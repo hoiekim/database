@@ -1,2 +1,5 @@
+# The toolchain the workspace is built and checked with: here and in the
+# Dockerfile's FROM line, which names the same version.
 [toolchain]
 channel = "1.97.0"
+components = ["clippy", "rustfmt"]

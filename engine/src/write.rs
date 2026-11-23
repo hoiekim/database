@@ -43,8 +43,6 @@ const OP_DROP_COLUMN: u8 = 7;
 const OP_CREATE_INDEX: u8 = 8;
 const OP_DROP_INDEX: u8 = 9;
 
-/// Words longer than this are not indexed for search: they are not words.
-
 /// A writing transaction's working state.
 pub struct Tx {
     pub writer: Writer,
