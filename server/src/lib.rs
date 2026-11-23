@@ -7,6 +7,7 @@
 //! is rolled back if the connection ends first.
 
 mod access;
+pub mod memory;
 mod session;
 
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 use database_engine::db::Options;
 use database_engine::engine::{Engine, EngineOptions};
+use database_engine::store::Limits;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Notify};
 
@@ -70,6 +72,8 @@ pub(crate) struct State {
     pub lock_freed: Notify,
     pub open_connections: AtomicU64,
     pub connection_closed: Notify,
+    /// Requests received, ever.
+    pub requests: AtomicU64,
 }
 
 /// A running server.
@@ -84,7 +88,12 @@ impl Server {
     /// Opens the data directory, recovers every database in it, and
     /// starts accepting connections.
     pub async fn start(config: ServerConfig) -> std::io::Result<Server> {
-        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, ..Options::default() } };
+        // What a database holds outside the cache is kept in proportion
+        // to it: an eighth in committed pages waiting to be written, a
+        // quarter in the pages of an open transaction.
+        let cache_pages = config.cache_bytes / database_engine::page::PAGE_SIZE;
+        let limits = Limits { max_dirty: (cache_pages / 8).max(64), max_private: (cache_pages / 4).max(128) };
+        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, limits, ..Options::default() } };
         let dir = config.data_dir.clone();
         // Recovery reads and writes files: keep it off the async threads.
         let engine = tokio::task::spawn_blocking(move || Engine::open(&dir, options)).await.map_err(std::io::Error::other)?.map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -99,8 +108,27 @@ impl Server {
             lock_freed: Notify::new(),
             open_connections: AtomicU64::new(0),
             connection_closed: Notify::new(),
+            requests: AtomicU64::new(0),
         });
         let (stop, stopping) = watch::channel(false);
+        // While requests arrive, and once more after they stop, memory
+        // that was freed is handed back to the system. An idle server
+        // does nothing here.
+        let (tidy_state, mut tidy_stop) = (state.clone(), stopping.clone());
+        tokio::spawn(async move {
+            let mut seen = 0;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = tidy_stop.changed() => return,
+                }
+                let now = tidy_state.requests.load(Ordering::Relaxed);
+                if now != seen {
+                    seen = now;
+                    let _ = tokio::task::spawn_blocking(memory::trim).await;
+                }
+            }
+        });
         let accept_state = state.clone();
         let accepting = tokio::spawn(async move {
             let mut next_id = 1u64;

@@ -476,8 +476,8 @@ struct Recent<'a> {
     pages: std::cell::RefCell<std::collections::HashMap<PageId, crate::page::Page>>,
 }
 
-/// As many pages as a query keeps for itself: 2 MiB.
-const RECENT_PAGES: usize = 256;
+/// As many pages as a query keeps for itself: half a megabyte.
+const RECENT_PAGES: usize = 64;
 
 impl Pages for Recent<'_> {
     fn page(&self, id: PageId) -> Result<crate::page::Page> {

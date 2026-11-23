@@ -174,6 +174,7 @@ async fn run(command: &str, mut args: Vec<String>) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    database_server::memory::configure();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let command = if args.is_empty() { String::new() } else { args.remove(0) };
     // Few threads, each with room for deeply nested expressions; the

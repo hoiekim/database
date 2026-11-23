@@ -537,9 +537,21 @@ fn project(ctx: &Ctx, q: &Query, scope: &Scope, table: &Table, all: &Option<Vec<
     match all {
         Some(cols) => {
             let frame = Frame { alias: "", table, row: Some(&hit.row) };
-            cols.iter().map(|i| eval::frame_value(ctx, &frame, *i)).collect()
+            let mut row = Vec::with_capacity(cols.len());
+            for i in cols {
+                row.push(eval::frame_value(ctx, &frame, *i)?);
+            }
+            Ok(row)
         }
-        None => q.select.iter().map(|s| eval(ctx, scope, &s.expr)).collect(),
+        None => {
+            // Collected by hand: through `collect` a fallible iterator
+            // gives no size, and the row is grown a step at a time.
+            let mut row = Vec::with_capacity(q.select.len());
+            for item in &q.select {
+                row.push(eval(ctx, scope, &item.expr)?);
+            }
+            Ok(row)
+        }
     }
 }
 

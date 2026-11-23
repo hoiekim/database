@@ -320,7 +320,13 @@ fn get_admin(r: &mut Reader) -> DbResult<Admin> {
 }
 
 pub fn encode_response(response: &Response) -> Vec<u8> {
-    let mut w = Writer::new();
+    encode_response_onto(Vec::new(), response)
+}
+
+/// Encodes a response after whatever `buf` already holds, so that a
+/// connection can keep one buffer for all it sends.
+pub fn encode_response_onto(buf: Vec<u8>, response: &Response) -> Vec<u8> {
+    let mut w = Writer { buf };
     match response {
         Response::Ok => w.u8(1),
         Response::Hello { version, server } => {

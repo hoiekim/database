@@ -1,6 +1,7 @@
 //! One connection: its greeting, its transaction, its locks.
 
 use std::io::Write;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,8 +66,9 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Vec<u8
     if len > MAX_FRAME {
         return Err(std::io::Error::other("frame larger than allowed"));
     }
-    // Grown as the bytes arrive: a length alone reserves nothing.
-    let mut frame = Vec::new();
+    // Room for an ordinary request at once; beyond that, grown as the
+    // bytes arrive, so that a length alone reserves little.
+    let mut frame = Vec::with_capacity(len.min(64 * 1024));
     let read = reader.take(len as u64).read_to_end(&mut frame).await?;
     if read != len {
         return Err(std::io::ErrorKind::UnexpectedEof.into());
@@ -74,12 +76,23 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Vec<u8
     Ok(Some(frame))
 }
 
-async fn write_response(writer: &mut OwnedWriteHalf, response: &Response) -> std::io::Result<()> {
-    let payload = encode_response(response);
-    let mut frame = Vec::with_capacity(payload.len() + 4);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    writer.write_all(&frame).await
+/// The most a connection's sending buffer keeps between responses.
+const KEPT_BUFFER: usize = 256 * 1024;
+
+/// Sends one response as a frame. `buf` is the connection's own buffer,
+/// used again for each: an answer of ordinary size allocates nothing.
+async fn write_response(writer: &mut OwnedWriteHalf, buf: &mut Vec<u8>, response: &Response) -> std::io::Result<()> {
+    let mut frame = std::mem::take(buf);
+    frame.clear();
+    frame.extend_from_slice(&[0; 4]);
+    let mut frame = encode_response_onto(frame, response);
+    let len = (frame.len() - 4) as u32;
+    frame[..4].copy_from_slice(&len.to_le_bytes());
+    let sent = writer.write_all(&frame).await;
+    if frame.capacity() <= KEPT_BUFFER {
+        *buf = frame;
+    }
+    sent
 }
 
 pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut stopping: watch::Receiver<bool>) {
@@ -101,7 +114,8 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
         Ok(()) => Response::Hello { version: PROTOCOL_VERSION, server: format!("database {}", env!("CARGO_PKG_VERSION")) },
         Err(e) => Response::Error(e.clone()),
     };
-    if write_response(&mut writer, &reply).await.is_err() || greeted.is_err() {
+    let mut sending = Vec::new();
+    if write_response(&mut writer, &mut sending, &reply).await.is_err() || greeted.is_err() {
         return;
     }
 
@@ -117,6 +131,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
             Ok(Ok(Some(frame))) => frame,
             _ => break,
         };
+        state.requests.fetch_add(1, Ordering::Relaxed);
         let outcome = match decode_request(&frame) {
             Ok((request, timeout_ms)) => {
                 drop(frame);
@@ -128,7 +143,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
         let Ok(responses) = outcome else { break };
         let mut failed = false;
         for response in &responses {
-            failed |= write_response(&mut writer, response).await.is_err();
+            failed |= write_response(&mut writer, &mut sending, response).await.is_err();
         }
         if failed {
             break;
@@ -476,7 +491,7 @@ impl Session {
             sink.flush().map_err(|e| DbError::new(ErrorCode::Connection, e.to_string()))
         });
         while let Some(chunk) = chunks.recv().await {
-            if write_response(writer, &Response::Chunk(chunk)).await.is_err() {
+            if write_response(writer, &mut Vec::new(), &Response::Chunk(chunk)).await.is_err() {
                 return Err(());
             }
         }
