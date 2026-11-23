@@ -45,12 +45,27 @@ impl TestServer {
     /// A server on an empty data directory. Commits do not wait for the
     /// disk: the tests that are about durability start their own.
     pub async fn start() -> TestServer {
-        let dir = TempDir::new();
+        TestServer::start_with(TempDir::new(), |_| {}).await
+    }
+
+    /// A server on the given directory, which may hold databases from an
+    /// earlier run, with its settings adjusted by `configure`.
+    pub async fn start_with(dir: TempDir, configure: impl FnOnce(&mut ServerConfig)) -> TestServer {
         let mut config = ServerConfig::new(dir.path(), ADMIN_PASSWORD);
         config.sync = false;
+        configure(&mut config);
         let server = Server::start(config).await.expect("server starts");
         let port = server.addr().port();
         TestServer { server: Some(server), dir, port }
+    }
+
+    /// Stops the server cleanly and hands back its directory, to start
+    /// another on it.
+    pub async fn restart_dir(mut self) -> TempDir {
+        if let Some(server) = self.server.take() {
+            server.stop().await;
+        }
+        self.dir
     }
 
     pub fn url(&self, database: &str) -> String {
@@ -73,6 +88,13 @@ impl TestServer {
         if let Some(server) = self.server.take() {
             server.stop().await;
         }
+    }
+
+    /// A client on an existing database with settings of the test's own.
+    pub async fn client_with(&self, database: &str, configure: impl FnOnce(&mut Config)) -> Client {
+        let mut config = Config::from_url(&self.url(database)).expect("valid url");
+        configure(&mut config);
+        Client::connect(config).await.expect("client connects")
     }
 }
 
