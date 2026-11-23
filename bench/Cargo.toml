@@ -1,0 +1,16 @@
+[package]
+name = "database-bench"
+description = "The same workloads against this database and against Postgres, side by side"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+database-client = { path = "../client" }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "process"] }
+tokio-postgres = "0.7"

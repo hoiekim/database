@@ -95,6 +95,14 @@ A `KeyRange` is two bounds, each a prefix of the key. On an index over
   entry: the cursor of a keyset page. (For a descending key, "after"
   means a smaller value.)
 
+**A NULL in a bound finds nothing**, as `key = NULL` is never true in
+SQL: `KeyRange::eq([session_id])` with a missing id is an empty range,
+not the rows whose id is missing, and a join on a missing key matches no
+row. To read the rows whose key *is* NULL, say so: `KeyRange::is([..])`
+is `IS NOT DISTINCT FROM` for each value (with a literal NULL, `IS
+NULL`), and `.nulls()` does the same for any range. NULL keys sort after
+all others, and a range with no upper bound runs through them.
+
 **There is no planner.** `filter` is applied to the rows the range gives,
 whatever it mentions. `Query::table("users").filter(col("email").eq(x))`
 reads the whole table; give it an index range to make it fast. A text in
@@ -113,6 +121,9 @@ grouping and `having`; `order_by`; `offset` and `limit`; `select`.
   `order_by` may name a selected item.
 - `with_total()` also counts the rows before `offset` and `limit`
   (`Rows::total`).
+- `Query::row()` is one row of no table, for what SQL writes as a
+  `SELECT` without `FROM`:
+  `Query::row().select("taken", exists(..)).select("at", now())`.
 
 ### Expressions
 
@@ -225,6 +236,12 @@ words. `Expr::Rank` grows with the number of matches, weighted by field.
 `Func::Matches` and `Func::MatchRank` do the same on any text without an
 index.
 
+The values given to `search` are the index's leading keys (`on([..])`),
+all of them: a search is always within one user's mails, one space's
+pages. An index with no leading keys searches the whole table. Hits come
+in primary key order unless ordered; the index is current as of every
+commit, with no separate refresh.
+
 ## Writing
 
 ```rust
@@ -253,6 +270,8 @@ db.delete(Delete::from("access").key([user, service]).returning(["role"])).await
 ```
 
 - `Rows::affected()` is the number of rows inserted, updated or deleted.
+- `returning([..])` names the columns to get back; `returning_all()` is
+  SQL's `RETURNING *`; `returning_expr(name, expr)` computes one.
 - **Insert.** Columns left out take their defaults. `from_query` inserts
   another query's rows. `on_conflict_do_nothing()` skips a row that
   breaks any unique index (`_on(index)`: only that one); skipped rows are
@@ -261,6 +280,11 @@ db.delete(Delete::from("access").key([user, service]).returning(["role"])).await
   `excluded("c")` the proposed value; `update_where(cond)` declines the
   update when the condition fails for the existing row, and then nothing
   is counted or returned. The primary key's index is named `PRIMARY`.
+  As in Postgres, the proposed row must be a valid row whether or not it
+  ends up stored: NOT NULL and checks are tested before the conflict is
+  looked for. A row that collides on the named index is handled there
+  even if it also collides on another; one that collides only on another
+  unique index is a `UniqueViolation`.
 - **Update.** `Update::table(t)` plus `key`/`index`/`filter`, or
   `Update::rows(query)` for anything a query can express: joins, a tree,
   `order_by` and `limit` (the first n in that order). Every `set` reads
@@ -278,6 +302,7 @@ Errors are `DbError { code, message, constraint, table }`:
 | `ErrorCode` | When |
 |---|---|
 | `UniqueViolation` | A unique index or the primary key has the key already. `constraint` is the index's name (`PRIMARY` for the primary key); `err.violates("users_email")` tests it |
+| `KeyTooLong` | A primary key or index key over 1,900 bytes |
 | `ForeignKeyViolation` | The parent is missing, or a `Restrict` child exists |
 | `NotNullViolation`, `CheckViolation` | `constraint` names the column or the check |
 | `TypeMismatch`, `OutOfRange`, `Arithmetic` | A value of the wrong kind; a number too large; division by zero |
@@ -343,6 +368,13 @@ dropped or the process dies. It occupies one pooled connection.
 | `WHERE (date, id) < ($1, $2) ORDER BY date DESC, id DESC` | an index on `(.., date, id)` read `.reverse()` with upper bound `Bound::excluded([.., date, id])` |
 | `col = ANY($1)` on a key | `.keys(..)` or `.index_ranges(name, values.map(KeyRange::eq))` |
 | `col = ANY($1)` elsewhere | `.filter(col("c").in_list(values))` |
+| `WHERE parent_id IS NULL` on an index | `KeyRange::is([.., Value::Null])` |
+| `WHERE k IS NOT DISTINCT FROM $1` | `KeyRange::is([k])` |
+| `SELECT EXISTS(..)`, `SELECT now()` | `Query::row().select(..)` |
+| `RETURNING *` | `.returning_all()` |
+| `jsonb_array_elements_text(a)` | `col("a").json_texts()`, a list: `in_list`, `each` |
+| `a OR b` over two different indexes | two queries (in `db.read(..)` for one moment), merged by the app |
+| `UNION` | two queries, merged by the app |
 | `SELECT count(*) FILTER (WHERE ..)` | `count().filter(..)` |
 | `SELECT ... FOR UPDATE` then `UPDATE` | the same two statements in `db.transaction(..)` |
 | `UPDATE .. WHERE id IN (SELECT .. ORDER BY .. LIMIT n FOR UPDATE SKIP LOCKED) RETURNING` | `Update::rows(Query::table(..).index(..).filter(..).limit(n)).set(..).returning(..)` |
@@ -353,3 +385,13 @@ dropped or the process dies. It occupies one pooled connection.
 | `WITH RECURSIVE` over `parent_id` | `ancestors` / `descendants` |
 | `to_tsvector` / `@@` / `ts_rank` / `ts_headline` | a full-text index, `search`, `Expr::Rank`, `Func::Headline` |
 | a stored function | a Rust function that returns an `Expr` |
+
+## Not here
+
+Things Postgres has that this does not, so that nobody goes looking:
+regular expressions (`like`, `try_cast` and the text functions cover what
+the apps matched); collations (text orders by bytes); `UNION`; window
+functions other than `with_total`; adding a foreign key or a check to a
+table that exists (declare them at creation); changing a column's type;
+cancelling another connection's statement (each request has its own
+deadline, `statement_timeout`); TLS.
