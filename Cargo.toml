@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["protocol", "client", "server"]
+members = ["protocol", "engine", "client", "server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,3 +23,10 @@ lto = "thin"
 codegen-units = 4
 strip = true
 panic = "unwind"
+
+# The storage tests run thousands of simulated crashes; unoptimized, the
+# page and checksum code makes them take minutes.
+[profile.dev.package.database-engine]
+opt-level = 2
+[profile.dev.package.crc32fast]
+opt-level = 3

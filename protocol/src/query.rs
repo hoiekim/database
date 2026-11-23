@@ -579,6 +579,12 @@ impl Update {
         self
     }
 
+    /// Rows whose primary key is in the range.
+    pub fn range(mut self, range: KeyRange) -> Update {
+        self.rows = self.rows.range(range);
+        self
+    }
+
     pub fn index(mut self, index: &str, range: KeyRange) -> Update {
         self.rows = self.rows.index(index, range);
         self
@@ -628,6 +634,12 @@ impl Delete {
 
     pub fn key<E: Into<Expr>>(mut self, key: impl IntoIterator<Item = E>) -> Delete {
         self.rows = self.rows.key(key);
+        self
+    }
+
+    /// Rows whose primary key is in the range.
+    pub fn range(mut self, range: KeyRange) -> Delete {
+        self.rows = self.rows.range(range);
         self
     }
 
