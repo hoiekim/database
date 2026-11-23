@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["protocol", "client", "server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+
+# Every dependency runs inside the process that holds every app's data, so
+# the list is kept to what the standard library lacks: an async runtime for
+# the network side, a CRC for page and log checksums, and JSON for the
+# columns that hold it.
+[workspace.dependencies]
+tokio = { version = "1", default-features = false }
+crc32fast = "1"
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "unwind"

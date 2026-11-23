@@ -1,0 +1,23 @@
+[package]
+name = "database-server"
+description = "The database server and its command line: serve, dump, restore, check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "database"
+path = "src/main.rs"
+
+[lib]
+name = "database_server"
+path = "src/lib.rs"
+
+[dependencies]
+database-protocol = { path = "../protocol" }
+database-client = { path = "../client" }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "time", "macros", "signal"] }
+
+[dev-dependencies]
+serde_json.workspace = true
