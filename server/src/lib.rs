@@ -1,8 +1,27 @@
 //! The database server: listens on a TCP port and serves the requests of
 //! `database-protocol` from the databases in its data directory.
+//!
+//! One task per connection reads a request, runs it on a blocking thread
+//! (the engine does its own I/O and never awaits), and writes the answer.
+//! A connection's transaction lives in its session between requests and
+//! is rolled back if the connection ends first.
 
+mod access;
+mod session;
+
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use database_engine::db::Options;
+use database_engine::engine::{Engine, EngineOptions};
+use tokio::net::TcpListener;
+use tokio::sync::{watch, Notify};
+
+pub use access::sha256;
 
 /// How a server is started.
 #[derive(Clone, Debug)]
@@ -20,6 +39,12 @@ pub struct ServerConfig {
     /// able to lose the last moments of commits (never to corrupt), and
     /// is meant for tests.
     pub sync: bool,
+    /// How long a lone write waits for the database's write lock.
+    pub lock_wait: Duration,
+    /// How long a connection may sit on an open writing transaction
+    /// without sending anything before the server rolls it back and
+    /// closes the connection. It holds every other writer up meanwhile.
+    pub idle_transaction: Duration,
 }
 
 impl ServerConfig {
@@ -30,20 +55,80 @@ impl ServerConfig {
             admin_password: admin_password.to_string(),
             cache_bytes: 32 * 1024 * 1024,
             sync: true,
+            lock_wait: Duration::from_secs(30),
+            idle_transaction: Duration::from_secs(60),
         }
     }
+}
+
+pub(crate) struct State {
+    pub engine: Engine,
+    pub access: Mutex<access::Access>,
+    pub config: ServerConfig,
+    /// Named locks: the database and name, and the connection holding it.
+    pub locks: Mutex<HashMap<(String, String), u64>>,
+    pub lock_freed: Notify,
+    pub open_connections: AtomicU64,
+    pub connection_closed: Notify,
 }
 
 /// A running server.
 pub struct Server {
     addr: SocketAddr,
+    stop: watch::Sender<bool>,
+    state: Arc<State>,
+    accepting: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Server {
     /// Opens the data directory, recovers every database in it, and
     /// starts accepting connections.
-    pub async fn start(_config: ServerConfig) -> std::io::Result<Server> {
-        todo!("the server is written after the tests that define it")
+    pub async fn start(config: ServerConfig) -> std::io::Result<Server> {
+        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, ..Options::default() } };
+        let dir = config.data_dir.clone();
+        // Recovery reads and writes files: keep it off the async threads.
+        let engine = tokio::task::spawn_blocking(move || Engine::open(&dir, options)).await.map_err(std::io::Error::other)?.map_err(|e| std::io::Error::other(e.to_string()))?;
+        let access = access::Access::load(&config.data_dir)?;
+        let listener = TcpListener::bind(config.listen).await?;
+        let addr = listener.local_addr()?;
+        let state = Arc::new(State {
+            engine,
+            access: Mutex::new(access),
+            config,
+            locks: Mutex::new(HashMap::new()),
+            lock_freed: Notify::new(),
+            open_connections: AtomicU64::new(0),
+            connection_closed: Notify::new(),
+        });
+        let (stop, stopping) = watch::channel(false);
+        let accept_state = state.clone();
+        let accepting = tokio::spawn(async move {
+            let mut next_id = 1u64;
+            let mut stopped = stopping.clone();
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = stopped.changed() => return,
+                };
+                let Ok((stream, _)) = accepted else {
+                    // Out of file descriptors, most likely: wait for some
+                    // to be given back rather than spin.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                let id = next_id;
+                next_id += 1;
+                let state = accept_state.clone();
+                let stopping = stopping.clone();
+                state.open_connections.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    session::serve(stream, state.clone(), id, stopping).await;
+                    state.open_connections.fetch_sub(1, Ordering::Relaxed);
+                    state.connection_closed.notify_waiters();
+                });
+            }
+        });
+        Ok(Server { addr, stop, state, accepting: Some(accepting) })
     }
 
     /// The address the server listens on.
@@ -53,5 +138,25 @@ impl Server {
 
     /// Stops accepting, lets requests in flight finish, writes a final
     /// checkpoint and closes the files.
-    pub async fn stop(self) {}
+    pub async fn stop(mut self) {
+        let _ = self.stop.send(true);
+        if let Some(accepting) = self.accepting.take() {
+            let _ = accepting.await;
+        }
+        // Connections end after the request they are on. Give them a
+        // moment, then checkpoint whatever is committed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.state.open_connections.load(Ordering::Relaxed) > 0 && tokio::time::Instant::now() < deadline {
+            let closed = self.state.connection_closed.notified();
+            let _ = tokio::time::timeout(Duration::from_millis(50), closed).await;
+        }
+        let state = self.state.clone();
+        let _ = tokio::task::spawn_blocking(move || state.engine.checkpoint_all()).await;
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+    }
 }

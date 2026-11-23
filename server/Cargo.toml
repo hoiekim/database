@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 database-protocol = { path = "../protocol" }
+database-engine = { path = "../engine" }
 database-client = { path = "../client" }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "time", "macros", "signal"] }
 
