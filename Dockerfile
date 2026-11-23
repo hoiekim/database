@@ -1,6 +1,6 @@
 # The database server and its command-line tool, in one binary.
 #
-#   docker build -t hoie/database .
+#   docker build -t database .
 #
 # Configuration comes from the environment only (docs/OPERATIONS.md).
 

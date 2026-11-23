@@ -1,28 +1,32 @@
-//! mail, the email server, restated against the client: every kind of
-//! statement its HTTP, IMAP and SMTP front ends send to Postgres today
-//! (`docs/requirements/mail.md`, Q1 to Q107), and what must come back.
+//! A mail store as a scenario suite: users and their sessions, mailboxes,
+//! messages with large bodies, flags, address lists, UID and MODSEQ
+//! counters, a spam allowlist and trained word counts, conversations and
+//! full-text search. The tests say through the client what a mail server
+//! with HTTP, IMAP and SMTP front ends asks of its database, and check what
+//! must come back.
 //!
-//! mail runs nearly everything as lone statements on whichever pooled
-//! connection is free, so these tests use the plain client the same way.
-//! They open a transaction only where the inventory has one, or where a
-//! single SQL statement had to become a read and a write.
+//! Such a server runs nearly everything as lone statements on whichever
+//! pooled connection is free, so these tests use the plain client the same
+//! way. They open a transaction only where the work needs one: a schema
+//! migration, or a count and an insert that nothing may come between.
 //!
-//! The indexes are not Postgres' list. Its one-column indexes on booleans
-//! helped no query; here each access path mail uses has the ordered key it
-//! needs, and every query names the one it reads through.
+//! The indexes are chosen for the queries. Each access path has the ordered
+//! key it needs, and every query names the index it reads through. There
+//! are no one-column indexes on booleans, which would help no query.
 //!
-//! Three things mail's SQL said have no direct form in the client, and are
-//! said the nearest way, with a note at the place:
+//! Three things that SQL says directly are said another way here, with a
+//! note at the place:
 //!
-//! - a SELECT without a FROM (Q50's `INSERT .. SELECT <constants> WHERE`,
-//!   Q60, Q95): a query needs a table, so the value is computed beside a
-//!   row or an aggregate that is certain to be there, or the statement
-//!   becomes a transaction;
-//! - `UPDATE mails .. FROM mail_mailbox_uid` (Q86): an update reads its own
-//!   table first, so a STORE in a mapped box starts from the user's mails
-//!   and looks up each one's mapping row, not the other way round;
-//! - the entries of a JSON array of strings as texts (`reference_ids ?|`):
-//!   the index over them holds JSON strings and is read with JSON strings.
+//! - a SELECT without a FROM (an `INSERT .. SELECT <constants> WHERE ..`,
+//!   a counter read without reserving, the server's clock): these tests
+//!   compute the value beside a row or an aggregate that is certain to be
+//!   there, or make the statement a transaction;
+//! - `UPDATE mails .. FROM mail_mailbox_uid`: an update reads its own table
+//!   first, so a STORE in a mapped box starts from the user's mails and
+//!   looks up each one's mapping row, not the other way round;
+//! - the entries of a JSON array of strings (`reference_ids ?|` in SQL):
+//!   the index over them holds JSON strings, and these tests read it with
+//!   JSON strings.
 //!
 //! Where `docs/CLIENT.md` is silent the tests expect what Postgres does:
 //! `substr` and `substr_bytes` past the end give the empty value, a sum of
@@ -95,8 +99,8 @@ fn users_table() -> TableDef {
         .unique("users_username_key", ["username"])
         // Unique among the users that have one: most have none.
         .unique("users_auth_sub_key", ["auth_sub"])
-        // Q23 compares emails without case; Q17 compares them exactly and
-        // narrows this index's rows with a filter.
+        // Linking a login compares emails without case; the user lookup
+        // compares them exactly and narrows this index's rows with a filter.
         .index(IndexDef::new("users_email_lower").on_expr(col("email").lower()))
 }
 
@@ -150,7 +154,7 @@ fn mailboxes_table() -> TableDef {
         .column(ColumnDef::new("special_use", Type::Text).nullable())
         .column(ColumnDef::new("created", Type::Timestamp).nullable().default_now())
         .primary_key(["mailbox_id"])
-        // Not unique, as in Postgres: the app probes for the name first.
+        // Not unique: the application probes for the name first.
         .index(IndexDef::new("mailboxes_user_name").on(["user_id"]).on_expr(col("name").lower()))
         .foreign_key(["user_id"], "users", OnDelete::Cascade)
         .foreign_key(["parent_id"], "mailboxes", OnDelete::Cascade)
@@ -189,10 +193,10 @@ fn mails_table() -> TableDef {
         .column(ColumnDef::new("in_reply_to", Type::Text).nullable())
         .column(ColumnDef::new("reference_ids", Type::Json).nullable())
         .column(ColumnDef::new("updated", Type::Timestamp).nullable().default_now())
-        // Stands in for Postgres' index on md5(lower(btrim(regexp_replace(..)))):
-        // the app normalises the subject (`normalize_subject`) and stores
-        // the result. There is no `search_vector` column: the full-text
-        // index below is kept by the database.
+        // Where Postgres would index md5(lower(btrim(regexp_replace(..)))),
+        // the application normalises the subject (`normalize_subject`) and
+        // stores the result. There is no `search_vector` column: the
+        // full-text index below is kept by the database.
         .column(ColumnDef::new("thread_subject_key", Type::Text).nullable())
         .primary_key(["mail_id"])
         .unique(MAILS_MESSAGE, ["user_id", "message_id"])
@@ -209,8 +213,8 @@ fn mails_table() -> TableDef {
                 .on_desc("date")
                 .filter(col("in_reply_to").is_null().and(col("reference_ids").is_null())),
         )
-        // Postgres built one tsvector from these four columns, unweighted,
-        // a missing header counting as no words.
+        // Like one Postgres tsvector built from these four columns:
+        // unweighted, a missing header counting as no words.
         .index(IndexDef::new(MAILS_SEARCH).on(["user_id"]).full_text(
             TextConfig::English,
             [(col("subject"), 1.0), (col("text"), 1.0), (col("from_text").or_else(""), 1.0), (col("to_text").or_else(""), 1.0)],
@@ -240,7 +244,7 @@ fn spam_allowlist_table() -> TableDef {
         .column(ColumnDef::new("created_at", Type::Timestamp).default_now())
         .primary_key(["allowlist_id"])
         .unique("spam_allowlist_user_pattern", ["user_id", "pattern"])
-        // Q49 runs for every received mail and compares lower(pattern).
+        // The check made for every received mail compares lower(pattern).
         .index(IndexDef::new("spam_allowlist_user_lower").on(["user_id"]).on_expr(col("pattern").lower()))
         .foreign_key(["user_id"], "users", OnDelete::Cascade)
 }
@@ -255,7 +259,7 @@ fn spam_training_table() -> TableDef {
         .primary_key(["training_id"])
         .unique("spam_training_user_word", ["user_id", "word"])
         .foreign_key(["user_id"], "users", OnDelete::Cascade)
-        // VARCHAR(100): mail relies on an over-long word failing the statement.
+        // Like VARCHAR(100): an over-long word must fail the whole statement.
         .check("spam_training_word_length", col("word").length().le(100))
 }
 
@@ -282,9 +286,9 @@ fn mail_mailbox_uid_table() -> TableDef {
         .foreign_key(["mail_id"], "mails", OnDelete::Cascade)
 }
 
-fn mailgun_events_table() -> TableDef {
-    // Append-only and never read by the app, so no index beyond its key.
-    let mut table = TableDef::new("mailgun_events").column(ColumnDef::new("event_id", Type::Text)).column(ColumnDef::new("event", Type::Text));
+fn delivery_events_table() -> TableDef {
+    // Append-only and never read back, so no index beyond its key.
+    let mut table = TableDef::new("delivery_events").column(ColumnDef::new("event_id", Type::Text)).column(ColumnDef::new("event", Type::Text));
     for name in ["message_id", "recipient", "severity", "reason"] {
         table = table.column(ColumnDef::new(name, Type::Text).nullable());
     }
@@ -296,7 +300,7 @@ fn mailgun_events_table() -> TableDef {
         .primary_key(["event_id"])
 }
 
-/// mail's tables, parents before the tables that point at them.
+/// The store's tables, parents before the tables that point at them.
 fn tables() -> Vec<TableDef> {
     vec![
         schema_meta_table(),
@@ -309,11 +313,11 @@ fn tables() -> Vec<TableDef> {
         spam_training_table(),
         mail_uid_counters_table(),
         mail_mailbox_uid_table(),
-        mailgun_events_table(),
+        delivery_events_table(),
     ]
 }
 
-/// What mail's boot does on a database at any state (Q2, Q15): create each
+/// What every boot does, whatever state the database is in: create each
 /// table unless it is there.
 async fn schema(db: &Client) -> DbResult<()> {
     for table in tables() {
@@ -327,7 +331,7 @@ fn all_columns(table: &TableDef) -> Vec<String> {
     table.columns.iter().map(|c| c.name.clone()).collect()
 }
 
-/// Another process of the app: its own pool on the same database.
+/// Another process of the application: its own pool on the same database.
 async fn second_instance(db: &Client) -> DbResult<Client> {
     Client::connect(db.config().clone()).await
 }
@@ -343,8 +347,8 @@ async fn user(db: &Client, name: &str) -> DbResult<Uuid> {
     db.insert(insert).await?.one()?.get("user_id")
 }
 
-/// Q17's soft-delete test. Nothing sets the flag today; every read of
-/// `users` still applies it, and rows from before the default hold NULL.
+/// The soft-delete test that every read of `users` applies. Rows from
+/// before the flag had a default hold NULL, and count as not deleted.
 fn not_deleted() -> Expr {
     col("is_deleted").is_null().or(col("is_deleted").eq(false))
 }
@@ -359,7 +363,7 @@ fn id_list(ids: &[Uuid]) -> Vec<Value> {
     ids.iter().map(|id| Value::from(*id)).collect()
 }
 
-/// A row of `mails` as the app holds it before the insert (Q63). An empty
+/// A row of `mails` as the application holds it before the insert. An empty
 /// address list stands for a header the message did not have: NULL in both
 /// the `_address` and the `_text` column.
 #[derive(Clone)]
@@ -426,7 +430,7 @@ fn mail(user: Uuid, n: i64) -> Mail {
     }
 }
 
-/// An address header as the parsed array mail stores: `{address, name}`.
+/// An address header as the parsed array a row stores: `{address, name}`.
 fn address_list(addresses: &[&str]) -> Option<Json> {
     if addresses.is_empty() {
         return None;
@@ -442,9 +446,9 @@ fn header_text(addresses: &[&str]) -> Option<String> {
     Some(addresses.iter().map(|a| format!("{} <{a}>", a.split('@').next().unwrap_or(a))).collect::<Vec<_>>().join(", "))
 }
 
-/// The app's subject normaliser for threading: Q106's regexp, trim and
-/// lower-casing, which Postgres also evaluated inside an index. Reply and
-/// forward prefixes go (`Re:`, `FWD:`, `AW[2]:`, with a plain or a
+/// The application's subject normaliser for threading: a regexp, a trim and
+/// a lower-casing, which Postgres could also evaluate inside an index. Reply
+/// and forward prefixes go (`Re:`, `FWD:`, `AW[2]:`, with a plain or a
 /// full-width colon), runs of whitespace become one space.
 fn normalize_subject(subject: &str) -> String {
     const PREFIXES: [&str; 10] = ["re", "fwd", "fw", "aw", "wg", "sv", "vs", "antw", "tr", "rv"];
@@ -462,8 +466,9 @@ fn normalize_subject(subject: &str) -> String {
     rest.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-/// The columns and values of Q63, in its order: the server's clock for
-/// `updated`, then the 36 values the app binds, then the subject key.
+/// The columns and values of a mail's insert, in order: the server's clock
+/// for `updated`, then the 36 values the application binds, then the
+/// subject key.
 fn mail_values(m: &Mail) -> Vec<(&'static str, Expr)> {
     vec![
         ("updated", now()),
@@ -507,8 +512,8 @@ fn mail_values(m: &Mail) -> Vec<(&'static str, Expr)> {
     ]
 }
 
-/// Q63 for one mail or, for a test's starting data, several in one
-/// statement.
+/// The insert of one mail or, for a test's starting data, of several in
+/// one statement.
 fn insert_mails(mails: &[Mail]) -> Insert {
     let mut insert = Insert::into("mails").columns(mail_values(&mails[0]).into_iter().map(|(column, _)| column));
     for m in mails {
@@ -567,7 +572,7 @@ fn domain_seed(user: Uuid, sent: bool) -> Seed {
 }
 
 /// A mapped box's UIDs continue from the mapping rows of the mailboxes
-/// that share the counter (`mailbox IN ($5, $6)`).
+/// that share the counter (`mailbox IN (..)`).
 fn box_seed(user: Uuid, mailboxes: &[&str]) -> Seed {
     let ranges = mailboxes.iter().map(|mailbox| KeyRange::eq([val(user), val(*mailbox)]));
     Seed { rows: Query::table("mail_mailbox_uid").index_ranges(BOX_UID, ranges), column: "uid" }
@@ -578,7 +583,7 @@ fn modseq_seed(user: Uuid) -> Seed {
     Seed { rows: Query::table("mails").index(MAILS_DATE, KeyRange::eq([user])), column: "modseq" }
 }
 
-/// Q59: reserve the next number of a counter. The first reservation inserts
+/// Reserves the next number of a counter. The first reservation inserts
 /// the seed, read from the data by a subquery in the same statement; every
 /// later one finds the row and adds one. Either way the statement returns
 /// the number reserved.
@@ -607,9 +612,9 @@ async fn next_modseq(db: &Client, user: Uuid) -> DbResult<i64> {
     reserved(db, reserve(user, "modseq", "", false, &modseq_seed(user))).await
 }
 
-/// Q60: UIDNEXT without allocating. The counter's next value if the counter
-/// exists, else the seed it would start from. SQL said this without a FROM;
-/// here the seed's aggregate query carries the counter lookup, and an
+/// UIDNEXT without allocating: the counter's next value if the counter
+/// exists, else the seed it would start from. SQL can say this without a
+/// FROM; here the seed's aggregate query carries the counter lookup, and an
 /// aggregate without groups always gives one row.
 fn peek(user: Uuid, kind: &str, scope: &str, sent: bool, seed: &Seed) -> Query {
     let counter = Query::table("mail_uid_counters").key([val(user), val(kind), val(scope), val(sent)]).select("next", col("last_uid") + 1);
@@ -620,7 +625,7 @@ async fn uid_next(db: &Client, query: Query) -> DbResult<i64> {
     db.query_one(query).await?.get("uid_next")
 }
 
-/// Q61: record a mail's UID in a mailbox, or learn the one it already has
+/// Records a mail's UID in a mailbox, or learns the one it already has
 /// there. The no-op update exists to make the statement return the row.
 fn map_mail(user: Uuid, mailbox: &str, mail_id: Uuid, uid: i64) -> Insert {
     Insert::into("mail_mailbox_uid")
@@ -637,10 +642,10 @@ async fn mapped(db: &Client, user: Uuid, mailbox: &str, mail_id: Uuid, uid: i64)
     db.insert(map_mail(user, mailbox, mail_id, uid)).await?.one()?.get("uid")
 }
 
-/// Which of a user's mails a mailbox shows: the inventory's membership
-/// fragment. INBOX and the per-account inboxes hide spam and drafts; Drafts
-/// and Junk show only those; Sent, user boxes, Starred and Trash show all.
-/// The conditions name the mail as `m`, as every IMAP query here does.
+/// Which of a user's mails a mailbox shows: its membership test. INBOX and
+/// the per-account inboxes hide spam and drafts; Drafts and Junk show only
+/// those; Sent, user boxes, Starred and Trash show all. The conditions name
+/// the mail as `m`, as every IMAP query here does.
 #[derive(Clone, Copy)]
 enum Members {
     Inbox,
@@ -695,8 +700,8 @@ fn mapped_view(user: Uuid, sent: bool, mailbox: &str, members: Members) -> Query
     mapped_rows(user, sent, mailbox).filter(col("m.expunged").eq(false).and(members.condition()))
 }
 
-/// Q75: a mailbox's message count and unseen count. The membership test
-/// sits inside the aggregates, as in the SQL.
+/// A mailbox's message count and unseen count. The membership test sits
+/// inside the aggregates, as a filter on each count.
 fn counts(rows: Query, members: Members) -> Query {
     rows.filter(col("m.expunged").eq(false))
         .select("total", count().filter(members.condition()))
@@ -706,7 +711,7 @@ fn counts(rows: Query, members: Members) -> Query {
 /// The five IMAP flags, as columns of the mail aliased `m`.
 const FLAGS: [&str; 5] = ["m.read", "m.saved", "m.deleted", "m.draft", "m.answered"];
 
-// R-S1, R-S2, R-S4, R-S9: mail Q2, Q4, Q15.
+// R-S1, R-S2, R-S4, R-S9: every boot creates the tables that are absent, and the schema reads back as it was declared.
 #[tokio::test(flavor = "multi_thread")]
 async fn tables_are_created_if_absent_and_described_back() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -718,7 +723,7 @@ async fn tables_are_created_if_absent_and_described_back() -> DbResult<()> {
     assert_eq!(live.len(), 11);
     for want in tables() {
         let have = live.iter().find(|t| t.name == want.name).expect("every table is described");
-        // What mail's migration compares (Q4): names, types and nullability, in order.
+        // What a migration compares: names, types and nullability, in order.
         let shape = |t: &TableDef| t.columns.iter().map(|c| (c.name.clone(), c.ty.clone(), c.nullable)).collect::<Vec<_>>();
         assert_eq!(shape(have), shape(&want), "{}", want.name);
         assert_eq!(have.primary_key, want.primary_key, "{}", want.name);
@@ -738,7 +743,7 @@ async fn tables_are_created_if_absent_and_described_back() -> DbResult<()> {
     Ok(())
 }
 
-// R-S5, R-W1, R-W11: mail Q36, Q63 (ids, clock stamps and flags the server fills in).
+// R-S5, R-W1, R-W11: the ids, clock stamps and flags the server fills in.
 #[tokio::test(flavor = "multi_thread")]
 async fn columns_left_out_take_their_defaults() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -780,7 +785,7 @@ async fn columns_left_out_take_their_defaults() -> DbResult<()> {
     Ok(())
 }
 
-/// Q3: write a marker, replacing the one that is there.
+/// Writes a marker, replacing the one that is there.
 fn set_marker(key: &str, value: &str) -> Insert {
     Insert::into("schema_meta").set("key", key).set("value", value).on_conflict_update(PRIMARY).update_excluded(["value"])
 }
@@ -792,12 +797,12 @@ async fn marker(db: &impl Db, key: &str) -> DbResult<Option<String>> {
     }
 }
 
-// R-S1, R-W4, R-Q1: mail Q1, Q2, Q3 (the hash that lets a boot skip all schema work).
+// R-S1, R-W4, R-Q1: the stored hash that lets a boot skip all schema work.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_schema_marker_is_read_and_replaced() -> DbResult<()> {
     let (_server, db) = fresh().await;
-    // On a database that was never booted the table is not there. mail
-    // takes any error from this read to mean "not at the target schema".
+    // On a database that was never booted the table is not there. Any
+    // error from this read is taken to mean "not at the target schema".
     let never_booted = marker(&db, "schema_hash").await.unwrap_err();
     assert_eq!(never_booted.code, ErrorCode::NotFound);
 
@@ -818,12 +823,12 @@ async fn has_column(db: &impl Db, table: &str, column: &str) -> DbResult<bool> {
     Ok(db.describe_table(table).await?.is_some_and(|t| t.column_index(column).is_some()))
 }
 
-/// mail's boot migration (§3.1, §5.1), alone on the database under a named
-/// lock: create what is absent, then add each column the model has and
-/// the live table lacks. Additive only; a column of another type stops the
-/// boot and nothing of the attempt remains. Answers the columns it added.
+/// The boot migration, alone on the database under a named lock: create
+/// what is absent, then add each column the model has and the live table
+/// lacks. Additive only; a column of another type stops the boot and
+/// nothing of the attempt remains. Answers the columns it added.
 async fn migrate(db: &Client, model: Vec<TableDef>, hash: &str) -> DbResult<Vec<String>> {
-    let guard = db.lock("mail.migrate").await?;
+    let guard = db.lock("app.migrate").await?;
     let hash = hash.to_string();
     let outcome = db
         .transaction(|tx| async move {
@@ -856,7 +861,7 @@ async fn migrate(db: &Client, model: Vec<TableDef>, hash: &str) -> DbResult<Vec<
     outcome
 }
 
-// R-S1, R-S8, R-X1, R-X2, R-X5: mail Q4, Q5, Q6, Q7 (§5.1 boot migration).
+// R-S1, R-S8, R-X1, R-X2, R-X5: the boot migration compares the model with the live schema and adds what is missing, in one transaction under a named lock.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_migration_adds_missing_columns_in_a_transaction_under_a_named_lock() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -936,7 +941,7 @@ async fn a_migration_adds_missing_columns_in_a_transaction_under_a_named_lock() 
     Ok(())
 }
 
-// R-X5: mail Q6, Q8 (two instances start at once during a rolling deploy).
+// R-X5: two instances start at once during a rolling deploy.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_instance_skips_maintenance_and_queues_for_migration() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -944,30 +949,30 @@ async fn a_second_instance_skips_maintenance_and_queues_for_migration() -> DbRes
     let other = second_instance(&db).await?;
 
     // Boot maintenance only tries the lock: whoever gets it does the work.
-    let running = db.try_lock("mail.maintenance").await?.expect("nobody holds it yet");
-    assert_eq!(running.name(), "mail.maintenance");
-    assert!(other.try_lock("mail.maintenance").await?.is_none());
-    assert!(db.try_lock("mail.maintenance").await?.is_none(), "not even the holder's own process gets it twice");
+    let running = db.try_lock("app.maintenance").await?.expect("nobody holds it yet");
+    assert_eq!(running.name(), "app.maintenance");
+    assert!(other.try_lock("app.maintenance").await?.is_none());
+    assert!(db.try_lock("app.maintenance").await?.is_none(), "not even the holder's own process gets it twice");
     // The lock stops nothing but another holder: both instances keep
     // reading and writing, and a lock of another name is free.
     db.insert(set_marker("maintenance_hash", "77aa77aa77aa77aa")).await?;
     assert_eq!(marker(&other, "maintenance_hash").await?.as_deref(), Some("77aa77aa77aa77aa"));
-    other.try_lock("mail.migrate").await?.expect("another name is another lock").unlock().await?;
+    other.try_lock("app.migrate").await?.expect("another name is another lock").unlock().await?;
     running.unlock().await?;
 
     // A guard that is dropped, as when its process dies, frees the lock too.
-    let abandoned = other.try_lock("mail.maintenance").await?.expect("free again after unlock");
+    let abandoned = other.try_lock("app.maintenance").await?.expect("free again after unlock");
     drop(abandoned);
-    let next = tokio::time::timeout(Duration::from_secs(10), db.lock("mail.maintenance")).await.expect("a dropped guard's lock is freed")?;
+    let next = tokio::time::timeout(Duration::from_secs(10), db.lock("app.maintenance")).await.expect("a dropped guard's lock is freed")?;
     next.unlock().await?;
 
     // Migration waits its turn instead of skipping.
     let order = Arc::new(Mutex::new(Vec::new()));
-    let first = db.lock("mail.migrate").await?;
+    let first = db.lock("app.migrate").await?;
     let waiter = tokio::spawn({
         let order = order.clone();
         async move {
-            let second = other.lock("mail.migrate").await?;
+            let second = other.lock("app.migrate").await?;
             order.lock().unwrap().push("second instance migrates");
             second.unlock().await
         }
@@ -980,14 +985,14 @@ async fn a_second_instance_skips_maintenance_and_queues_for_migration() -> DbRes
     Ok(())
 }
 
-// R-S11, R-S3, R-Q17: mail Q10, Q11, Q12, Q13, Q14 (boot maintenance).
+// R-S11, R-S3, R-Q17: boot maintenance drops and builds indexes on a table that already holds rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn maintenance_builds_indexes_over_rows_that_are_already_there() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     let ann = user(&db, "ann").await?;
     // A database from before two of the indexes existed. Dropping one
-    // that is not there is fine: Q12 runs on every retry.
+    // that is not there is fine: the drop runs on every retry.
     db.drop_index("mails", MAILS_SEARCH).await?;
     db.drop_index("mails", MAILS_REPLY).await?;
     db.drop_index_if_exists("mails", MAILS_REPLY).await?;
@@ -1006,7 +1011,7 @@ async fn maintenance_builds_indexes_over_rows_that_are_already_there() -> DbResu
     assert_eq!(db.query(replies()).await.unwrap_err().code, ErrorCode::NotFound);
 
     // The maintenance session is a connection of its own with a ten
-    // minute statement limit (Q10) instead of the pool's thirty seconds.
+    // minute statement limit instead of the pool's thirty seconds.
     let mut config = db.config().clone();
     config.pool_size = 1;
     config.statement_timeout = Duration::from_secs(600);
@@ -1021,13 +1026,13 @@ async fn maintenance_builds_indexes_over_rows_that_are_already_there() -> DbResu
     }
 
     // The new indexes hold the rows written before them: no rewrite of
-    // the table (Q14's drain) is needed for search to find old mail.
+    // the table is needed for search to find old mail.
     assert_eq!(db.query(replies()).await?.column::<Uuid>()?.into_iter().collect::<BTreeSet<_>>(), BTreeSet::from([uuid(2), uuid(4)]));
     let found = db.query(Query::table("mails").search(MAILS_SEARCH, [ann], "invoice").columns(["mail_id"])).await?;
     assert_eq!(found.column::<Uuid>()?.into_iter().collect::<BTreeSet<_>>(), BTreeSet::from([uuid(1), uuid(2), uuid(4)]));
 
     // A unique index over rows that hold duplicates is refused, and
-    // nothing half-built is left behind to sweep up (Q11).
+    // nothing half-built is left behind to sweep up.
     let unique = IndexDef::new("mails_uid_unique").on(["user_id", "sent", "uid_domain"]).unique();
     let refused = maintenance.create_index("mails", unique.clone()).await.unwrap_err();
     assert_eq!(refused.code, ErrorCode::UniqueViolation);
@@ -1048,7 +1053,7 @@ async fn usernames(db: &Client, query: Query) -> DbResult<Vec<String>> {
     Ok(column(&db.query(query).await?, "username"))
 }
 
-// R-Q1, R-Q2, R-Q3, R-T9: mail Q17 (run for every HTTP request, IMAP command and SMTP command).
+// R-Q1, R-Q2, R-Q3, R-T9: the user lookup, run for every HTTP request, IMAP command and SMTP command.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_user_is_found_by_id_name_email_or_subject_unless_deleted() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1096,8 +1101,8 @@ async fn a_user_is_found_by_id_name_email_or_subject_unless_deleted() -> DbResul
     Ok(())
 }
 
-/// Q18: write an account by id, inserting it or bringing the stored row up
-/// to date. Columns the statement does not name keep what they hold.
+/// Writes an account by id, inserting it or bringing the stored row up to
+/// date. Columns the statement does not name keep what they hold.
 fn seed_account(id: Uuid, columns: &[(&str, Expr)]) -> Insert {
     let mut insert = Insert::into("users").set("updated", now()).set("user_id", id);
     for (column, value) in columns {
@@ -1106,13 +1111,13 @@ fn seed_account(id: Uuid, columns: &[(&str, Expr)]) -> Insert {
     insert.on_conflict_update(PRIMARY).update_excluded(columns.iter().map(|(column, _)| *column)).update("updated", now()).returning(USER_COLUMNS)
 }
 
-// R-W1, R-W4, R-W5, R-W11, R-S3: mail Q18, Q21, Q25.
+// R-W1, R-W4, R-W5, R-W11, R-S3: an account seeded by upsert, a pending sign-up, and a first single-sign-on login.
 #[tokio::test(flavor = "multi_thread")]
 async fn accounts_are_seeded_by_upsert_and_created_unless_taken() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
 
-    // Q18 at first boot inserts the admin account.
+    // At first boot the upsert inserts the admin account.
     let admin = uuid(0xad);
     let first = db
         .insert(seed_account(admin, &[("username", val("admin")), ("password", val("hash-1")), ("email", val("admin@example.com"))]))
@@ -1136,7 +1141,7 @@ async fn accounts_are_seeded_by_upsert_and_created_unless_taken() -> DbResult<()
     assert_eq!(taken.code, ErrorCode::UniqueViolation);
     assert!(taken.violates("users_username_key"));
 
-    // Q21: a pending sign-up, with an id the app made and no password yet.
+    // A pending sign-up, with an id the application made and no password yet.
     let pending = uuid(0x51);
     let sign_up = || {
         Insert::into("users")
@@ -1155,7 +1160,7 @@ async fn accounts_are_seeded_by_upsert_and_created_unless_taken() -> DbResult<()
     let twice = db.insert(sign_up()).await.unwrap_err();
     assert!(twice.is_unique_violation() && twice.violates(PRIMARY));
 
-    // Q25: first single-sign-on login creates the user unless any unique
+    // A first single-sign-on login creates the user unless any unique
     // index objects. No row back means "someone has that name or subject".
     let sso = |name: &str, subject: &str| {
         Insert::into("users")
@@ -1180,7 +1185,7 @@ async fn accounts_are_seeded_by_upsert_and_created_unless_taken() -> DbResult<()
     Ok(())
 }
 
-// R-W6, R-W7, R-W10, R-X3: mail Q19, Q20, Q22, Q26.
+// R-W6, R-W7, R-W10, R-X3: a password change, sign-out everywhere, and updates and deletes that answer whether the row was there.
 #[tokio::test(flavor = "multi_thread")]
 async fn credentials_rotate_atomically_and_an_update_tells_whether_the_row_exists() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1188,8 +1193,9 @@ async fn credentials_rotate_atomically_and_an_update_tells_whether_the_row_exist
     let ann = user(&db, "ann").await?;
     db.update(Update::table("users").key([ann]).set("token", "reset-token").set("expiry", at(3600))).await?;
 
-    // Q19: the new password and the bumped version land together, and the
-    // statement answers the version that every other session now fails.
+    // A password change: the new password and the bumped version land
+    // together, and the statement answers the version that every other
+    // session now fails.
     let rotate = |id: Uuid, password: &str| {
         Update::table("users")
             .key([id])
@@ -1210,8 +1216,8 @@ async fn credentials_rotate_atomically_and_an_update_tells_whether_the_row_exist
     assert_eq!(db.update(rotate(ann, "hash-3")).await?.column::<i64>()?, [2]);
     assert!(db.update(rotate(uuid(404), "hash-x")).await?.is_empty());
 
-    // Q26: sign-out everywhere, addressed by OIDC subject. Eight at once
-    // each add one: no increment is lost.
+    // Sign-out everywhere, addressed by OIDC subject. Eight at once each
+    // add one: no increment is lost.
     db.update(Update::table("users").key([ann]).set("auth_sub", "oidc|ann")).await?;
     let bumps: Vec<_> = (0..8)
         .map(|_| {
@@ -1233,8 +1239,8 @@ async fn credentials_rotate_atomically_and_an_update_tells_whether_the_row_exist
     versions.sort();
     assert_eq!(versions, (3..=10).collect::<Vec<i64>>());
 
-    // Q20: an update by id returns the id, and that is how the app learns
-    // the row exists. Token and expiry are set, and cleared, together.
+    // An update by id returns the id, and that is how the application
+    // learns the row exists. Token and expiry are set, and cleared, together.
     let touch = |id: Uuid, token: Option<&str>, expiry: Option<Timestamp>| {
         Update::table("users").key([id]).set("updated", now()).set("token", token).set("expiry", expiry).returning(["user_id"])
     };
@@ -1244,13 +1250,13 @@ async fn credentials_rotate_atomically_and_an_update_tells_whether_the_row_exist
     assert!(db.get("users", [ann]).await?.expect("ann").is_null("expiry")?);
     let nobody = db.update(touch(uuid(404), Some("t"), Some(at(60)))).await?;
     assert_eq!((nobody.affected(), nobody.len()), (0, 0));
-    // UIDVALIDITY is set on first IMAP use: read (Q17), then write (Q20).
+    // UIDVALIDITY is set on first IMAP use: a read, then a write.
     assert!(db.get("users", [ann]).await?.expect("ann").is_null("imap_uid_validity")?);
     db.update(Update::table("users").key([ann]).set("updated", now()).set("imap_uid_validity", 1_794_711_304_i64).returning(["user_id"])).await?;
     assert_eq!(db.get("users", [ann]).await?.expect("ann").get::<i64>("imap_uid_validity")?, 1_794_711_304);
 
-    // Q22: the delete that reclaims an expired sign-up. The id comes back
-    // once; a second delete finds nothing.
+    // The delete that reclaims an expired sign-up. The id comes back once;
+    // a second delete finds nothing.
     let reclaim = || Delete::from("users").key([ann]).returning(["user_id"]);
     assert_eq!(db.delete(reclaim()).await?.column::<Uuid>()?, [ann]);
     let again = db.delete(reclaim()).await?;
@@ -1258,7 +1264,7 @@ async fn credentials_rotate_atomically_and_an_update_tells_whether_the_row_exist
     Ok(())
 }
 
-// R-Q3, R-Q6, R-W7, R-W11, R-T9, R-S3: mail Q23, Q24 (linking an OIDC login to an existing account).
+// R-Q3, R-Q6, R-W7, R-W11, R-T9, R-S3: linking an OIDC login to an existing account.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_login_is_linked_to_the_one_account_with_that_email_and_only_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1276,7 +1282,8 @@ async fn a_login_is_linked_to_the_one_account_with_that_email_and_only_once() ->
     let legacy = id(db.insert(account("legacy", "legacy@example.com").set("password", "hash").set("is_deleted", null())).await?)?;
     let bob = id(db.insert(account("bob", "bob@example.com").set("password", "hash")).await?)?;
 
-    // Q23. LIMIT 2 is how the app tells "exactly one" from "ambiguous".
+    // The accounts a login may be linked to. LIMIT 2 is how the application
+    // tells "exactly one" from "ambiguous".
     let candidates = |email: &str| {
         Query::table("users")
             .index("users_email_lower", KeyRange::eq([email.to_lowercase()]))
@@ -1293,7 +1300,7 @@ async fn a_login_is_linked_to_the_one_account_with_that_email_and_only_once() ->
     db.insert(account("ann-too", "ANN@EXAMPLE.COM").set("password", "hash")).await?;
     assert_eq!(usernames(&db, candidates("ann@example.com")).await?.len(), 2);
 
-    // Q24: link if still unlinked. The row comes back to whoever linked it.
+    // Link if still unlinked. The row comes back to whoever linked it.
     let link = |user: Uuid, subject: &str| {
         Update::table("users")
             .key([user])
@@ -1308,8 +1315,8 @@ async fn a_login_is_linked_to_the_one_account_with_that_email_and_only_once() ->
     let late = db.update(link(ann, "oidc|other")).await?;
     assert_eq!((late.affected(), late.len()), (0, 0));
     assert_eq!(db.get("users", [ann]).await?.expect("ann").get::<String>("auth_sub")?, "oidc|ann");
-    // The same subject on a second account is refused by the unique
-    // index, which the app reads as "someone else linked first".
+    // The same subject on a second account is refused by the unique index,
+    // which the application reads as "someone else linked first".
     let stolen = db.update(link(bob, "oidc|ann")).await.unwrap_err();
     assert_eq!(stolen.code, ErrorCode::UniqueViolation);
     assert!(stolen.violates("users_auth_sub_key"));
@@ -1325,7 +1332,7 @@ async fn a_login_is_linked_to_the_one_account_with_that_email_and_only_once() ->
     Ok(())
 }
 
-/// Q28: the session store's write. `optional` are the nullable columns this
+/// The session store's write. `optional` are the nullable columns this
 /// request carries; on a conflict the ones it leaves out keep their values.
 fn put_session(id: &str, user: Uuid, max_age: i64, optional: &[(&str, Expr)]) -> Insert {
     let mut insert = Insert::into("sessions")
@@ -1344,7 +1351,7 @@ fn put_session(id: &str, user: Uuid, max_age: i64, optional: &[(&str, Expr)]) ->
     insert.on_conflict_update(PRIMARY).update_excluded(written).update("updated", now()).returning(all_columns(&sessions_table()))
 }
 
-// R-W4, R-Q1, R-X4: mail Q27, Q28 (the session is read and written on every HTTP request).
+// R-W4, R-Q1, R-X4: the session is read and written on every HTTP request.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_is_upserted_on_every_request_and_keeps_what_a_request_leaves_out() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1364,7 +1371,7 @@ async fn a_session_is_upserted_on_every_request_and_keeps_what_a_request_leaves_
     let created = db.insert(put_session("sid-1", ann, 86_400_000, &cookie)).await?.one()?;
     assert_eq!(created.get::<String>("cookie_secure")?, "\"auto\"");
     assert!(created.is_null("auth_sid")? && created.is_null("cookie_domain")?);
-    // Q27 from another connection: what was returned is what is stored.
+    // The session read, from another connection: what was returned is what is stored.
     let read = other.query_opt(Query::table("sessions").key(["sid-1"]).limit(1)).await?.expect("visible as soon as the insert returned");
     assert_eq!(read, created);
     assert!(other.query_opt(Query::table("sessions").key(["sid-2"]).limit(1)).await?.is_none());
@@ -1389,7 +1396,7 @@ async fn a_session_is_upserted_on_every_request_and_keeps_what_a_request_leaves_
     Ok(())
 }
 
-// R-W10, R-W7, R-Q4, R-S4: mail Q29, Q30, Q31, and the session read of §3.2 (Q27, Q17, Q29).
+// R-W10, R-W7, R-Q4, R-S4: sessions are deleted one at a time, by login, by owner and by expiry; one whose user is gone is removed when a request finds it.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_are_deleted_by_id_owner_login_and_expiry() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1407,8 +1414,9 @@ async fn sessions_are_deleted_by_id_owner_login_and_expiry() -> DbResult<()> {
     let remaining = |rows: Rows| column::<String>(&rows, "session_id").into_iter().collect::<BTreeSet<_>>();
     let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<BTreeSet<_>>();
 
-    // Q30, hourly: everything that expires at or before the app's clock,
-    // which arrives as ISO text. A session with no expiry is never purged.
+    // The hourly purge: everything that expires at or before the
+    // application's clock, which arrives as ISO text. A session with no
+    // expiry is never purged.
     let purge = Delete::from("sessions")
         .index("sessions_cookie_expires", KeyRange::new(Bound::Unbounded, Bound::included([at(0).to_rfc3339()])))
         .returning(["session_id"]);
@@ -1416,13 +1424,13 @@ async fn sessions_are_deleted_by_id_owner_login_and_expiry() -> DbResult<()> {
     assert_eq!(purged.affected(), 2);
     assert_eq!(remaining(purged), ids(&["expired", "expiring-now"]));
 
-    // Q29: sign-out.
+    // Sign-out.
     let sign_out = |id: &str| Delete::from("sessions").key([id]).returning(["session_id"]);
     assert_eq!(db.delete(sign_out("a-microsecond-left")).await?.len(), 1);
     assert_eq!(db.delete(sign_out("a-microsecond-left")).await?.len(), 0);
 
-    // Q31: every session of one single sign-on session, of one impersonating
-    // admin, of one user. The app uses the count.
+    // Every session of one single sign-on session, of one impersonating
+    // admin, of one user. The application uses the count.
     let back_channel_logout = Delete::from("sessions").index("sessions_auth_sid", KeyRange::eq(["sso-7"])).returning(["session_id"]);
     assert_eq!(remaining(db.delete(back_channel_logout).await?), ids(&["bob-1", "carol-1"]));
     let impersonated = Delete::from("sessions").filter(col("session_authenticated_as").eq("admin")).returning(["session_id"]);
@@ -1432,8 +1440,8 @@ async fn sessions_are_deleted_by_id_owner_login_and_expiry() -> DbResult<()> {
     assert_eq!(remaining(db.delete(of_user(carol)).await?), ids(&["carol-2"]));
     assert_eq!(remaining(db.query(Query::table("sessions")).await?), ids(&["browser-session"]));
 
-    // A request with a session whose user is gone: Q27 finds the session,
-    // Q17 finds no user, Q29 removes the session. Nothing ties the two
+    // A request with a session whose user is gone: the session is found,
+    // its user is not, and the session is removed. Nothing ties the two
     // tables together, so deleting the user left the session behind.
     db.delete(Delete::from("users").key([ann])).await?;
     let session = db.query_opt(Query::table("sessions").key(["browser-session"]).limit(1)).await?.expect("no foreign key removed it");
@@ -1443,7 +1451,7 @@ async fn sessions_are_deleted_by_id_owner_login_and_expiry() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q3, R-Q11, R-W1, R-W6, R-W10, R-S6: mail Q32–Q39 (IMAP CREATE, RENAME, DELETE, SUBSCRIBE of §3.2).
+// R-Q3, R-Q11, R-W1, R-W6, R-W10, R-S6: IMAP CREATE, RENAME, DELETE and SUBSCRIBE on a user's mailboxes.
 #[tokio::test(flavor = "multi_thread")]
 async fn mailboxes_are_probed_by_name_without_case_then_written_by_id() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1465,7 +1473,7 @@ async fn mailboxes_are_probed_by_name_without_case_then_written_by_id() -> DbRes
             .returning(all_columns(&mailboxes_table()))
     };
 
-    // CREATE: probe the name (Q33), count for the per-user cap (Q35), insert (Q36).
+    // CREATE: probe the name, count for the per-user cap, insert.
     assert!(db.query_opt(named(ann, "Archive")).await?.is_none());
     assert_eq!(db.query_one(count_of(ann)).await?.get::<i64>("count")?, 0);
     let before = db.now().await?;
@@ -1480,13 +1488,13 @@ async fn mailboxes_are_probed_by_name_without_case_then_written_by_id() -> DbRes
     db.insert(create(bob, "Archive", None)).await?;
     let child: Uuid = db.insert(create(ann, "Archive 2019", Some(archive_id))).await?.one()?.get("mailbox_id")?;
 
-    // Q33 again, as every later command does: any case finds it, per user.
+    // The probe again, as every later command issues it: any case finds it, per user.
     for spelling in ["Archive", "ARCHIVE", "archive"] {
         let found = db.query_opt(named(ann, spelling)).await?.expect("found whatever the case");
         assert_eq!(found.get::<Uuid>("mailbox_id")?, archive_id);
         assert_eq!(found.get::<String>("name")?, "Archive");
     }
-    // Q32, Q35: the user's folders. The app sorts them itself.
+    // The user's folders, listed and counted. The application sorts them itself.
     let listed = db.query(Query::table("mailboxes").index("mailboxes_user_name", KeyRange::eq([ann]))).await?;
     assert_eq!(
         column::<String>(&listed, "name").into_iter().collect::<BTreeSet<_>>(),
@@ -1494,7 +1502,7 @@ async fn mailboxes_are_probed_by_name_without_case_then_written_by_id() -> DbRes
     );
     assert_eq!(db.query_one(count_of(ann)).await?.get::<i64>("count")?, 4);
     assert_eq!(db.query_one(count_of(bob)).await?.get::<i64>("count")?, 1);
-    // Q34: by the address mail is delivered to.
+    // A folder found by its delivery address.
     let by_address =
         Query::table("mailboxes").index("mailboxes_user_name", KeyRange::eq([ann])).filter(col("address").eq("projects@example.com")).limit(1);
     assert_eq!(db.query_one(by_address).await?.get::<String>("name")?, "Projects");
@@ -1504,7 +1512,7 @@ async fn mailboxes_are_probed_by_name_without_case_then_written_by_id() -> DbRes
     mapped(&db, ann, "Archive", uuid(1), 1).await?;
 
     // RENAME: probe the old name, probe the new one, then write the name
-    // and the validity the app computed from the row it read (Q38).
+    // and the validity the application computed from the row it read.
     let validity: i64 = db.query_opt(named(ann, "archive")).await?.expect("exists").get("uid_validity")?;
     assert!(db.query_opt(named(ann, "Old Mail")).await?.is_none());
     let renamed = db
@@ -1515,7 +1523,7 @@ async fn mailboxes_are_probed_by_name_without_case_then_written_by_id() -> DbRes
     assert_eq!(db.query_opt(named(ann, "OLD MAIL")).await?.expect("under its new name").get::<i64>("uid_validity")?, 2);
     assert!(db.query_opt(named(bob, "Archive")).await?.is_some());
 
-    // SUBSCRIBE / UNSUBSCRIBE (Q39).
+    // SUBSCRIBE and UNSUBSCRIBE.
     let unsubscribed = db.update(Update::table("mailboxes").key([archive_id]).set("subscribed", false).returning(["mailbox_id"])).await?;
     assert_eq!(unsubscribed.len(), 1);
     assert!(!db.get("mailboxes", [archive_id]).await?.expect("exists").get::<bool>("subscribed")?);
@@ -1526,8 +1534,8 @@ async fn mailboxes_are_probed_by_name_without_case_then_written_by_id() -> DbRes
     db.insert(create(ann, "PROJECTS", None)).await?;
     assert_eq!(db.query(Query::table("mailboxes").index("mailboxes_user_name", KeyRange::eq([val(ann), val("projects")]))).await?.len(), 2);
 
-    // DELETE (Q37) takes the folders under it, and only touches this table:
-    // the mapping rows filed under the old name are still there.
+    // DELETE takes the folders under it, and only touches this table: the
+    // mapping rows filed under the old name are still there.
     let deleted = db.delete(Delete::from("mailboxes").key([archive_id]).returning(["mailbox_id"])).await?;
     assert_eq!(deleted.column::<Uuid>()?, [archive_id]);
     assert!(db.get("mailboxes", [child]).await?.is_none());
@@ -1537,7 +1545,7 @@ async fn mailboxes_are_probed_by_name_without_case_then_written_by_id() -> DbRes
     Ok(())
 }
 
-// R-W1, R-W6, R-W7, R-W10, R-Q6: mail Q40–Q46.
+// R-W1, R-W6, R-W7, R-W10, R-Q6: web push subscriptions are stored, read for several users at once, refreshed, stamped and swept.
 #[tokio::test(flavor = "multi_thread")]
 async fn push_subscriptions_are_refreshed_listed_and_swept() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1559,7 +1567,7 @@ async fn push_subscriptions_are_refreshed_listed_and_swept() -> DbResult<()> {
     }
     let ids = |rows: Rows| column::<Uuid>(&rows, "push_subscription_id").into_iter().collect::<BTreeSet<_>>();
 
-    // Q44: the subscriptions of the users a new mail concerns.
+    // The subscriptions of the users a new mail concerns.
     let of_users =
         |users: &[Uuid]| Query::table("push_subscriptions").index_ranges("push_subscriptions_user", users.iter().map(|u| KeyRange::eq([*u])));
     assert_eq!(ids(db.query(of_users(&[ann, bob])).await?), BTreeSet::from([uuid(1), uuid(2), uuid(3)]));
@@ -1571,13 +1579,13 @@ async fn push_subscriptions_are_refreshed_listed_and_swept() -> DbResult<()> {
         .first()
         .expect("four rows")
         .get("updated")?;
-    // Q45: a browser refreshes its own subscription, and only its own.
+    // A browser refreshes its own subscription, and only its own.
     let refresh = |id: Uuid, user: Uuid| {
         Update::table("push_subscriptions").key([id]).filter(col("user_id").eq(user)).set("updated", now()).returning(["push_subscription_id"])
     };
     assert_eq!(db.update(refresh(uuid(1), ann)).await?.len(), 1);
     assert_eq!(db.update(refresh(uuid(3), ann)).await?.len(), 0);
-    // Q46: a delivery stamps the app's time of sending and the server's `updated`.
+    // A delivery stamps the application's time of sending and the server's `updated`.
     let notified = db
         .update(
             Update::table("push_subscriptions").key([uuid(3)]).set("updated", now()).set("last_notified", at(7)).returning(["push_subscription_id"]),
@@ -1588,13 +1596,13 @@ async fn push_subscriptions_are_refreshed_listed_and_swept() -> DbResult<()> {
     assert_eq!(row.get::<Timestamp>("last_notified")?, at(7));
     assert!(row.get::<Timestamp>("updated")? > stale);
 
-    // Q43, daily: whatever was not refreshed for a week, by the app's clock.
+    // The daily sweep: whatever was not refreshed for a week, by the application's clock.
     let week_ago = db.now().await?.plus_secs(-7 * 86_400);
     let swept = db.delete(Delete::from("push_subscriptions").filter(col("updated").lt(week_ago)).returning(["push_subscription_id"])).await?;
     assert_eq!(swept.affected(), 2);
     assert_eq!(ids(swept), BTreeSet::from([uuid(2), uuid(4)]));
 
-    // Q42: unsubscribe needs the owner; Q41: a dead endpoint is dropped by id alone.
+    // Unsubscribing needs the owner; a dead endpoint is dropped by id alone.
     let unsubscribe =
         |id: Uuid, user: Uuid| Delete::from("push_subscriptions").key([id]).filter(col("user_id").eq(user)).returning(["push_subscription_id"]);
     assert_eq!(db.delete(unsubscribe(uuid(1), bob)).await?.len(), 0);
@@ -1604,15 +1612,15 @@ async fn push_subscriptions_are_refreshed_listed_and_swept() -> DbResult<()> {
     Ok(())
 }
 
-// R-W5, R-T6: mail Q47 (webhooks are retried; an event is stored the first time only).
+// R-W5, R-T6: webhooks are retried; an event is stored the first time only.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mailgun_event_is_stored_once() -> DbResult<()> {
+async fn a_delivery_event_is_stored_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     let raw =
         json!({"signature": {"timestamp": "1794711304", "token": "t0k"}, "event-data": {"severity": "permanent", "event": "failed", "id": "ev-1"}});
     let event = |reason: &str| {
-        Insert::into("mailgun_events")
+        Insert::into("delivery_events")
             .set("updated", now())
             .set("event_id", "ev-1")
             .set("event", "failed")
@@ -1624,13 +1632,13 @@ async fn a_mailgun_event_is_stored_once() -> DbResult<()> {
             .set("received_at", at(5))
             .set("raw", raw.clone())
             .on_conflict_do_nothing_on(PRIMARY)
-            .returning(all_columns(&mailgun_events_table()))
+            .returning(all_columns(&delivery_events_table()))
     };
     let stored = db.insert(event("bounce")).await?;
     assert_eq!(stored.affected(), 1);
     let stored = stored.one()?;
     assert_eq!((stored.get::<Timestamp>("occurred_at")?, stored.get::<Timestamp>("received_at")?), (at(0), at(5)));
-    // The payload comes back as jsonb gave it: keys by length, then bytes.
+    // The payload comes back as jsonb gives it: keys by length, then bytes.
     assert_eq!(
         stored.get::<Json>("raw")?.to_string(),
         r#"{"signature":{"token":"t0k","timestamp":"1794711304"},"event-data":{"id":"ev-1","event":"failed","severity":"permanent"}}"#
@@ -1638,7 +1646,7 @@ async fn a_mailgun_event_is_stored_once() -> DbResult<()> {
 
     let retried = db.insert(event("suppress-bounce")).await?;
     assert_eq!((retried.affected(), retried.len()), (0, 0));
-    assert_eq!(db.get("mailgun_events", ["ev-1"]).await?.expect("the first delivery").get::<String>("reason")?, "bounce");
+    assert_eq!(db.get("delivery_events", ["ev-1"]).await?.expect("the first delivery").get::<String>("reason")?, "bounce");
     Ok(())
 }
 
@@ -1650,11 +1658,11 @@ enum Added {
     Full,
 }
 
-/// Q50 and Q51: add a pattern unless the user's list is full. Postgres did
-/// the count and the insert in one `INSERT .. SELECT .. WHERE (count) < cap`;
-/// here they are the two statements of a transaction, which has the
-/// database to itself. When no row comes back, a probe tells "already
-/// there" from "full", as it did before.
+/// Adds a pattern unless the user's list is full. SQL can put the count and
+/// the insert in one `INSERT .. SELECT .. WHERE (count) < cap`; here they
+/// are the two statements of a transaction, which has the database to
+/// itself. When no row comes back, a probe tells "already there" from
+/// "full".
 async fn allow(db: &Client, user: Uuid, pattern: &str, cap: i64) -> DbResult<Added> {
     let proposed = pattern.to_string();
     let created = db
@@ -1682,25 +1690,25 @@ async fn allow(db: &Client, user: Uuid, pattern: &str, cap: i64) -> DbResult<Add
     Ok(if db.query(probe).await?.len() == 1 { Added::Exists } else { Added::Full })
 }
 
-// R-Q3, R-Q6, R-Q11, R-W5, R-W10, R-X1: mail Q48–Q53.
+// R-Q3, R-Q6, R-Q11, R-W5, R-W10, R-X1: the spam allowlist is listed, checked for every received mail, added to under a cap and removed from.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_allowlist_is_matched_by_address_or_domain_and_capped() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     let (ann, bob) = (user(&db, "ann").await?, user(&db, "bob").await?);
-    // Patterns are stored lower-cased by the app; one from before that rule is not.
+    // Patterns are stored lower-cased by the application; one from before that rule is not.
     for (owner, pattern, age) in
         [(ann, "bob@remote.test", 30), (ann, "*@partner.test", 20), (ann, "Carol@Remote.test", 10), (bob, "bob@remote.test", 5)]
     {
         db.insert(Insert::into("spam_allowlist").set("user_id", owner).set("pattern", pattern).set("created_at", now() - seconds(age))).await?;
     }
 
-    // Q48: the settings page lists the newest first.
+    // The settings page lists the newest first.
     let list =
         |user: Uuid| Query::table("spam_allowlist").index("spam_allowlist_user_pattern", KeyRange::eq([user])).order_by(col("created_at").desc());
     assert_eq!(column::<String>(&db.query(list(ann)).await?, "pattern"), ["Carol@Remote.test", "*@partner.test", "bob@remote.test"]);
 
-    // Q49, for every received mail: is the sender, or the sender's whole
+    // For every received mail: is the sender, or the sender's whole
     // domain, on the list? Two keys of the lower-cased index, counted.
     let allowed = |user: Uuid, sender: &str| {
         let sender = sender.to_lowercase();
@@ -1718,7 +1726,7 @@ async fn the_allowlist_is_matched_by_address_or_domain_and_capped() -> DbResult<
         assert_eq!(db.query_one(allowed(owner, sender)).await?.get::<i64>("count")?, hits, "{sender}");
     }
 
-    // Q50, Q51 with a cap of five for the test (mail's is 1000).
+    // Adding under a cap, which is five for the test; a real one is far higher.
     let Added::Created(erin) = allow(&db, ann, "erin@remote.test", 5).await? else { panic!("there is room for a fourth") };
     let row = db.get("spam_allowlist", [erin]).await?.expect("created");
     assert_eq!(row.get::<String>("pattern")?, "erin@remote.test");
@@ -1730,11 +1738,11 @@ async fn the_allowlist_is_matched_by_address_or_domain_and_capped() -> DbResult<
     assert!(matches!(allow(&db, bob, "gina@remote.test", 5).await?, Added::Created(_)), "the cap is per user");
     assert_eq!(db.query(list(ann)).await?.len(), 5);
 
-    // Q52: remove by pattern, whatever case it was stored in. The count is the answer.
+    // Remove by pattern, whatever case it was stored in. The count is the answer.
     let remove = |pattern: &str| Delete::from("spam_allowlist").index("spam_allowlist_user_lower", KeyRange::eq([val(ann), val(pattern)]));
     assert_eq!(db.delete(remove("carol@remote.test")).await?.affected(), 1);
     assert_eq!(db.delete(remove("carol@remote.test")).await?.affected(), 0);
-    // Q53: remove by id, only for its owner.
+    // Remove by id, only for its owner.
     let remove_id = |user: Uuid| Delete::from("spam_allowlist").key([erin]).filter(col("user_id").eq(user));
     assert_eq!(db.delete(remove_id(bob)).await?.affected(), 0);
     assert_eq!(db.delete(remove_id(ann)).await?.affected(), 1);
@@ -1745,7 +1753,7 @@ async fn the_allowlist_is_matched_by_address_or_domain_and_capped() -> DbResult<
     Ok(())
 }
 
-// R-X2, R-X3, R-X8: mail Q50 under a race (§3.3: in Postgres two adds of different patterns could both pass the count).
+// R-X2, R-X3, R-X8: allowlist adds under a race (as one statement in Postgres, two adds of different patterns could both pass the count).
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_allowlist_adds_stop_exactly_at_the_cap() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1774,8 +1782,8 @@ async fn concurrent_allowlist_adds_stop_exactly_at_the_cap() -> DbResult<()> {
     Ok(())
 }
 
-/// Q56: count a trained document's words. One statement of up to 501
-/// rows; a word seen before has the new counts added to its own.
+/// Counts a trained document's words. One statement of up to 501 rows; a
+/// word seen before has the new counts added to its own.
 fn train(user: Uuid, words: &[String], spam: i64, ham: i64) -> Insert {
     let mut insert = Insert::into("spam_training").columns(["user_id", "word", "spam_count", "ham_count"]);
     for word in words {
@@ -1787,7 +1795,7 @@ fn train(user: Uuid, words: &[String], spam: i64, ham: i64) -> Insert {
         .update("ham_count", col("ham_count") + excluded("ham_count"))
 }
 
-// R-W2, R-W4, R-Q6, R-S5: mail Q54–Q58.
+// R-W2, R-W4, R-Q6, R-S5: spam training writes and reads the word counts of a whole document in one statement.
 #[tokio::test(flavor = "multi_thread")]
 async fn training_adds_the_counts_of_501_words_in_one_statement() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1801,7 +1809,7 @@ async fn training_adds_the_counts_of_501_words_in_one_statement() -> DbResult<()
     assert_eq!(db.insert(train(ann, &document(250..750), 0, 1)).await?.affected(), 501);
     db.insert(train(bob, &document(0..3), 5, 5)).await?;
 
-    // Q54: everything a user has trained.
+    // Everything a user has trained.
     let of_user = |user: Uuid| Query::table("spam_training").index("spam_training_user_word", KeyRange::eq([user]));
     let all = db.query(of_user(ann)).await?;
     assert_eq!(all.len(), 751);
@@ -1822,7 +1830,7 @@ async fn training_adds_the_counts_of_501_words_in_one_statement() -> DbResult<()
         assert_eq!(counts[word], expected, "{word}");
     }
 
-    // Q55: the totals row alone.
+    // The totals row alone.
     let totals = db
         .query_one(
             Query::table("spam_training")
@@ -1832,8 +1840,8 @@ async fn training_adds_the_counts_of_501_words_in_one_statement() -> DbResult<()
         .await?;
     assert_eq!((totals.get::<i64>("spam_count")?, totals.get::<i64>("ham_count")?), (1, 1));
 
-    // Q57, for every received mail: the counts of its words, the ones
-    // never trained simply missing. 501 keys in one statement.
+    // For every received mail: the counts of its words, the ones never
+    // trained simply missing. 501 keys in one statement.
     let mut asked: Vec<String> = (700..1200).map(|n| format!("word{n:03}")).collect();
     asked.push("__total__".into());
     let by_key = db
@@ -1846,14 +1854,14 @@ async fn training_adds_the_counts_of_501_words_in_one_statement() -> DbResult<()
     let by_filter = db.query(of_user(ann).filter(col("word").in_list(asked.clone()))).await?;
     assert_eq!(column::<String>(&by_filter, "word").into_iter().collect::<BTreeSet<_>>(), known.into_iter().collect::<BTreeSet<_>>());
 
-    // Q58: forget everything one user trained.
+    // Forget everything one user trained.
     assert_eq!(db.delete(Delete::from("spam_training").index("spam_training_user_word", KeyRange::eq([ann]))).await?.affected(), 751);
     assert!(db.query(of_user(ann)).await?.is_empty());
     assert_eq!(db.query(of_user(bob)).await?.len(), 4);
     Ok(())
 }
 
-// R-S7, R-W11, R-X1: mail §1.7 and §3.5 (VARCHAR(100): Postgres' 22001 fails the statement, and the app counts on it).
+// R-S7, R-W11, R-X1: a length limit like VARCHAR(100), where Postgres' 22001 fails the statement and the application counts on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_over_long_training_word_fails_the_whole_statement() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1876,7 +1884,7 @@ async fn an_over_long_training_word_fails_the_whole_statement() -> DbResult<()> 
     Ok(())
 }
 
-// R-W12, R-W4, R-Q10, R-Q11, R-S2: mail Q59 (§3.4: every delivery reserves two UIDs and a MODSEQ).
+// R-W12, R-W4, R-Q10, R-Q11, R-S2: every delivery reserves two UIDs and a MODSEQ from counters, atomically.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_counter_is_seeded_from_the_data_once_and_then_counts_up() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1941,7 +1949,7 @@ async fn a_counter_is_seeded_from_the_data_once_and_then_counts_up() -> DbResult
     Ok(())
 }
 
-// R-W12, R-X2, R-X3, R-X8: mail Q59 under contention (§3.4: strictly increasing per key, never reused).
+// R-W12, R-X2, R-X3, R-X8: counter reservations under contention are strictly increasing per key and never reused.
 #[tokio::test(flavor = "multi_thread")]
 async fn twenty_tasks_reserving_at_once_get_distinct_consecutive_numbers() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1978,7 +1986,7 @@ async fn twenty_tasks_reserving_at_once_get_distinct_consecutive_numbers() -> Db
     Ok(())
 }
 
-// R-Q10, R-Q11: mail Q60 (UIDNEXT for SELECT and STATUS; never MAX(uid) of the surviving rows).
+// R-Q10, R-Q11: UIDNEXT for SELECT and STATUS, which is never MAX(uid) of the surviving rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn uidnext_is_peeked_without_allocating() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2010,7 +2018,7 @@ async fn uidnext_is_peeked_without_allocating() -> DbResult<()> {
     Ok(())
 }
 
-// R-W4, R-W11, R-S3, R-S6: mail Q61, Q62 (§3.4, §3.5).
+// R-W4, R-W11, R-S3, R-S6: a mail is filed in a mailbox under a UID by upsert, and taken out again by delete.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mapping_upsert_returns_the_uid_that_stuck() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2032,7 +2040,7 @@ async fn a_mapping_upsert_returns_the_uid_that_stuck() -> DbResult<()> {
     // unique index. The upsert absorbs only its own target, so this is an
     // error. For an account's box the save that caused it switches to its
     // merge path; for the INBOX marker, where old data holds duplicate
-    // domain UIDs, the app logs it and carries on without the row.
+    // domain UIDs, the application logs it and carries on without the row.
     db.delete(Delete::from("mail_mailbox_uid").key([val(ann), val(sales), val(uuid(2))])).await?;
     for mailbox in [sales, "INBOX"] {
         let clash = db.insert(map_mail(ann, mailbox, uuid(2), 4)).await.unwrap_err();
@@ -2044,7 +2052,7 @@ async fn a_mapping_upsert_returns_the_uid_that_stuck() -> DbResult<()> {
     let orphan = db.insert(map_mail(ann, "INBOX", uuid(404), 9)).await.unwrap_err();
     assert_eq!(orphan.code, ErrorCode::ForeignKeyViolation);
 
-    // Q62: un-starring removes the pivot row; starring again takes a new UID.
+    // Un-starring removes the pivot row; starring again takes a new UID.
     assert_eq!(mapped(&db, ann, "Starred", uuid(1), 1).await?, 1);
     let unstar = || Delete::from("mail_mailbox_uid").key([val(ann), val("Starred"), val(uuid(1))]);
     assert_eq!(db.delete(unstar()).await?.affected(), 1);
@@ -2057,7 +2065,7 @@ async fn a_mapping_upsert_returns_the_uid_that_stuck() -> DbResult<()> {
     Ok(())
 }
 
-// R-X4, R-W12, R-W1, R-Q1: mail Q59, Q61, Q63, Q78 (§3.2 "save a mail": no transaction, any connection).
+// R-X4, R-W12, R-W1, R-Q1: saving a mail takes several statements, with no transaction, on whichever connections are free.
 #[tokio::test(flavor = "multi_thread")]
 async fn saving_a_mail_is_several_statements_each_visible_to_every_connection_at_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2092,8 +2100,8 @@ async fn saving_a_mail_is_several_statements_each_visible_to_every_connection_at
     let starred_uid = reserved(&other, reserve(ann, "mailbox", "Starred", false, &box_seed(ann, &["Starred"]))).await?;
     assert_eq!(mapped(&db, ann, "Starred", delivered.mail_id, starred_uid).await?, 1);
 
-    // An IDLE session on the other instance re-reads its UID lists (Q78)
-    // and finds the mail in each view.
+    // An IDLE session on the other instance re-reads its UID lists and
+    // finds the mail in each view.
     assert_eq!(other.query(domain_view(ann, false, Members::Inbox).select("uid", col("m.uid_domain"))).await?.column::<i64>()?, [1]);
     for mailbox in [sales, "Starred"] {
         assert_eq!(db.query(mapped_view(ann, false, mailbox, Members::All).select("uid", col("x.uid"))).await?.column::<i64>()?, [1], "{mailbox}");
@@ -2108,7 +2116,7 @@ async fn saving_a_mail_is_several_statements_each_visible_to_every_connection_at
     Ok(())
 }
 
-// R-W11, R-S3, R-W6, R-X4: mail Q63, Q64, Q67, Q68, Q61 (§3.5: 23505 as the signal to merge).
+// R-W11, R-S3, R-W6, R-X4: a unique violation (Postgres' 23505) is the signal to merge a duplicate delivery.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_duplicate_message_id_is_a_unique_violation_that_turns_into_a_merge() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2138,10 +2146,10 @@ async fn a_duplicate_message_id_is_a_unique_violation_that_turns_into_a_merge() 
     // Another user may hold the same Message-ID: the key is per user.
     save(&db, &Mail { mail_id: uuid(3), user_id: bob, ..first.clone() }).await?;
 
-    // Merge. Q64 reads the stored row whole.
+    // Merge. First the stored row is read whole.
     let stored = db.query_one(Query::table("mails").index(MAILS_MESSAGE, KeyRange::eq([val(ann), val(&first.message_id)]))).await?;
     assert_eq!(stored.get::<Uuid>("mail_id")?, first.mail_id);
-    // Q67: the app appends the envelope addresses it has not seen and writes the array back.
+    // The application appends the envelope addresses it has not seen and writes the array back.
     let mut envelope = stored.get::<Json>("envelope_to")?.as_array().cloned().expect("an array");
     envelope.extend(address_list(&again.envelope_to).and_then(|list| list.as_array().cloned()).expect("one recipient"));
     let merged = db
@@ -2153,7 +2161,7 @@ async fn a_duplicate_message_id_is_a_unique_violation_that_turns_into_a_merge() 
         )
         .await?;
     assert_eq!(merged.affected(), 1);
-    // Q68: the second copy was not spam, so the mail leaves Junk, under a new MODSEQ.
+    // The second copy was not spam, so the mail leaves Junk, under a new MODSEQ.
     let modseq = next_modseq(&db, ann).await?;
     let flipped = db
         .update(
@@ -2165,8 +2173,8 @@ async fn a_duplicate_message_id_is_a_unique_violation_that_turns_into_a_merge() 
         )
         .await?;
     assert_eq!(flipped.affected(), 1);
-    // Q61 for the box it is already in gives back the UID it has; the
-    // number reserved for the duplicate is simply never used.
+    // Filing it in the box it is already in gives back the UID it has;
+    // the number reserved for the duplicate is simply never used.
     assert_eq!(mapped(&db, ann, sales, first.mail_id, 2).await?, 1);
     assert_eq!(mapped(&db, ann, "INBOX/accounts/info", first.mail_id, 1).await?, 1);
 
@@ -2186,8 +2194,8 @@ async fn a_duplicate_message_id_is_a_unique_violation_that_turns_into_a_merge() 
     Ok(())
 }
 
-/// Q70: set `read` or `saved` if it is not set that way already, stamping
-/// a MODSEQ. A returned row means this caller made the change.
+/// Sets `read` or `saved` if it is not set that way already, stamping a
+/// MODSEQ. A returned row means this caller made the change.
 fn set_flag(flag: &str, mail_id: Uuid, user: Uuid, on: bool, modseq: i64) -> Update {
     Update::table("mails")
         .key([mail_id])
@@ -2198,7 +2206,7 @@ fn set_flag(flag: &str, mail_id: Uuid, user: Uuid, on: bool, modseq: i64) -> Upd
         .returning(["mail_id"])
 }
 
-/// Q66: one flag of one mail, to tell "already so" from "no such mail".
+/// One flag of one mail, to tell "already so" from "no such mail".
 async fn flag(db: &Client, name: &str, mail_id: Uuid, user: Uuid) -> DbResult<Option<bool>> {
     match db.query_opt(Query::table("mails").key([mail_id]).filter(col("user_id").eq(user)).columns([name]).limit(1)).await? {
         Some(row) => Ok(Some(row.get(name)?)),
@@ -2206,7 +2214,7 @@ async fn flag(db: &Client, name: &str, mail_id: Uuid, user: Uuid) -> DbResult<Op
     }
 }
 
-// R-W7, R-X3, R-X4, R-W6: mail Q66, Q69, Q70 (§3.2 "mark read / saved": probe, reserve, compare-and-set).
+// R-W7, R-X3, R-X4, R-W6: marking a mail read or saved is a probe, a reservation and a compare-and-set.
 #[tokio::test(flavor = "multi_thread")]
 async fn marking_a_mail_read_is_a_compare_and_set_that_one_caller_wins() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2215,8 +2223,8 @@ async fn marking_a_mail_read_is_a_compare_and_set_that_one_caller_wins() -> DbRe
     save_all(&db, &[mail(ann, 1), mail(ann, 2)]).await?;
     let stale = rewind_updated(&db, ann).await?;
 
-    // Opening a mail in eight tabs at once: each probes (Q66), reserves a
-    // MODSEQ (Q59) and tries the guarded update (Q70).
+    // Opening a mail in eight tabs at once: each probes, reserves a
+    // MODSEQ and tries the guarded update.
     let attempts: Vec<_> = (0..8)
         .map(|_| {
             let db = db.clone();
@@ -2254,8 +2262,8 @@ async fn marking_a_mail_read_is_a_compare_and_set_that_one_caller_wins() -> DbRe
     assert!(db.update(set_flag("saved", uuid(2), ann, false, 13)).await?.is_empty());
     assert_eq!(db.get("mails", [uuid(2)]).await?.expect("the mail").get::<i64>("modseq")?, 12);
 
-    // Q69: caching the computed size is not a change a client should
-    // sync, so it leaves `updated` and `modseq` alone.
+    // Caching the computed size is not a change a client should sync, so
+    // it leaves `updated` and `modseq` alone.
     let before = updated_of(&db, uuid(2)).await?;
     let sized = db.update(Update::table("mails").key([uuid(2)]).filter(col("user_id").eq(ann)).set("rfc822_size", 48_213_i64)).await?;
     assert_eq!(sized.affected(), 1);
@@ -2264,7 +2272,7 @@ async fn marking_a_mail_read_is_a_compare_and_set_that_one_caller_wins() -> DbRe
     Ok(())
 }
 
-// R-W7, R-T9, R-W6: mail Q72, Q73 (§3.2 "mark spam").
+// R-W7, R-T9, R-W6: marking a mail as spam, and telling "nothing changed" from "no such mail".
 #[tokio::test(flavor = "multi_thread")]
 async fn marking_spam_reports_whether_anything_changed() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2281,7 +2289,7 @@ async fn marking_spam_reports_whether_anything_changed() -> DbResult<()> {
             .set("modseq", modseq)
             .returning(["mail_id"])
     };
-    // Q73: when nothing changed, is the mail there at all?
+    // When nothing changed, is the mail there at all?
     let found = |mail_id: Uuid, user: Uuid| {
         Query::table("mails").key([mail_id]).filter(col("user_id").eq(user).and(col("expunged").eq(false))).select("one", val(1)).limit(1)
     };
@@ -2305,7 +2313,7 @@ async fn marking_spam_reports_whether_anything_changed() -> DbResult<()> {
     Ok(())
 }
 
-// R-S6, R-W10, R-W11: mail Q22, Q71 and the cascade graph of §1.12.
+// R-S6, R-W10, R-W11: hard deletes of a mail and of a user, and what the foreign keys take with them.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_mail_or_a_user_takes_what_points_at_it_and_nothing_else() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2339,7 +2347,7 @@ async fn deleting_a_mail_or_a_user_takes_what_points_at_it_and_nothing_else() ->
         async move { db.query_one(query).await?.get::<i64>("n") }
     };
 
-    // Q71: the HTTP delete is a hard delete, for the owner only.
+    // The HTTP delete is a hard delete, for the owner only.
     let delete = |mail_id: Uuid, user: Uuid| Delete::from("mails").key([mail_id]).filter(col("user_id").eq(user)).returning(["mail_id"]);
     assert_eq!(db.delete(delete(uuid(1), bob)).await?.affected(), 0);
     let deleted = db.delete(delete(uuid(1), ann)).await?;
@@ -2356,8 +2364,8 @@ async fn deleting_a_mail_or_a_user_takes_what_points_at_it_and_nothing_else() ->
     let orphan_box = db.insert(Insert::into("mailboxes").set("user_id", uuid(404)).set("name", "Nowhere")).await.unwrap_err();
     assert_eq!(orphan_box.code, ErrorCode::ForeignKeyViolation);
 
-    // Q22: deleting a user empties five tables directly and the mapping
-    // table through the mails.
+    // Deleting a user empties five tables directly and the mapping table
+    // through the mails.
     assert_eq!(db.delete(Delete::from("users").key([ann]).returning(["user_id"])).await?.affected(), 1);
     for table in ["mailboxes", "push_subscriptions", "spam_allowlist", "spam_training", "users"] {
         assert_eq!(rows(table).await?, 1, "{table} keeps only bob's row");
@@ -2372,7 +2380,7 @@ async fn deleting_a_mail_or_a_user_takes_what_points_at_it_and_nothing_else() ->
     Ok(())
 }
 
-// R-Q13, R-Q2, R-Q1: mail Q65, Q74 (an attachment download is authorised by finding its id in a mail of the user).
+// R-Q13, R-Q2, R-Q1: an attachment download is authorised by finding its id in a mail of the user.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attachment_is_authorised_by_json_containment() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2413,7 +2421,7 @@ async fn an_attachment_is_authorised_by_json_containment() -> DbResult<()> {
     // A NULL column and an empty array contain nothing, and are no error.
     assert!(db.query_opt(holding(ann, "f-404")).await?.is_none());
 
-    // Q65: one mail, whole, for its owner.
+    // One mail, whole, for its owner.
     let whole = |mail_id: Uuid, user: Uuid| Query::table("mails").key([mail_id]).filter(col("user_id").eq(user)).limit(1);
     let row = db.query_opt(whole(uuid(1), ann)).await?.expect("ann's mail");
     assert_eq!(row.columns(), all_columns(&mails_table()));
@@ -2422,7 +2430,7 @@ async fn an_attachment_is_authorised_by_json_containment() -> DbResult<()> {
     Ok(())
 }
 
-// R-T6, R-Q13: mail §4 (JSONB comes back in Postgres' canonical form, and responses and their ETags expose it).
+// R-T6, R-Q13: JSON comes back in the canonical form of Postgres' JSONB, which responses and their ETags expose.
 #[tokio::test(flavor = "multi_thread")]
 async fn json_comes_back_with_keys_in_jsonb_order() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2449,7 +2457,7 @@ async fn json_comes_back_with_keys_in_jsonb_order() -> DbResult<()> {
     );
     assert_eq!(row.get::<String>("cc_text")?, "carol <carol@example.com>, dave <dave@example.com>");
 
-    // The functions mail's SQL applied to these columns.
+    // The JSON functions a mail store applies to these columns.
     let parts = db
         .query_one(
             Query::table("mails")
@@ -2478,19 +2486,19 @@ async fn uids(db: &Client, query: Query) -> DbResult<Vec<i64>> {
     db.query(query).await?.column()
 }
 
-/// Q75's answer: (messages, unseen).
+/// A mailbox's counts: (messages, unseen).
 async fn counted(db: &Client, rows: Query, members: Members) -> DbResult<(i64, i64)> {
     let row = db.query_one(counts(rows, members)).await?;
     Ok((row.get("total")?, row.get("unread")?))
 }
 
-/// Q81: HIGHESTMODSEQ, over expunged mail and non-members too, since an
-/// expunge must advance it. One for a mailbox that never held anything.
+/// HIGHESTMODSEQ, over expunged mail and non-members too, since an expunge
+/// must advance it. One for a mailbox that never held anything.
 async fn highest_modseq(db: &Client, rows: Query) -> DbResult<i64> {
     db.query_one(rows.select("highest", max(col("m.modseq")).or_else(1))).await?.get("highest")
 }
 
-// R-Q2, R-Q4, R-Q5, R-Q6, R-Q11, R-S4: mail Q75, Q76, Q78, Q79, Q80, Q81 over the domain UID space (§7.1).
+// R-Q2, R-Q4, R-Q5, R-Q6, R-Q11, R-S4: what SELECT, STATUS, FETCH and IDLE read over the domain UID space.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_domain_view_is_a_uid_range_of_mails_narrowed_by_membership() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2513,7 +2521,7 @@ async fn a_domain_view_is_a_uid_range_of_mails_narrowed_by_membership() -> DbRes
     .await?;
     let uid_list = |user: Uuid, sent: bool, members: Members| domain_view(user, sent, members).select("uid", col("m.uid_domain"));
 
-    // Q78: a session's UID list on SELECT, for INBOX, Drafts, Junk and Sent.
+    // A session's UID list on SELECT, for INBOX, Drafts, Junk and Sent.
     // The index gives UID order; nothing is sorted.
     assert_eq!(uids(&db, uid_list(ann, false, Members::Inbox)).await?, [1, 2, 6]);
     assert_eq!(uids(&db, uid_list(ann, false, Members::Drafts)).await?, [3]);
@@ -2521,25 +2529,25 @@ async fn a_domain_view_is_a_uid_range_of_mails_narrowed_by_membership() -> DbRes
     assert_eq!(uids(&db, uid_list(ann, true, Members::All)).await?, [1, 2]);
     assert_eq!(uids(&db, uid_list(bob, false, Members::Inbox)).await?, [1]);
 
-    // Q75: EXISTS and UNSEEN. An empty mailbox still answers, with zeros.
+    // EXISTS and UNSEEN. An empty mailbox still answers, with zeros.
     assert_eq!(counted(&db, domain_rows(ann, false), Members::Inbox).await?, (3, 2));
     assert_eq!(counted(&db, domain_rows(ann, false), Members::Drafts).await?, (1, 1));
     assert_eq!(counted(&db, domain_rows(ann, false), Members::Junk).await?, (1, 1));
     assert_eq!(counted(&db, domain_rows(ann, true), Members::All).await?, (2, 1));
     assert_eq!(counted(&db, domain_rows(bob, true), Members::All).await?, (0, 0));
 
-    // Q79: the first unseen message, found by reading the range until one matches.
+    // The first unseen message, found by reading the range until one matches.
     let first_unseen = |user: Uuid, sent: bool, members: Members| uid_list(user, sent, members).filter(col("m.read").eq(false)).limit(1);
     assert_eq!(uids(&db, first_unseen(ann, false, Members::Inbox)).await?, [2]);
     assert_eq!(uids(&db, first_unseen(ann, true, Members::All)).await?, [2]);
     assert!(uids(&db, first_unseen(bob, false, Members::Junk)).await?.is_empty());
 
-    // Q81.
+    // HIGHESTMODSEQ.
     assert_eq!(highest_modseq(&db, domain_rows(ann, false)).await?, 12);
     assert_eq!(highest_modseq(&db, domain_rows(ann, true)).await?, 6);
     assert_eq!(highest_modseq(&db, domain_rows(bob, true)).await?, 1);
 
-    // Q76, FETCH 2:* (the open end arrives as 999999999): only the columns
+    // FETCH 2:* (the open end arrives as 999999999): only the columns
     // asked for, the UID under the name the session expects, and the body
     // sizes without the bodies.
     let fetch = |low: i64, high: i64| {
@@ -2566,8 +2574,8 @@ async fn a_domain_view_is_a_uid_range_of_mails_narrowed_by_membership() -> DbRes
     // The builder's by-position form: messages 2 and 3 of the mailbox.
     assert_eq!(uids(&db, uid_list(ann, false, Members::Inbox).offset(1).limit(2)).await?, [2, 6]);
 
-    // Q80: the flags of the mails an IDLE wake-up named, by primary key,
-    // dropping those that are not this side's or are expunged. No membership test.
+    // The flags of the mails an IDLE wake-up named, by primary key, dropping
+    // those that are not this side's or are expunged. No membership test.
     let named = [uuid(6), uuid(5), uuid(1), uuid(4), uuid(901), uuid(7), uuid(404)];
     let flags = Query::table("mails")
         .alias("m")
@@ -2587,7 +2595,7 @@ async fn a_domain_view_is_a_uid_range_of_mails_narrowed_by_membership() -> DbRes
     Ok(())
 }
 
-// R-Q9, R-Q2, R-Q4, R-Q5, R-Q6, R-Q11: mail Q75, Q76, Q78, Q79, Q80, Q81 over a mapped box (§7.1).
+// R-Q9, R-Q2, R-Q4, R-Q5, R-Q6, R-Q11: what SELECT, STATUS, FETCH and IDLE read over a mapped box.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mapped_box_is_a_uid_range_of_the_mapping_table_joined_to_its_mails() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2626,7 +2634,7 @@ async fn a_mapped_box_is_a_uid_range_of_the_mapping_table_joined_to_its_mails() 
     mapped(&db, bob, sales, uuid(901), 11).await?;
     let uid_list = |user: Uuid, sent: bool, mailbox: &str, members: Members| mapped_view(user, sent, mailbox, members).select("uid", col("x.uid"));
 
-    // Q78: in the box's UID order, which is the mapping index's.
+    // The UID list, in the box's UID order, which is the mapping index's.
     assert_eq!(uids(&db, uid_list(ann, false, sales, Members::Inbox)).await?, [10, 30]);
     // A user-created box shows everything filed in it, spam too.
     assert_eq!(uids(&db, uid_list(ann, false, "Archive", Members::All)).await?, [1, 2]);
@@ -2636,18 +2644,18 @@ async fn a_mapped_box_is_a_uid_range_of_the_mapping_table_joined_to_its_mails() 
     assert_eq!(uids(&db, uid_list(bob, false, sales, Members::Inbox)).await?, [11]);
     assert!(uids(&db, uid_list(ann, false, "Trash", Members::All)).await?.is_empty());
 
-    // Q75.
+    // EXISTS and UNSEEN.
     assert_eq!(counted(&db, mapped_rows(ann, false, sales), Members::Inbox).await?, (2, 1));
     assert_eq!(counted(&db, mapped_rows(ann, false, "Archive"), Members::All).await?, (2, 2));
     assert_eq!(counted(&db, mapped_rows(ann, false, "Trash"), Members::All).await?, (0, 0));
-    // Q79.
+    // The first unseen message.
     let first_unseen = uid_list(ann, false, sales, Members::Inbox).filter(col("m.read").eq(false)).limit(1);
     assert_eq!(uids(&db, first_unseen).await?, [10]);
-    // Q81: the expunged mail's MODSEQ is the highest.
+    // HIGHESTMODSEQ: the expunged mail's MODSEQ is the highest.
     assert_eq!(highest_modseq(&db, mapped_rows(ann, false, sales)).await?, 40);
     assert_eq!(highest_modseq(&db, mapped_rows(ann, false, "Trash")).await?, 1);
 
-    // Q76 by UID: a range of the mapping index, projecting the mail's
+    // FETCH by UID: a range of the mapping index, projecting the mail's
     // columns and the mapping's UID.
     let fetch = |low: i64, high: i64| {
         mapped_view(ann, false, sales, Members::Inbox)
@@ -2662,7 +2670,7 @@ async fn a_mapped_box_is_a_uid_range_of_the_mapping_table_joined_to_its_mails() 
     // By position: the second message of the box.
     assert_eq!(uids(&db, uid_list(ann, false, sales, Members::Inbox).offset(1).limit(1)).await?, [30]);
 
-    // Q80: flags of named mails with the box's UIDs. Each is one mapping
+    // The flags of named mails, with the box's UIDs. Each is one mapping
     // row by primary key; the mail it joins decides whether it counts.
     let named = [uuid(1), uuid(3), uuid(2), uuid(6)];
     let flags = Query::table("mail_mailbox_uid")
@@ -2677,7 +2685,7 @@ async fn a_mapped_box_is_a_uid_range_of_the_mapping_table_joined_to_its_mails() 
         db.query(flags).await?.map::<(Uuid, i64, bool, bool, bool, bool, bool)>()?,
         [(uuid(1), 30, true, false, false, false, false), (uuid(2), 10, false, false, false, false, false)]
     );
-    // The same as the SQL wrote it, `m.mail_id = ANY($4)`, is a filter
+    // The same as SQL would write it, `m.mail_id = ANY(..)`, is a filter
     // over the whole box, and answers in UID order.
     let scanned = mapped_rows(ann, false, sales)
         .filter(col("m.expunged").eq(false).and(col("m.mail_id").in_list(id_list(&named))))
@@ -2687,7 +2695,7 @@ async fn a_mapped_box_is_a_uid_range_of_the_mapping_table_joined_to_its_mails() 
     Ok(())
 }
 
-/// An IMAP SEARCH key, as mail's builder gets it from the parser.
+/// An IMAP SEARCH key, as the query builder gets it from the parser.
 enum Key {
     /// ALL, OLD, RECENT: constrains nothing.
     All,
@@ -2724,9 +2732,9 @@ enum Compiled {
     Condition(Expr),
 }
 
-/// mail's SEARCH builder with expressions where it had SQL fragments. The
+/// A SEARCH builder, with expressions where a SQL one has fragments. The
 /// user's text goes into the pattern as typed: `%`, `_` and `\` keep their
-/// LIKE meaning, as they did in Postgres. NOT and OR nest without limit.
+/// LIKE meaning, as they do in Postgres. NOT and OR nest without limit.
 fn compile(key: &Key, uid: &Expr) -> Compiled {
     let holds = |column: &str, text: &str| col(&format!("m.{column}")).ilike(format!("%{text}%"));
     match key {
@@ -2754,8 +2762,8 @@ fn compile(key: &Key, uid: &Expr) -> Compiled {
     }
 }
 
-/// Q77: the UIDs of a view's mails that satisfy every key, ascending,
-/// however many there are. `uid` is the view's UID column.
+/// The UIDs of a view's mails that satisfy every key, ascending, however
+/// many there are. `uid` is the view's UID column.
 fn search(view: Query, uid: Expr, keys: &[Key]) -> Query {
     let mut query = view;
     for key in keys {
@@ -2827,7 +2835,7 @@ async fn searchable(db: &Client) -> DbResult<Uuid> {
     Ok(ann)
 }
 
-// R-Q20, R-Q2, R-Q4: mail Q77 (criteria AND-ed, NOT and OR nested, the builder's rules for keys that constrain nothing or match nothing).
+// R-Q20, R-Q2, R-Q4: IMAP SEARCH (criteria AND-ed, NOT and OR nested, the builder's rules for keys that constrain nothing or match nothing).
 #[tokio::test(flavor = "multi_thread")]
 async fn search_combines_keys_with_and_or_and_not_to_any_depth() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2873,7 +2881,7 @@ async fn search_combines_keys_with_and_or_and_not_to_any_depth() -> DbResult<()>
     Ok(())
 }
 
-// R-Q7: mail Q77 (case-insensitive substring match on headers and bodies, with the user's wildcards left as wildcards).
+// R-Q7: IMAP SEARCH (case-insensitive substring match on headers and bodies, with the user's wildcards left as wildcards).
 #[tokio::test(flavor = "multi_thread")]
 async fn search_matches_substrings_without_case_and_keeps_the_users_wildcards() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2904,20 +2912,20 @@ async fn search_matches_substrings_without_case_and_keeps_the_users_wildcards() 
     // and a backslash makes the next character literal.
     assert_eq!(found(&db, ann, &[Key::Contains("text", "50\\%")]).await?, [3]);
     assert_eq!(found(&db, ann, &[Key::Contains("subject", "a\\_c")]).await?, [4]);
-    // Had mail escaped the text, as `like_escape` does, the wildcards would be gone.
+    // Had the builder escaped the text, as `like_escape` does, the wildcards would be gone.
     let literal = |text: &str| {
         domain_view(ann, false, Members::Inbox).filter(col("m.subject").ilike(format!("%{}%", like_escape(text)))).select("uid", col("m.uid_domain"))
     };
     assert_eq!(uids(&db, literal("a_c")).await?, [4]);
     assert!(uids(&db, literal("in%due")).await?.is_empty());
     assert_eq!(uids(&db, literal("100%")).await?, [1]);
-    // LIKE with case, which mail uses on Message-IDs elsewhere, tells `RE` from `re`.
+    // LIKE with case, which other queries here use on Message-IDs, tells `RE` from `re`.
     let cased = domain_view(ann, false, Members::Inbox).filter(col("m.subject").like("RE:%")).select("uid", col("m.uid_domain"));
     assert_eq!(uids(&db, cased).await?, [3]);
     Ok(())
 }
 
-// R-T9: mail Q77 (`NOT (cc_text ILIKE ..)` is not true of a mail that has no Cc).
+// R-T9: IMAP SEARCH (`NOT (cc_text ILIKE ..)` is not true of a mail that has no Cc).
 #[tokio::test(flavor = "multi_thread")]
 async fn search_follows_sql_null_logic_under_not_and_or() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2948,7 +2956,7 @@ async fn search_follows_sql_null_logic_under_not_and_or() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q4, R-Q9, R-T3: mail Q77 (dates as half-open ranges, UID sets as unions of ranges, and the same search over a mapped box).
+// R-Q4, R-Q9, R-T3: IMAP SEARCH (dates as half-open ranges, UID sets as unions of ranges, and the same search over a mapped box).
 #[tokio::test(flavor = "multi_thread")]
 async fn search_dates_are_half_open_and_uid_sets_are_unions_of_ranges() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2965,7 +2973,7 @@ async fn search_dates_are_half_open_and_uid_sets_are_unions_of_ranges() -> DbRes
     assert_eq!(found(&db, ann, &[Key::Since(day(11)), Key::Before(day(13))]).await?, [2, 3, 4]);
     assert_eq!(found(&db, ann, &[not(Key::On(day(11)))]).await?, [1, 4, 6]);
     assert!(found(&db, ann, &[Key::On(day(14))]).await?.is_empty());
-    // The app binds dates as ISO text; compared with a timestamp it is read as one.
+    // The application binds dates as ISO text; compared with a timestamp it is read as one.
     let before = domain_view(ann, false, Members::Inbox).filter(col("m.date").lt("2026-11-11T00:00:00.000Z")).select("uid", col("m.uid_domain"));
     assert_eq!(uids(&db, before).await?, [1]);
 
@@ -2994,7 +3002,8 @@ async fn search_dates_are_half_open_and_uid_sets_are_unions_of_ranges() -> DbRes
 /// A message as STORE reports it: mail, UID, the five flags, MODSEQ.
 type Stored = (Uuid, i64, bool, bool, bool, bool, bool, i64);
 
-/// Q86's RETURNING, and Q84's projection: `uid` is the view's UID column.
+/// What STORE returns for each message it changed, the same columns a read
+/// of the current state selects. `uid` is the view's UID column.
 fn store_returning(update: Update, uid: &str) -> Update {
     update.returning(["m.mail_id"]).returning_expr("uid", col(uid)).returning(FLAGS).returning(["m.modseq"])
 }
@@ -3018,7 +3027,7 @@ async fn state(db: &Client, mail_id: Uuid) -> DbResult<Stored> {
     Ok(db.query(query).await?.map::<Stored>()?.remove(0))
 }
 
-// R-W6, R-W7, R-Q4, R-X4: mail Q59, Q84, Q85, Q86 in a domain view (§3.2 STORE, §3.4 CONDSTORE).
+// R-W6, R-W7, R-Q4, R-X4: STORE in a domain view, with CONDSTORE's UNCHANGEDSINCE guard.
 #[tokio::test(flavor = "multi_thread")]
 async fn store_stamps_every_message_it_addresses_and_skips_those_changed_since() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3039,17 +3048,17 @@ async fn store_stamps_every_message_it_addresses_and_skips_those_changed_since()
     )
     .await?;
     let stale = rewind_updated(&db, ann).await?;
-    // `{W}`: the messages a UID range addresses in INBOX.
+    // The messages a UID range addresses in INBOX.
     let addressed = |low: i64, high: i64| domain_view(ann, false, Members::Inbox).index(MAILS_UID, domain_uids(ann, false, low, high));
 
     // UID STORE 1:5 (UNCHANGEDSINCE 3) +FLAGS (\Seen). One MODSEQ is
     // reserved for the whole command.
     let modseq = next_modseq(&db, ann).await?;
     assert_eq!(modseq, 6);
-    // Q85: what the range addresses, to report the ones the guard skips.
+    // First a read of what the range addresses, to report the ones the guard skips.
     assert_eq!(uids(&db, addressed(1, 5).select("uid", col("m.uid_domain"))).await?, [1, 2, 3, 4]);
-    // Q86: the guard is one more condition of the same statement, and
-    // the rows come back as they are after the change.
+    // Then the update: the guard is one more condition of the same
+    // statement, and the rows come back as they are after the change.
     let store = Update::rows(addressed(1, 5)).filter(col("m.modseq").le(3)).set("read", true).set("updated", now()).set("modseq", modseq);
     let updated = db.update(store_returning(store, "m.uid_domain")).await?;
     assert_eq!(updated.affected(), 3);
@@ -3089,7 +3098,7 @@ async fn store_stamps_every_message_it_addresses_and_skips_those_changed_since()
     );
 
     // A STORE that names no flag changes nothing and reports the current
-    // state (Q84); one that addresses nothing returns nothing.
+    // state; one that addresses nothing returns nothing.
     let current = addressed(1, 999_999_999).columns(["m.mail_id"]).select("uid", col("m.uid_domain")).columns(FLAGS).columns(["m.modseq"]);
     assert_eq!(
         db.query(current).await?.map::<Stored>()?,
@@ -3127,7 +3136,7 @@ fn mapped_mails(user: Uuid, sent: bool, mailbox: &str, members: Members, low: i6
         .filter(col("m.expunged").eq(false).and(members.condition()))
 }
 
-// R-W8, R-W7, R-Q9, R-W4: mail Q59, Q61, Q62, Q85, Q86 in a mapped box (`UPDATE .. FROM`, returning the joined table's UID).
+// R-W8, R-W7, R-Q9, R-W4: STORE in a mapped box (SQL's `UPDATE .. FROM`, returning the joined table's UID).
 #[tokio::test(flavor = "multi_thread")]
 async fn store_in_a_mapped_box_updates_mails_through_a_join_and_returns_the_box_uid() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3155,10 +3164,10 @@ async fn store_in_a_mapped_box_updates_mails_through_a_join_and_returns_the_box_
     // UID STORE 10:14 (UNCHANGEDSINCE 5) +FLAGS (\Flagged) in the account's inbox.
     let modseq = next_modseq(&db, ann).await?;
     assert_eq!(modseq, 9);
-    // Q85 reads the box's own UID range.
+    // The read of what is addressed takes the box's own UID range.
     let matched = mapped_view(ann, false, sales, Members::Inbox).index(BOX_UID, mapped_uids(ann, sales, 10, 14)).select("uid", col("x.uid"));
     assert_eq!(uids(&db, matched).await?, [10, 11, 12]);
-    // Q86 changes `mails` and answers with the UID from the mapping row.
+    // The update changes `mails` and answers with the UID from the mapping row.
     let store = Update::rows(mapped_mails(ann, false, sales, Members::Inbox, 10, 14))
         .filter(col("m.modseq").le(5))
         .set("saved", true)
@@ -3181,7 +3190,7 @@ async fn store_in_a_mapped_box_updates_mails_through_a_join_and_returns_the_box_
         [10, 11, 12, 13, 14]
     );
 
-    // Per updated row whose star changed, a row in Starred: Q59, then Q61.
+    // Per updated row whose star changed, a row in Starred: reserve a UID, then file the mail.
     let starred = box_seed(ann, &["Starred"]);
     for (mail_id, ..) in &updated {
         let uid = reserved(&db, reserve(ann, "mailbox", "Starred", false, &starred)).await?;
@@ -3194,7 +3203,7 @@ async fn store_in_a_mapped_box_updates_mails_through_a_join_and_returns_the_box_
     let seen = Update::rows(mapped_mails(ann, false, "Archive", Members::All, 12, 12)).set("read", true).set("updated", now()).set("modseq", modseq);
     assert_eq!(stored(db.update(store_returning(seen, "x.uid")).await?)?, [(uuid(1), 12, true, true, false, false, false, 10)]);
 
-    // UID STORE 10 -FLAGS (\Flagged), then Q62 takes the mail out of Starred.
+    // UID STORE 10 -FLAGS (\Flagged), then a delete takes the mail out of Starred.
     let modseq = next_modseq(&db, ann).await?;
     let unflag =
         Update::rows(mapped_mails(ann, false, sales, Members::Inbox, 10, 10)).set("saved", false).set("updated", now()).set("modseq", modseq);
@@ -3204,7 +3213,7 @@ async fn store_in_a_mapped_box_updates_mails_through_a_join_and_returns_the_box_
     Ok(())
 }
 
-// R-W9, R-W8, R-Q5, R-Q10: mail Q84, Q86 in their by-position forms (`mail_id IN (SELECT .. ORDER BY uid OFFSET .. LIMIT ..)`).
+// R-W9, R-W8, R-Q5, R-Q10: STORE by message sequence number (`mail_id IN (SELECT .. ORDER BY uid OFFSET .. LIMIT ..)`).
 #[tokio::test(flavor = "multi_thread")]
 async fn store_can_address_messages_by_their_position_in_the_mailbox() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3247,7 +3256,7 @@ async fn store_can_address_messages_by_their_position_in_the_mailbox() -> DbResu
         .offset(1)
         .limit(2)
         .select("mail_id", col("y.mail_id"));
-    // Q84: the current state of messages 2:3.
+    // The current state of messages 2:3.
     let current = mapped_rows(ann, false, sales)
         .filter(col("m.mail_id").in_list(list_of(positions.clone())))
         .columns(["m.mail_id"])
@@ -3258,7 +3267,7 @@ async fn store_can_address_messages_by_their_position_in_the_mailbox() -> DbResu
         db.query(current).await?.map::<Stored>()?,
         [(uuid(4), 5, true, false, false, false, false, 2), (uuid(2), 8, true, false, false, false, false, 2)]
     );
-    // Q86: the same two, flagged.
+    // The same two, flagged.
     let by_position = domain_rows(ann, false)
         .join(Query::table("mail_mailbox_uid").alias("x").key([col("m.user_id"), val(sales), col("m.mail_id")]))
         .filter(col("m.mail_id").in_list(list_of(positions)));
@@ -3271,7 +3280,7 @@ async fn store_can_address_messages_by_their_position_in_the_mailbox() -> DbResu
     Ok(())
 }
 
-// R-W6, R-W7, R-Q6, R-Q4: mail Q59, Q78, Q81, Q87 (EXPUNGE of the Sent box and the source side of MOVE, each one statement).
+// R-W6, R-W7, R-Q6, R-Q4: EXPUNGE of the Sent box and the source side of MOVE, each one statement.
 #[tokio::test(flavor = "multi_thread")]
 async fn expunge_in_a_domain_view_marks_rows_and_answers_their_uids() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3310,7 +3319,7 @@ async fn expunge_in_a_domain_view_marks_rows_and_answers_their_uids() -> DbResul
     assert_eq!(gone.column::<i64>()?.into_iter().collect::<BTreeSet<_>>(), BTreeSet::from([1, 4]));
     // A second EXPUNGE, or another session's, finds nothing left to do.
     assert_eq!(db.update(expunge).await?.affected(), 0);
-    // The session rebuilds its sequence numbers (Q78), and HIGHESTMODSEQ moved (Q81).
+    // The session rebuilds its sequence numbers, and HIGHESTMODSEQ has moved.
     assert_eq!(uids(&db, domain_view(ann, true, Members::All).select("uid", col("m.uid_domain"))).await?, [2]);
     assert_eq!(highest_modseq(&db, domain_rows(ann, true)).await?, 4);
     // The rows are kept, marked; the one expunged long ago kept its MODSEQ.
@@ -3338,7 +3347,7 @@ async fn expunge_in_a_domain_view_marks_rows_and_answers_their_uids() -> DbResul
     Ok(())
 }
 
-// R-Q10, R-Q7, R-W7, R-X4: mail Q59, Q78, Q88, Q91 (§7.6: which deleted mails an EXPUNGE in INBOX may take).
+// R-Q10, R-Q7, R-W7, R-X4: which deleted mails an EXPUNGE in INBOX may take.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbox_expunge_takes_only_the_mails_inbox_owns() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3381,9 +3390,9 @@ async fn inbox_expunge_takes_only_the_mails_inbox_owns() -> DbResult<()> {
     }
     mapped(&db, bob, "INBOX", uuid(901), 1).await?;
 
-    // Q88. A deleted mail is INBOX's to expunge if a mapping row files it
-    // under INBOX or an account's inbox; or if it is not an IMAP copy and
-    // no mapping row files it anywhere but Starred and Trash.
+    // A deleted mail is INBOX's to expunge if a mapping row files it under
+    // INBOX or an account's inbox; or if it is not an IMAP copy and no
+    // mapping row files it anywhere but Starred and Trash.
     let boxes_of_the_mail = || {
         Query::table("mail_mailbox_uid").alias("x").index(BOX_MAIL, KeyRange::eq([col("m.mail_id")])).filter(col("x.user_id").eq(col("m.user_id")))
     };
@@ -3404,9 +3413,9 @@ async fn inbox_expunge_takes_only_the_mails_inbox_owns() -> DbResult<()> {
     db.update(Update::table("mails").key([uuid(3)]).set("deleted", false)).await?;
     let mappings_before = db.query(Query::table("mail_mailbox_uid").range(KeyRange::eq([ann]))).await?.len();
 
-    // Q59, then Q91: mark the mails found, re-checking that each is still
-    // deleted and not expunged. The ids that come back are the ones this
-    // EXPUNGE removed; the session maps them to the UIDs it looked up.
+    // Reserve a MODSEQ, then mark the mails found, re-checking that each is
+    // still deleted and not expunged. The ids that come back are the ones
+    // this EXPUNGE removed; the session maps them to the UIDs it looked up.
     let modseq = next_modseq(&db, ann).await?;
     let mark = Update::rows(Query::table("mails").keys(looked_up.iter().map(|(mail_id, _)| [*mail_id])).filter(all([
         col("user_id").eq(ann),
@@ -3423,7 +3432,7 @@ async fn inbox_expunge_takes_only_the_mails_inbox_owns() -> DbResult<()> {
     let expunged: Vec<i64> = looked_up.iter().filter(|(mail_id, _)| marked.contains(mail_id)).map(|(_, uid)| *uid).collect();
     assert_eq!(expunged, [1, 4, 7, 10]);
 
-    // Q78: what the view holds afterwards.
+    // What the view holds afterwards.
     assert_eq!(uids(&db, domain_view(ann, false, Members::Inbox).select("uid", col("m.uid_domain"))).await?, [2, 3, 5, 6, 9]);
     assert_eq!(highest_modseq(&db, domain_rows(ann, false)).await?, modseq);
     // Expunging never removes a mapping row: the UID stays retired.
@@ -3435,8 +3444,8 @@ async fn inbox_expunge_takes_only_the_mails_inbox_owns() -> DbResult<()> {
 
 /// The Message-ID of an IMAP copy, `<16 hex digits>.copy@server`: a
 /// function of the source's id and the destination, so that a retried COPY
-/// collides with its first attempt. mail takes the digits from a SHA-256;
-/// any stable digest shows the same thing.
+/// collides with its first attempt. A server would take the digits from a
+/// SHA-256; any stable digest shows the same thing.
 fn copy_message_id(source: &str, destination: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -3461,7 +3470,7 @@ fn clone_mail(source: &Row, mail_id: Uuid, message_id: &str, uid_domain: i64, mo
     insert.returning(["mail_id"])
 }
 
-// R-Q9, R-Q6, R-W7, R-W1, R-W11, R-X4: mail Q59, Q61, Q63, Q76, Q78, Q89, Q90, Q91 (EXPUNGE, MOVE and COPY in a mapped box).
+// R-Q9, R-Q6, R-W7, R-W1, R-W11, R-X4: EXPUNGE, MOVE and COPY in a mapped box.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mapped_box_expunges_and_moves_by_its_own_uids() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3485,7 +3494,7 @@ async fn a_mapped_box_expunges_and_moves_by_its_own_uids() -> DbResult<()> {
     mapped(&db, ann, "INBOX/accounts/sales", uuid(6), 10).await?;
     let view = |mailbox: &str| mapped_view(ann, false, mailbox, Members::All).select("uid", col("x.uid"));
 
-    // EXPUNGE in Archive. Q89 finds the box's deleted mails with their UIDs.
+    // EXPUNGE in Archive. A lookup finds the box's deleted mails with their UIDs.
     let lookup =
         mapped_view(ann, false, "Archive", Members::All).filter(col("m.deleted").eq(true)).columns(["m.mail_id"]).select("uid", col("x.uid"));
     let looked_up = db.query(lookup).await?.map::<(Uuid, i64)>()?;
@@ -3507,16 +3516,16 @@ async fn a_mapped_box_expunges_and_moves_by_its_own_uids() -> DbResult<()> {
     assert_eq!(uids(&db, view("INBOX/accounts/sales")).await?, [10]);
     assert_eq!(db.query(Query::table("mail_mailbox_uid").index(BOX_UID, KeyRange::eq([val(ann), val("Archive")]))).await?.len(), 5);
 
-    // UID MOVE 20,40,50,60 from Archive to Projects. Q90 resolves the UIDs
-    // to live mails: 40 is expunged, 60 was never given out.
+    // UID MOVE 20,40,50,60 from Archive to Projects. The UIDs are first
+    // resolved to live mails: 40 is expunged, 60 was never given out.
     let named = [20, 40, 50, 60].map(|uid| KeyRange::eq([val(ann), val("Archive"), val(uid)]));
     let sources = db
         .query(mapped_view(ann, false, "Archive", Members::All).index_ranges(BOX_UID, named).columns(["m.mail_id"]).select("uid", col("x.uid")))
         .await?
         .map::<(Uuid, i64)>()?;
     assert_eq!(sources, [(uuid(2), 20), (uuid(5), 50)]);
-    // Per message: read the source whole (Q76), reserve its numbers (Q59
-    // three times), insert the clone (Q63), file it (Q61).
+    // Per message: read the source whole, reserve its three numbers,
+    // insert the clone, file it.
     let projects = box_seed(ann, &["Projects"]);
     let mut copies = Vec::new();
     for (n, (source_id, source_uid)) in sources.iter().enumerate() {
@@ -3538,8 +3547,8 @@ async fn a_mapped_box_expunges_and_moves_by_its_own_uids() -> DbResult<()> {
         copies.push((copy_id, uid_domain, uid_box, message_id));
     }
     assert_eq!(copies.iter().map(|(_, uid_domain, uid_box, _)| (*uid_domain, *uid_box)).collect::<Vec<_>>(), [(7, 1), (8, 2)]);
-    // MOVE then retires the sources (Q59, Q91 without the \Deleted
-    // re-check) and both sessions re-read their lists (Q78).
+    // MOVE then retires the sources, under a new MODSEQ and without the
+    // \Deleted re-check, and both sessions re-read their lists.
     let modseq = next_modseq(&db, ann).await?;
     let retire = Update::rows(Query::table("mails").keys(sources.iter().map(|(mail_id, _)| [*mail_id])))
         .set("expunged", true)
@@ -3563,7 +3572,8 @@ async fn a_mapped_box_expunges_and_moves_by_its_own_uids() -> DbResult<()> {
     assert_eq!(db.query(Query::table("mails").index(MAILS_DATE, KeyRange::eq([ann]))).await?.len(), 8);
 
     // A COPY retried after a lost reply builds the same Message-ID, hits
-    // the unique index, and merges: Q61 answers the UID the first try filed.
+    // the unique index, and merges: filing it again answers the UID the
+    // first try filed.
     let retried =
         db.insert(clone_mail(&original, uuid(200), &copy_message_id(&original.get::<String>("message_id")?, "Projects"), 9, 9)).await.unwrap_err();
     assert!(retried.is_unique_violation() && retried.violates(MAILS_MESSAGE));
@@ -3584,7 +3594,7 @@ fn large_body() -> String {
     body
 }
 
-// R-T8, R-Q15, R-Q1: mail Q65, Q76, Q82, Q83 and `{H}` (§7.8: a body is measured, previewed and streamed without being loaded).
+// R-T8, R-Q15, R-Q1: a body is measured, previewed and streamed without being loaded.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_body_is_measured_and_read_in_pieces() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3596,7 +3606,7 @@ async fn a_large_body_is_measured_and_read_in_pieces() -> DbResult<()> {
     assert!(body.len() > 3 * 1024 * 1024 && (characters as usize) < body.len());
     save(&db, &Mail { text: body.clone(), html: html.clone(), ..mail(ann, 1) }).await?;
 
-    // Q76, FETCH (RFC822.SIZE): the sizes come back, the bodies do not.
+    // FETCH (RFC822.SIZE): the sizes come back, the bodies do not.
     let sizes = db
         .query_one(
             domain_view(ann, false, Members::Inbox)
@@ -3613,13 +3623,13 @@ async fn a_large_body_is_measured_and_read_in_pieces() -> DbResult<()> {
         (body.len() as i64, html.len() as i64, characters)
     );
 
-    // `{H}`: a list row previews the first 400 characters, not bytes.
+    // A list row previews the first 400 characters, not bytes.
     let preview: String =
         db.query_one(Query::table("mails").key([uuid(1)]).select("text_prefix", col("text").left(400))).await?.get("text_prefix")?;
     assert_eq!(preview, body.chars().take(400).collect::<String>());
 
-    // Q82, IMAP BODY[TEXT]: 12 000 characters per round trip until a
-    // short chunk, each asked for by its character position, from 1.
+    // IMAP BODY[TEXT]: 12 000 characters per round trip until a short
+    // chunk, each asked for by its character position, from 1.
     let characters_from = |user: Uuid, start: i64, length: i64| {
         Query::table("mails").key([uuid(1)]).filter(col("user_id").eq(user)).select("chunk", col("text").substr(start, length))
     };
@@ -3646,8 +3656,8 @@ async fn a_large_body_is_measured_and_read_in_pieces() -> DbResult<()> {
     // The statement names the owner: for anyone else there is no row.
     assert!(db.query_opt(characters_from(bob, 1, 12_000)).await?.is_none());
 
-    // Q83, a partial fetch `BODY[]<start.length>`: 48 KiB of the UTF-8
-    // bytes per round trip, from any byte, as bytes.
+    // A partial fetch `BODY[]<start.length>`: 48 KiB of the UTF-8 bytes
+    // per round trip, from any byte, as bytes.
     let bytes_from = |column: &str, start: i64, length: i64| {
         Query::table("mails").key([uuid(1)]).filter(col("user_id").eq(ann)).select("chunk", col(column).substr_bytes(start, length))
     };
@@ -3669,13 +3679,13 @@ async fn a_large_body_is_measured_and_read_in_pieces() -> DbResult<()> {
     let past: Vec<u8> = db.query_one(bytes_from("text", body.len() as i64 + 1, 49_152)).await?.get("chunk")?;
     assert!(past.is_empty());
 
-    // Q65: the HTTP body view does read the mail whole.
+    // The HTTP body view does read the mail whole.
     let mut whole = db.query_one(Query::table("mails").key([uuid(1)]).filter(col("user_id").eq(ann)).limit(1)).await?;
     assert!(whole.take::<String>("text")? == body && whole.take::<String>("html")? == html);
     Ok(())
 }
 
-// R-T8, R-W1, R-W11, R-Q9: mail Q59, Q61, Q63, Q76 (§2.13: COPY reads the source row with its bodies and inserts it again).
+// R-T8, R-W1, R-W11, R-Q9: COPY reads the source row with its bodies and inserts it again.
 #[tokio::test(flavor = "multi_thread")]
 async fn copying_a_mail_with_a_large_body_clones_it_exactly() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3684,7 +3694,7 @@ async fn copying_a_mail_with_a_large_body_clones_it_exactly() -> DbResult<()> {
     let body = large_body();
     save(&db, &Mail { text: body.clone(), html: body.to_uppercase(), read: true, cc: vec!["carol@example.com"], ..mail(ann, 1) }).await?;
 
-    // Q76 as COPY issues it: the source by UID, every column.
+    // The fetch as COPY issues it: the source by UID, every column.
     let source = db.query_one(domain_view(ann, false, Members::Inbox).index(MAILS_UID, domain_uids(ann, false, 1, 1))).await?;
     assert_eq!(source.columns(), all_columns(&mails_table()));
     let (uid_domain, modseq) = (next_domain_uid(&db, ann, false).await?, next_modseq(&db, ann).await?);
@@ -3748,8 +3758,8 @@ const HEADER_COLUMNS: [&str; 20] = [
     "in_reply_to",
 ];
 
-/// `{H}`: what a list row carries. Never the bodies: 400 characters of the
-/// text; and of a long References list its first and its last two entries.
+/// What a list row carries. Never the bodies: 400 characters of the text;
+/// and of a long References list its first and its last two entries.
 fn headers(query: Query) -> Query {
     let references = || col("reference_ids");
     let trimmed = call(Func::JsonArray, [references().json([0]), references().json([-2]), references().json([-1])]);
@@ -3759,14 +3769,14 @@ fn headers(query: Query) -> Query {
         .select("reference_ids", when(references().json_len().gt(3), trimmed, references()))
 }
 
-/// `{A}` for received mail: one of the four recipient arrays holds an
-/// entry with this address (`to_address @> '[{"address": ..}]' OR ..`).
+/// The account test for received mail: one of the four recipient arrays
+/// holds an entry with this address (`to_address @> '[{"address": ..}]' OR ..`).
 fn addressed_to(address: &str) -> Expr {
     let entry = json!([{ "address": address }]);
     any(["to_address", "cc_address", "bcc_address", "envelope_to"].map(|column| col(column).json_contains(entry.clone())))
 }
 
-/// `{A}` for sent mail.
+/// The account test for sent mail: the sender array holds the address.
 fn sent_from(address: &str) -> Expr {
     col("from_address").json_contains(json!([{ "address": address }]))
 }
@@ -3781,7 +3791,7 @@ fn mail_ids(rows: &Rows) -> Vec<Uuid> {
     column(rows, "mail_id")
 }
 
-// R-S9, R-Q13, R-Q5, R-Q4: mail Q93 (the per-account list in its received, sent, saved and spam forms).
+// R-S9, R-Q13, R-Q5, R-Q4: the per-account list in its received, sent, saved and spam forms.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_account_list_reads_one_address_of_the_recipients_index_newest_first() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3818,11 +3828,11 @@ async fn an_account_list_reads_one_address_of_the_recipients_index_newest_first(
     let inbox = received(sales).filter(col("is_spam").eq(false)).columns(["mail_id"]).offset(0).limit(10_000);
     assert_eq!(mail_ids(&db.query(inbox.clone()).await?), ids(&[11, 10, 4, 3, 2, 1]));
     assert_eq!(mail_ids(&db.query(received("info@example.com").filter(col("is_spam").eq(false)).columns(["mail_id"])).await?), ids(&[10, 5]));
-    // Addresses are compared by their bytes, as `@>` did.
+    // Addresses are compared by their bytes, as `@>` does.
     assert_eq!(mail_ids(&db.query(received("Sales@Example.com").columns(["mail_id"])).await?), ids(&[13]));
     assert!(db.query(received("nobody@example.com")).await?.is_empty());
 
-    // The same list as the SQL wrote it: containment tested on every mail
+    // The same list as SQL would write it: containment tested on every mail
     // of the user. Same rows, same order; the index only saves the scan.
     let scanned = Query::table("mails")
         .index(MAILS_DATE, KeyRange::eq([ann]))
@@ -3854,9 +3864,9 @@ async fn an_account_list_reads_one_address_of_the_recipients_index_newest_first(
     Ok(())
 }
 
-/// Q94: a page of an account's list after a cursor, one row longer than
-/// the page so the caller knows whether another follows. The cursor is
-/// the last row's date, as text with its microseconds, and its id.
+/// A page of an account's list after a cursor, one row longer than the
+/// page so the caller knows whether another follows. The cursor is the
+/// last row's date, as text with its microseconds, and its id.
 fn account_page(user: Uuid, address: &str, cursor: Option<&(String, String)>, size: u64) -> Query {
     let after = match cursor {
         Some((date, mail_id)) => Bound::excluded([date.clone(), mail_id.clone()]),
@@ -3870,7 +3880,7 @@ fn account_page(user: Uuid, address: &str, cursor: Option<&(String, String)>, si
         .limit(size + 1)
 }
 
-// R-Q4, R-T2, R-T3, R-Q22: mail Q94 (§7.7: `(date, mail_id) < ($3, $4)` on microsecond timestamps with a text cursor).
+// R-Q4, R-T2, R-T3, R-Q22: keyset paging (`(date, mail_id) < (cursor_date, cursor_id)` on microsecond timestamps with a text cursor).
 #[tokio::test(flavor = "multi_thread")]
 async fn keyset_pages_lose_and_repeat_nothing() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3932,7 +3942,7 @@ async fn keyset_pages_lose_and_repeat_nothing() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q6, R-Q13, R-Q15, R-W2: mail Q92 and `{H}` (list rows are fetched for 500 ids per statement).
+// R-Q6, R-Q13, R-Q15, R-W2: list rows are fetched for 500 ids per statement.
 #[tokio::test(flavor = "multi_thread")]
 async fn header_rows_are_fetched_500_ids_at_a_time_without_their_bodies() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3962,7 +3972,7 @@ async fn header_rows_are_fetched_500_ids_at_a_time_without_their_bodies() -> DbR
         statements += 1;
     }
     assert_eq!((statements, rows.len()), (2, 599));
-    // Rows come in the order the ids were given, so the app need not
+    // Rows come in the order the ids were given, so the application need not
     // re-sort; the expunged mail, the foreign one and the unknown one are absent.
     let got = rows.iter().map(|row| row.get::<Uuid>("mail_id")).collect::<DbResult<Vec<_>>>()?;
     let hidden = [uuid(7), uuid(9001), uuid(404_404)];
@@ -3985,7 +3995,7 @@ async fn header_rows_are_fetched_500_ids_at_a_time_without_their_bodies() -> DbR
     Ok(())
 }
 
-// R-Q8, R-O3, R-Q4, R-Q13, R-X4: mail Q93 with `updated >`, Q95, Q96 (§7.7: delta sync on the server's clock).
+// R-Q8, R-O3, R-Q4, R-Q13, R-X4: delta sync of a list (`updated >` a watermark) on the server's clock.
 #[tokio::test(flavor = "multi_thread")]
 async fn delta_sync_reads_what_changed_since_a_watermark_from_the_servers_clock() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4007,9 +4017,10 @@ async fn delta_sync_reads_what_changed_since_a_watermark_from_the_servers_clock(
     .await?;
     let stale = rewind_updated(&db, ann).await?;
 
-    // Q95: the watermark handed to the client is the server's clock two
-    // seconds back, so a mutation committing right now is not missed by
-    // the next poll. It is computed where `updated` is stamped.
+    // The watermark handed to the client is the server's clock two seconds
+    // back, so a mutation committing right now is not missed by the next
+    // poll. It is computed where `updated` is stamped, here beside a row
+    // that is certain to be there.
     let before = db.now().await?;
     let as_of: Timestamp = db.query_one(Query::table("users").key([ann]).select("as_of", now() - seconds(2))).await?.get("as_of")?;
     let after = db.now().await?;
@@ -4028,7 +4039,7 @@ async fn delta_sync_reads_what_changed_since_a_watermark_from_the_servers_clock(
                 .order_by(col("mail_id").desc()),
         )
     };
-    // Q96: the mails the client should drop from this list.
+    // The mails the client should drop from this list.
     let evicted = |watermark: Timestamp| {
         since(watermark).filter(addressed_to(sales).and(col("expunged").eq(true).or(col("is_spam").eq(true)))).columns(["mail_id"])
     };
@@ -4042,7 +4053,7 @@ async fn delta_sync_reads_what_changed_since_a_watermark_from_the_servers_clock(
     db.update(Update::table("mails").key([uuid(4)]).set("is_spam", true).set("updated", now()).set("modseq", 5)).await?;
     db.update(set_flag("read", uuid(5), ann, true, 6)).await?;
     save(&db, &to_sales(7)).await?;
-    // Caching a size is not a change to sync (Q69).
+    // Caching a size is not a change to sync.
     db.update(Update::table("mails").key([uuid(6)]).set("rfc822_size", 1024)).await?;
 
     let delta = db.query(changed(as_of)).await?;
@@ -4064,7 +4075,7 @@ async fn delta_sync_reads_what_changed_since_a_watermark_from_the_servers_clock(
     Ok(())
 }
 
-// R-Q14, R-Q4, R-Q11, R-Q13: mail Q97, Q98, Q99 (the unified inbox: any of the user's addresses among the recipients).
+// R-Q14, R-Q4, R-Q11, R-Q13: the unified inbox (any of the user's addresses among the recipients).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_unified_list_filters_by_any_of_the_users_addresses() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4089,19 +4100,19 @@ async fn the_unified_list_filters_by_any_of_the_users_addresses() -> DbResult<()
     )
     .await?;
     let stale = rewind_updated(&db, ann).await?;
-    // `{UA}`: EXISTS over the unnested recipient arrays with an array
-    // parameter, said as "the two lists share an item". A mail whose
-    // arrays are all NULL has an empty list, and is simply not matched.
+    // In SQL an EXISTS over the unnested recipient arrays with an array
+    // parameter; here "the two lists share an item". A mail whose arrays
+    // are all NULL has an empty list, and is simply not matched.
     let mine = || recipients().list_overlaps(vec![sales, info]);
     let unified = || Query::table("mails").index(MAILS_DATE, KeyRange::eq([ann])).filter(mine().and(listed()).and(col("is_spam").eq(false)));
 
-    // Q97, unpaged: unread first, then newest first; false sorts before true.
+    // Unpaged: unread first, then newest first; false sorts before true.
     let front_page = unified().order_by(col("read")).order_by(col("date").desc()).columns(["mail_id"]).offset(0).limit(10_000);
     assert_eq!(mail_ids(&db.query(front_page).await?), [uuid(11), uuid(5), uuid(2), uuid(3), uuid(1)]);
     // In date order the index's own order serves, and a limit stops the read.
     assert_eq!(mail_ids(&db.query(unified().columns(["mail_id"]).limit(2)).await?), [uuid(11), uuid(5)]);
 
-    // Q98: keyset pages over the user's date index, the filter applied to what the range gives.
+    // Keyset pages over the user's date index, the filter applied to what the range gives.
     let page = |cursor: Option<(Timestamp, Uuid)>| {
         let after = cursor.map_or(Bound::Unbounded, |(date, mail_id)| Bound::excluded([val(date), val(mail_id)]));
         Query::table("mails")
@@ -4117,7 +4128,7 @@ async fn the_unified_list_filters_by_any_of_the_users_addresses() -> DbResult<()
     let second = db.query(page(Some((cursor_date, cursor_id)))).await?.map::<(Uuid, Timestamp)>()?;
     assert_eq!(second, [(uuid(3), at(3)), (uuid(2), at(2)), (uuid(1), at(1))]);
 
-    // Q97 with `updated >` and Q99: the unified delta and its evictions.
+    // The unified delta (`updated >` a watermark) and its evictions.
     let as_of = db.now().await?.plus_secs(-2);
     assert!(stale < as_of);
     let modseq = next_modseq(&db, ann).await?;
@@ -4136,21 +4147,21 @@ async fn the_unified_list_filters_by_any_of_the_users_addresses() -> DbResult<()
 /// One line of the account sidebar: address, mails, unread, starred, newest.
 type Account = (String, i64, i64, i64, Timestamp);
 
-/// Q101: the addresses a user has mail for, with their counters, the most
-/// recently used first. Postgres unnested the address arrays in a CTE with
-/// DISTINCT and grouped that; `each` shows a mail once under each distinct
+/// The addresses a user has mail for, with their counters, the most
+/// recently used first. SQL would unnest the address arrays in a CTE with
+/// DISTINCT and group that; `each` shows a mail once under each distinct
 /// address of the list, which is the same thing.
 fn sidebar(mails: Query, addresses: Expr, placement: Expr, domain: Option<&str>) -> Query {
     let mut query = mails.each("address", addresses).filter(listed().and(placement)).filter(col("address").is_not_null());
     if let Some(domain) = domain {
-        // `address ILIKE '%@' || $2`, the domain unescaped as it always was.
+        // `address ILIKE '%@' || domain`, with the domain left unescaped.
         query = query.filter(col("address").ilike(concat([val("%@"), val(domain)])));
     }
     query
         .group_by([col("address")])
         .select("address", col("address"))
         .select("count", count())
-        // `SUM(CASE WHEN read = FALSE THEN 1 ELSE 0 END)` as the SQL had it,
+        // `SUM(CASE WHEN read = FALSE THEN 1 ELSE 0 END)` as SQL says it,
         // and the same idea for `saved` as a filtered count.
         .select("unread", sum(when(col("read").eq(false), 1, 0)))
         .select("saved_count", count().filter(col("saved").eq(true)))
@@ -4158,7 +4169,7 @@ fn sidebar(mails: Query, addresses: Expr, placement: Expr, domain: Option<&str>)
         .order_by(col("latest").desc())
 }
 
-// R-Q12, R-Q11, R-Q7, R-Q17: mail Q101, Q102 (§7.4: three times per page load, twice for every IMAP LIST, SELECT and STATUS).
+// R-Q12, R-Q11, R-Q7, R-Q17: the account sidebar, read several times per page load and for every IMAP LIST, SELECT and STATUS.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sidebar_counts_each_mail_once_under_each_address_it_names() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4187,7 +4198,7 @@ async fn the_sidebar_counts_each_mail_once_under_each_address_it_names() -> DbRe
     let not_spam = || col("is_spam").eq(false);
     let line = |address: &str, mails: i64, unread: i64, saved: i64, latest: i64| (address.to_string(), mails, unread, saved, at(latest));
 
-    // The accounts mail was received for, in the user's own domain. Mail 2
+    // The accounts that received mail, in the user's own domain. Mail 2
     // names sales three times and counts once; mail 3 counts for both
     // addresses. The domain test ignores case; the grouping does not.
     let received = db.query(sidebar(mails_of(ann), recipients(), not_spam(), Some("example.com"))).await?.map::<Account>()?;
@@ -4212,14 +4223,14 @@ async fn the_sidebar_counts_each_mail_once_under_each_address_it_names() -> DbRe
     assert_eq!(senders, [line(sales, 1, 0, 0, 9)]);
     assert_eq!(db.query(sidebar(mails_of(bob), recipients(), not_spam(), Some("example.com"))).await?.map::<Account>()?, [line(sales, 1, 1, 0, 901)]);
 
-    // Q102: the same lines for the mails a search finds.
+    // The same lines for the mails a search finds.
     let hits = Query::table("mails").search(MAILS_SEARCH, [ann], "invoice");
     let searched = db.query(sidebar(hits, recipients(), not_spam(), Some("example.com"))).await?.map::<Account>()?;
     assert_eq!(searched, [line(info, 2, 1, 0, 4), line(sales, 2, 2, 0, 3)]);
     Ok(())
 }
 
-// R-Q11, R-Q6: mail Q103 (the unread badge sent with a web push).
+// R-Q11, R-Q6: the unread badge sent with a web push.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_unread_badge_is_counted_per_user_in_one_statement() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4257,7 +4268,7 @@ async fn the_unread_badge_is_counted_per_user_in_one_statement() -> DbResult<()>
         .map(|(user, unread, latest)| (user, (unread, latest)))
         .collect();
     assert_eq!(badges.get(&ann), Some(&(2, at(3))));
-    // A user whose mail is all read has a line with zero; one without mail has none.
+    // A user with nothing unread has a line with zero; a user with no mails has none.
     assert_eq!(badges.get(&bob), Some(&(0, at(901))));
     assert_eq!(badges.get(&carol), None);
     assert!(db.query(badge(&[carol])).await?.is_empty());
@@ -4269,8 +4280,8 @@ fn highlight(column: &str, words: &str) -> Expr {
     call(Func::Headline, [col(column), val(words), val("english"), val("<em>"), val("</em>"), val(50), val(10)])
 }
 
-/// Q100: the user's mails that hold every word, best match first and
-/// newest first among equals, with excerpts; at most a thousand.
+/// The user's mails that hold every word, best match first and newest
+/// first among equals, with excerpts; at most a thousand.
 fn full_text(user: Uuid, words: &str) -> Query {
     headers(Query::table("mails").search(MAILS_SEARCH, [user], words).filter(listed()))
         .select("rank", Expr::Rank)
@@ -4281,7 +4292,7 @@ fn full_text(user: Uuid, words: &str) -> Query {
         .limit(1000)
 }
 
-// R-Q17, R-Q15: mail Q100 (§7.3: English stemming, all words required, rank then date, `<em>` excerpts).
+// R-Q17, R-Q15: full-text search (English stemming, all words required, rank then date, `<em>` excerpts).
 #[tokio::test(flavor = "multi_thread")]
 async fn full_text_search_stems_ranks_and_highlights() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4340,7 +4351,7 @@ async fn full_text_search_stems_ranks_and_highlights() -> DbResult<()> {
     let (subject, text): (String, String) = (best.get("subject_highlight")?, best.get("text_highlight")?);
     assert!(subject.contains("<em>Invoice</em>") && subject.contains("<em>overdue</em>"), "{subject}");
     assert!(text.contains("<em>invoices</em>") && text.contains("<em>overdue</em>") && text.contains("<em>invoice</em>"), "{text}");
-    // A column without a match has no marker, and the app then shows no excerpt for it.
+    // A column without a match has no marker, and the application then shows no excerpt for it.
     let reminder_subject: String = both.iter().nth(1).expect("mail 5").get("subject_highlight")?;
     assert!(!reminder_subject.contains("<em>"), "{reminder_subject}");
     // Of a long body the excerpt is the neighbourhood of the match: at most fifty words.
@@ -4351,7 +4362,7 @@ async fn full_text_search_stems_ranks_and_highlights() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q17, R-X4, R-W10: mail Q100 (which mails a search may show) and the trigger of §1.4 (the index follows every write).
+// R-Q17, R-X4, R-W10: which mails a full-text search may show; the index follows every write, as a trigger-kept tsvector column would.
 #[tokio::test(flavor = "multi_thread")]
 async fn full_text_search_shows_spam_but_not_drafts_or_expunged_mail() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4419,8 +4430,8 @@ const THREAD_COLUMNS: [&str; 20] = [
     "insight",
 ];
 
-/// `{T}`: a conversation row. All of References this time, and the same
-/// 400 characters of text.
+/// A conversation row. All of References this time, and the same 400
+/// characters of text.
 fn thread_row(query: Query) -> Query {
     query.columns(THREAD_COLUMNS).select("text_prefix", col("text").left(400))
 }
@@ -4442,7 +4453,7 @@ fn both_forms(ids: &[&str]) -> Vec<String> {
     ids.iter().flat_map(|id| [id.trim_matches(['<', '>']).to_string(), id.to_string()]).collect()
 }
 
-// R-Q6, R-Q13, R-S9, R-Q2, R-Q4: mail Q104, Q105, Q107 (§7.5: following Message-ID, In-Reply-To and References).
+// R-Q6, R-Q13, R-S9, R-Q2, R-Q4: a conversation is gathered by following Message-ID, In-Reply-To and References.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_conversation_follows_message_ids_replies_and_references() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4472,7 +4483,7 @@ async fn a_conversation_follows_message_ids_replies_and_references() -> DbResult
     )
     .await?;
 
-    // Q104: the mail the conversation is opened from.
+    // The mail the conversation is opened from.
     let seed =
         |mail_id: Uuid, user: Uuid| thread_row(Query::table("mails").key([mail_id]).filter(col("user_id").eq(user).and(col("expunged").eq(false))));
     let opened = db.query_one(seed(uuid(2), ann)).await?;
@@ -4486,10 +4497,10 @@ async fn a_conversation_follows_message_ids_replies_and_references() -> DbResult
     assert!(db.query_opt(seed(uuid(2), bob)).await?.is_none());
     assert!(db.query_opt(seed(uuid(8), ann)).await?.is_none());
 
-    // Q105, as the SQL had it: one pass over the user's mail, newest
-    // first, keeping what any of the three links ties to the ids known so
-    // far. `in_reply_to = ANY(..)` is unknown for a mail without the
-    // header, which the OR survives.
+    // The links as SQL would follow them: one pass over the user's mails,
+    // newest first, keeping what any of the three links ties to the ids
+    // known so far. `in_reply_to = ANY(..)` is unknown for a mail without
+    // the header, which the OR survives.
     let linked = |ids: &[&str], with_spam: bool| {
         let ids = both_forms(ids);
         let tied = any([
@@ -4540,8 +4551,8 @@ async fn a_conversation_follows_message_ids_replies_and_references() -> DbResult
     let union: BTreeSet<Uuid> = by_message.into_iter().chain(by_reply).chain(by_reference).collect();
     assert_eq!(union, found(round_one));
 
-    // Q107: the References of the mail being replied to, known by either
-    // form of its id. An expunged mail lends none.
+    // The References of the mail being replied to, known by either form
+    // of its id. An expunged mail lends none.
     let references = |id: &str| {
         Query::table("mails")
             .index_ranges(MAILS_MESSAGE, both_forms(&[id]).into_iter().map(|id| KeyRange::eq([val(ann), val(id)])))
@@ -4555,14 +4566,14 @@ async fn a_conversation_follows_message_ids_replies_and_references() -> DbResult
     Ok(())
 }
 
-// R-S3, R-S4, R-Q10, R-Q2: mail Q106 (§7.5: mails without threading headers are tied by their normalised subject).
+// R-S3, R-S4, R-Q10, R-Q2: mails without threading headers are tied by their normalised subject.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_headerless_conversation_is_found_by_its_subject_key() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     let (ann, bob) = (user(&db, "ann").await?, user(&db, "bob").await?);
-    // The normaliser is the app's. What matters to the database is only
-    // that the app stores its result and asks for it again.
+    // The normaliser is the application's. What matters to the database is
+    // only that the application stores its result and asks for it again.
     for (subject, key) in [
         ("Quarterly   Report", "quarterly report"),
         ("Re: quarterly report", "quarterly report"),
@@ -4594,16 +4605,16 @@ async fn a_headerless_conversation_is_found_by_its_subject_key() -> DbResult<()>
     )
     .await?;
 
-    // The index holds only mails with neither header: 5 and 11 are tied
-    // to their conversations by Q105 and must not be tied by subject too.
+    // The index holds only mails with neither header: 5 and 11 are tied to
+    // their conversations by those headers and must not be tied by subject too.
     let headerless = db.query(Query::table("mails").index(MAILS_SUBJECT, KeyRange::eq([ann])).columns(["mail_id"])).await?;
     assert_eq!(
         mail_ids(&headerless).into_iter().collect::<BTreeSet<_>>(),
         [1, 2, 3, 4, 6, 7, 8, 9, 10, 12].map(uuid).into_iter().collect::<BTreeSet<_>>()
     );
 
-    // Opened from mail 2: the app normalises the subject of the row it
-    // holds and reads that key, newest first, a hundred at most.
+    // Opened from mail 2: the application normalises the subject of the row
+    // it holds and reads that key, newest first, a hundred at most.
     let seed = db.query_one(thread_row(Query::table("mails").key([uuid(2)]).filter(col("user_id").eq(ann).and(col("expunged").eq(false))))).await?;
     let key = normalize_subject(&seed.get::<String>("subject")?);
     let same_subject = |with_spam: bool| {
@@ -4613,8 +4624,8 @@ async fn a_headerless_conversation_is_found_by_its_subject_key() -> DbResult<()>
     assert_eq!(mail_ids(&db.query(same_subject(true)).await?), [uuid(10), uuid(4), uuid(3), uuid(2), uuid(1)]);
     assert_eq!(mail_ids(&db.query(same_subject(false).limit(2)).await?), [uuid(4), uuid(3)]);
 
-    // The one-statement form of the SQL, where the seed's key is a scalar
-    // subquery (its `WITH seed AS ..`): the same mails.
+    // The one-statement form, where the seed's key is a scalar subquery
+    // (SQL's `WITH seed AS ..`): the same mails.
     let seed_key = scalar(
         Query::table("mails").alias("seed").key([uuid(2)]).filter(col("seed.user_id").eq(ann)).select("subject", col("seed.thread_subject_key")),
     );
@@ -4633,15 +4644,15 @@ async fn a_headerless_conversation_is_found_by_its_subject_key() -> DbResult<()>
     Ok(())
 }
 
-// R-T2, R-T3, R-Q22, R-W11, R-O3: mail Q16 and §7.10 (parameters typed by the statement; a malformed one is an error the caller absorbs).
+// R-T2, R-T3, R-Q22, R-W11, R-O3: parameters are typed by the statement; a malformed one is an error the caller absorbs.
 #[tokio::test(flavor = "multi_thread")]
 async fn text_is_read_as_the_columns_type_or_refused() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     let ann = user(&db, "ann").await?;
 
-    // Ids and times reach mail as text, from URLs, cursors and headers,
-    // and are written and compared as text.
+    // Ids and times reach the application as text, from URLs, cursors and
+    // headers, and are written and compared as text.
     let id_text = "6F9619FF-8B86-D011-B42D-00C04FC964FF";
     let delivered = Insert::into("mails")
         .set("mail_id", id_text)
@@ -4655,7 +4666,7 @@ async fn text_is_read_as_the_columns_type_or_refused() -> DbResult<()> {
     // A uuid prints in lower case whatever case it came in.
     assert_eq!(id.to_string(), "6f9619ff-8b86-d011-b42d-00c04fc964ff");
     assert_eq!(date, ts("2026-11-15T02:55:04.123456Z"));
-    // What the API sends is the app's doing: ISO text cut to milliseconds.
+    // What the API sends is the application's doing: ISO text cut to milliseconds.
     assert_eq!(Timestamp::from_millis(date.millis()).to_rfc3339(), "2026-11-15T02:55:04.123000Z");
     assert!(db.get("mails", [id_text]).await?.is_some());
     assert!(db.get("mails", [id_text.to_lowercase()]).await?.is_some());
@@ -4676,22 +4687,22 @@ async fn text_is_read_as_the_columns_type_or_refused() -> DbResult<()> {
     let number_as_text =
         db.insert(Insert::into("mails").set("user_id", ann).set("message_id", "<bad-uid@remote.test>").set("uid_domain", "12")).await.unwrap_err();
     assert_eq!(number_as_text.code, ErrorCode::TypeMismatch);
-    // A STORE whose range end JavaScript printed as "Infinity": the
-    // server refuses the comparison, and the IMAP layer answers that the
-    // command addressed nothing.
+    // A STORE whose open range end was printed as "Infinity": the server
+    // refuses the comparison, and the IMAP layer answers that the command
+    // addressed nothing.
     let infinite = db.query(domain_view(ann, false, Members::Inbox).filter(col("m.uid_domain").le("Infinity"))).await.unwrap_err();
     assert_eq!(infinite.code, ErrorCode::TypeMismatch);
     let unknown_column = db.query(domain_view(ann, false, Members::Inbox).filter(col("m.flagged").eq(true))).await.unwrap_err();
     assert_eq!(unknown_column.code, ErrorCode::NotFound);
 
     // None of the failures wrote anything or cost the pool a connection:
-    // the health probe (Q16) and the next statement go through.
+    // the health probe and the next statement go through.
     db.ping().await?;
     assert_eq!(db.query(Query::table("mails").index(MAILS_DATE, KeyRange::eq([ann]))).await?.len(), 1);
     Ok(())
 }
 
-// R-X9, R-X8, R-X1: mail Q10 and §3.7 (every connection has a statement timeout; one that fires fails that call and nothing else).
+// R-X9, R-X8, R-X1: every connection has a statement timeout; one that fires fails that call and nothing else.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_statement_past_its_deadline_is_stopped_and_leaves_nothing_behind() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4702,10 +4713,10 @@ async fn a_statement_past_its_deadline_is_stopped_and_leaves_nothing_behind() ->
         db.insert(train(ann, document, 1, 0)).await?;
     }
 
-    // mail gives its pool thirty seconds per statement; this one gets fifty
-    // milliseconds. The deadline is the only way a statement is stopped:
-    // the client has nothing like Q9's cancel of another connection's
-    // statement, which mail used to end maintenance at shutdown.
+    // A pool would give a statement thirty seconds; this client gives it
+    // fifty milliseconds. The deadline is all that stops a statement in
+    // these tests: none of them cancels another connection's statement, the
+    // way a Postgres application can end its maintenance at shutdown.
     let mut config = db.config().clone();
     config.statement_timeout = Duration::from_millis(50);
     let impatient = Client::connect(config).await?;

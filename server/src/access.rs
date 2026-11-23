@@ -7,7 +7,7 @@
 //! <name> <salt, hex> <hash, hex>
 //! ```
 //!
-//! The passwords are machine-made secrets from the apps' environment
+//! The passwords are machine-made secrets from the clients' environment
 //! files, long and random, so a fast hash is enough: there is nothing to
 //! guess. The administrator's password is not stored at all: it comes
 //! from the server's own environment at every start.
@@ -205,19 +205,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("database-access-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut access = Access::load(&dir).unwrap();
-        access.set("mail", "s3cret").unwrap();
-        access.set("budget", "other").unwrap();
-        assert!(access.check("mail", "s3cret"));
-        assert!(!access.check("mail", "other"));
+        access.set("shop", "s3cret").unwrap();
+        access.set("blog", "other").unwrap();
+        assert!(access.check("shop", "s3cret"));
+        assert!(!access.check("shop", "other"));
         assert!(!access.check("nobody", "s3cret"));
 
         let mut again = Access::load(&dir).unwrap();
-        assert!(again.check("mail", "s3cret") && again.check("budget", "other"));
-        let note = again.note("mail");
-        again.remove("mail").unwrap();
-        assert!(!again.check("mail", "s3cret"));
-        again.set_note("mail", &note).unwrap();
-        assert!(Access::load(&dir).unwrap().check("mail", "s3cret"));
+        assert!(again.check("shop", "s3cret") && again.check("blog", "other"));
+        let note = again.note("shop");
+        again.remove("shop").unwrap();
+        assert!(!again.check("shop", "s3cret"));
+        again.set_note("shop", &note).unwrap();
+        assert!(Access::load(&dir).unwrap().check("shop", "s3cret"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

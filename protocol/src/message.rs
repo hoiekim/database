@@ -16,8 +16,8 @@ use crate::value::Value;
 /// that speaks another version, in the answer to its `Hello`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The largest frame either side accepts. A row holding one 35 MiB mail
-/// body must fit.
+/// The largest frame either side accepts. A row holding a text of tens
+/// of megabytes must fit.
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 
 /// A result is cut into frames of about this size.
@@ -538,7 +538,7 @@ mod tests {
             .check("positive", col("n").ge(0))
             .volatile();
         let requests = vec![
-            Request::Hello { version: PROTOCOL_VERSION, database: "mail".into(), password: "pw".into(), client: "test".into() },
+            Request::Hello { version: PROTOCOL_VERSION, database: "shop".into(), password: "pw".into(), client: "test".into() },
             Request::Ping,
             Request::Begin { write: true, lock_wait_ms: 30_000 },
             Request::Commit,

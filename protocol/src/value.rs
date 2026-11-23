@@ -317,7 +317,7 @@ pub fn compare_json(a: &Json, b: &Json) -> Ordering {
 
 /// JSON as it is stored: object keys ordered by length, then by bytes, at
 /// every depth, and no key twice. This is the order Postgres' `jsonb`
-/// returns, which the apps' responses and their ETags were built on.
+/// returns, so that responses built from stored JSON do not change.
 pub fn normalize_json(v: Json) -> Json {
     match v {
         Json::Array(items) => Json::Array(items.into_iter().map(normalize_json).collect()),

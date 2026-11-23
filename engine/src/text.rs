@@ -163,8 +163,8 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // ----------------------------------------------------------------- words
 
 /// Only this much of a text is cut into words: a megabyte of prose is
-/// more than any search needs, and a 35 MiB attachment pasted into a body
-/// should not become a million index entries.
+/// more than any search needs, and a file of tens of megabytes pasted
+/// into a body should not become a million index entries.
 pub const MAX_INDEXED_BYTES: usize = 1_000_000;
 
 /// In order, to be searched by halving.

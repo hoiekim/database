@@ -2,7 +2,7 @@
 //!
 //! The server's allocations are of two very different kinds: thousands of
 //! page-sized buffers a second, made by one thread and dropped by another,
-//! and now and then a request or a mail body of megabytes. The C library's
+//! and now and then a request or a text of megabytes. The C library's
 //! allocator, left to itself, keeps a pool for every thread and returns
 //! little to the system: after the benchmark in `bench/` the process held
 //! 230 MB with 60 MB in use. Two settings and an occasional trim bring

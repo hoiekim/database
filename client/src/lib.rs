@@ -3,7 +3,7 @@
 //! ```ignore
 //! use database_client::*;
 //!
-//! let db = Client::connect_url("database://mail:secret@database:5454").await?;
+//! let db = Client::connect_url("database://shop:secret@database:5454").await?;
 //! db.create_table_if_not_exists(
 //!     TableDef::new("users")
 //!         .column(ColumnDef::new("id", Type::Uuid).default_random_uuid())
@@ -23,7 +23,7 @@
 //!
 //! There is no SQL and no planner: a query says which key or index to
 //! read and in what range, and the server does exactly that. See
-//! `docs/CLIENT.md` in the repository for the patterns the apps use.
+//! `docs/CLIENT.md` in the repository for the common patterns.
 
 mod client;
 mod config;

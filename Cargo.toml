@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.89"
 publish = false
 
-# Every dependency runs inside the process that holds every app's data, so
+# Every dependency runs inside the process that holds everyone's data, so
 # the list is kept to what the standard library lacks: an async runtime for
 # the network side, a CRC for page and log checksums, and JSON for the
 # columns that hold it.

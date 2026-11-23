@@ -1,6 +1,6 @@
 [package]
 name = "database-client"
-description = "The typed async client the apps use to talk to the database server"
+description = "The typed async client applications use to talk to the database server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -85,7 +85,7 @@ async fn a_dump_taken_under_load_restores_whole() -> DbResult<()> {
     let fresh_admin = fresh_server.admin().await;
     fresh_admin.admin().restore(&mut dump.as_slice(), false).await?;
     assert_eq!(fresh_admin.admin().list_databases().await?, ["second", "test"]);
-    // The apps' passwords came with it.
+    // The databases' passwords came with it.
     let restored = Client::connect_url(&fresh_server.url("test")).await?;
     assert_paired(&restored).await?;
     let docs = restored.query(Query::table("docs")).await?;
@@ -152,58 +152,58 @@ async fn a_restore_replaces_only_when_asked_and_only_from_a_whole_dump() -> DbRe
 async fn databases_are_separate_and_guarded() -> DbResult<()> {
     let server = TestServer::start().await;
     let admin = server.admin().await;
-    admin.admin().create_database("mail", "mail-secret").await?;
-    admin.admin().create_database("budget", "budget-secret").await?;
-    assert_eq!(admin.admin().create_database("mail", "x").await.unwrap_err().code, ErrorCode::AlreadyExists);
-    admin.admin().create_database_if_not_exists("mail", "ignored").await?;
+    admin.admin().create_database("shop", "shop-secret").await?;
+    admin.admin().create_database("blog", "blog-secret").await?;
+    assert_eq!(admin.admin().create_database("shop", "x").await.unwrap_err().code, ErrorCode::AlreadyExists);
+    admin.admin().create_database_if_not_exists("shop", "ignored").await?;
     assert!(admin.admin().create_database("Not Valid", "x").await.is_err());
-    assert_eq!(admin.admin().list_databases().await?, ["budget", "mail"]);
+    assert_eq!(admin.admin().list_databases().await?, ["blog", "shop"]);
 
     let url = |database: &str, password: &str| format!("database://{database}:{password}@127.0.0.1:{}", server.port);
-    let mail = Client::connect_url(&url("mail", "mail-secret")).await?;
-    let budget = Client::connect_url(&url("budget", "budget-secret")).await?;
+    let shop = Client::connect_url(&url("shop", "shop-secret")).await?;
+    let blog = Client::connect_url(&url("blog", "blog-secret")).await?;
     // The same name, two tables.
-    mail.create_table(TableDef::new("users").column(ColumnDef::new("id", Type::Int)).primary_key(["id"])).await?;
-    budget.create_table(TableDef::new("users").column(ColumnDef::new("name", Type::Text)).primary_key(["name"])).await?;
-    mail.insert(Insert::into("users").set("id", 1)).await?;
-    assert_eq!(budget.query(Query::table("users")).await?.len(), 0);
+    shop.create_table(TableDef::new("users").column(ColumnDef::new("id", Type::Int)).primary_key(["id"])).await?;
+    blog.create_table(TableDef::new("users").column(ColumnDef::new("name", Type::Text)).primary_key(["name"])).await?;
+    shop.insert(Insert::into("users").set("id", 1)).await?;
+    assert_eq!(blog.query(Query::table("users")).await?.len(), 0);
 
     // Wrong password, another database's password, no such database:
     // all the same refusal.
-    for (database, password) in [("mail", "wrong"), ("mail", "budget-secret"), ("nope", "mail-secret"), ("", "mail-secret")] {
+    for (database, password) in [("shop", "wrong"), ("shop", "blog-secret"), ("nope", "shop-secret"), ("", "shop-secret")] {
         let err = Client::connect_url(&url(database, password)).await.err().expect("refused");
         assert_eq!(err.code, ErrorCode::AccessDenied, "{database}");
     }
     // The administrator may enter any database.
-    assert_eq!(Client::connect_url(&url("mail", ADMIN_PASSWORD)).await?.query(Query::table("users")).await?.len(), 1);
+    assert_eq!(Client::connect_url(&url("shop", ADMIN_PASSWORD)).await?.query(Query::table("users")).await?.len(), 1);
 
     // A database's password does not administer the server.
-    assert_eq!(mail.admin().create_database("other", "x").await.unwrap_err().code, ErrorCode::AccessDenied);
-    assert_eq!(mail.admin().drop_database("budget").await.unwrap_err().code, ErrorCode::AccessDenied);
-    assert_eq!(mail.admin().list_databases().await.unwrap_err().code, ErrorCode::AccessDenied);
+    assert_eq!(shop.admin().create_database("other", "x").await.unwrap_err().code, ErrorCode::AccessDenied);
+    assert_eq!(shop.admin().drop_database("blog").await.unwrap_err().code, ErrorCode::AccessDenied);
+    assert_eq!(shop.admin().list_databases().await.unwrap_err().code, ErrorCode::AccessDenied);
     let mut sink = Vec::new();
-    assert_eq!(mail.admin().dump(&["budget"], &mut sink).await.unwrap_err().code, ErrorCode::AccessDenied);
-    assert_eq!(mail.admin().restore(&mut &b""[..], true).await.unwrap_err().code, ErrorCode::AccessDenied);
+    assert_eq!(shop.admin().dump(&["blog"], &mut sink).await.unwrap_err().code, ErrorCode::AccessDenied);
+    assert_eq!(shop.admin().restore(&mut &b""[..], true).await.unwrap_err().code, ErrorCode::AccessDenied);
     // It may look after its own database, and dump it.
-    mail.admin().checkpoint().await?;
-    assert!(mail.admin().check().await?.contains("table users: 1 rows"));
-    assert!(mail.admin().stats().await?.contains("database mail"));
-    assert!(mail.admin().dump(&[], &mut sink).await? > 0);
+    shop.admin().checkpoint().await?;
+    assert!(shop.admin().check().await?.contains("table users: 1 rows"));
+    assert!(shop.admin().stats().await?.contains("database shop"));
+    assert!(shop.admin().dump(&[], &mut sink).await? > 0);
 
     // A changed password takes effect for new connections.
-    admin.admin().set_password("mail", "rotated").await?;
-    assert!(Client::connect_url(&url("mail", "mail-secret")).await.is_err());
-    assert!(Client::connect_url(&url("mail", "rotated")).await.is_ok());
+    admin.admin().set_password("shop", "rotated").await?;
+    assert!(Client::connect_url(&url("shop", "shop-secret")).await.is_err());
+    assert!(Client::connect_url(&url("shop", "rotated")).await.is_ok());
 
     // A dropped database is gone, with its password.
-    admin.admin().drop_database("budget").await?;
-    assert_eq!(budget.query(Query::table("users")).await.unwrap_err().code, ErrorCode::Unavailable);
-    assert!(Client::connect_url(&url("budget", "budget-secret")).await.is_err());
-    admin.admin().drop_database_if_exists("budget").await?;
-    assert_eq!(admin.admin().drop_database("budget").await.unwrap_err().code, ErrorCode::NotFound);
+    admin.admin().drop_database("blog").await?;
+    assert_eq!(blog.query(Query::table("users")).await.unwrap_err().code, ErrorCode::Unavailable);
+    assert!(Client::connect_url(&url("blog", "blog-secret")).await.is_err());
+    admin.admin().drop_database_if_exists("blog").await?;
+    assert_eq!(admin.admin().drop_database("blog").await.unwrap_err().code, ErrorCode::NotFound);
     // Its name can be used again, empty.
-    admin.admin().create_database("budget", "new").await?;
-    assert!(Client::connect_url(&url("budget", "new")).await?.describe().await?.is_empty());
+    admin.admin().create_database("blog", "new").await?;
+    assert!(Client::connect_url(&url("blog", "new")).await?.describe().await?.is_empty());
     Ok(())
 }
 

@@ -1,15 +1,20 @@
-//! auth's use of its database, said through the client.
+//! An identity service's use of its database, said through the client.
 //!
-//! `docs/requirements/auth.md` lists the 171 statements auth sends Postgres
-//! (Q1 to Q171), the transactions it groups them in and the locks it takes.
-//! Here each shape is built with the client and its result asserted. Where
-//! Postgres needed a row lock, `SKIP LOCKED` or a transaction-scoped
-//! advisory lock, the statements run in a writing transaction, which has
-//! the database to itself.
+//! The scenario is a service that signs people in for other services:
+//! users, sessions, tokens, access roles, an audit log, an outbox of events
+//! and rate limits. Each test builds the statements such a service runs
+//! with the client and asserts their results: lookups by key and by index,
+//! joins, upserts, conditional updates, cascading deletes, transactions and
+//! migrations.
 //!
-//! The functions before the tests are auth's statements: one function per
-//! shape that several tests share, named for what it does and marked with
-//! its number in the inventory.
+//! Where an application on a SQL database takes a row lock, reads with
+//! `SKIP LOCKED` or takes a transaction-scoped advisory lock, the
+//! statements here run in a writing transaction, which has the database to
+//! itself. A lock that is held outside a transaction, or only tried, is a
+//! named lock.
+//!
+//! The functions before the tests are the service's statements: one
+//! function per shape that several tests share, named for what it does.
 
 mod common;
 use common::*;
@@ -18,8 +23,8 @@ use std::time::Duration;
 
 use serde_json::json;
 
-/// The columns auth's Rust server names when it reads a user (Q1), so that
-/// a column a later migration adds changes no result.
+/// The columns the service names when it reads a user, so that a column a
+/// later migration adds changes no result.
 const USER_COLUMNS: [&str; 10] =
     ["id", "username", "name", "email", "email_verified_at", "kind", "owner_id", "password_hash", "disabled_at", "created_at"];
 
@@ -28,8 +33,8 @@ const INVITE_COLUMNS: [&str; 8] = ["id", "email", "service", "role", "invited_by
 /// One day in the microseconds timestamps count in.
 const DAY: i64 = 86_400_000_000;
 
-/// Thirty-two bytes that stand in for the SHA-256 digest auth stores in
-/// place of a secret: the same text always gives the same bytes.
+/// Thirty-two bytes that stand in for the SHA-256 digest the service stores
+/// in place of a secret: the same text always gives the same bytes.
 fn digest(secret: &str) -> Vec<u8> {
     let mut state: u64 = 0xcbf2_9ce4_8422_2325;
     let mut out = Vec::with_capacity(32);
@@ -71,16 +76,16 @@ fn texts(name: &str) -> ColumnDef {
     ColumnDef::new(name, Type::list(Type::Text))
 }
 
-/// The table the migrator keeps its own record in (Q161).
+/// The table the migrator keeps its own record in.
 fn schema_migrations() -> TableDef {
     TableDef::new("schema_migrations").column(text("version")).column(time("applied_at").default_now()).primary_key(["version"])
 }
 
-/// auth's tables as its two migration files leave them, parents before
-/// children. Unique indexes carry the names Postgres gave them, because
-/// auth tells two of them apart by name. The checks that are a regular
-/// expression are left to the app, which validates first anyway.
-/// `identities` is left out: neither server reads or writes it.
+/// The service's tables as its first two migrations leave them, parents
+/// before children. Unique indexes carry the names Postgres would give
+/// them, because the service tells two of them apart by name. Checks that
+/// would be a regular expression are left to the application, which
+/// validates first anyway.
 fn tables() -> Vec<TableDef> {
     vec![
         TableDef::new("users")
@@ -277,8 +282,9 @@ fn tables() -> Vec<TableDef> {
             .column(time("created_at").default_now())
             .column(time("updated_at").default_now())
             .primary_key(["name"])
-            // The half of the name's check that is not a regular expression.
-            .check("services_name_check", col("name").ne("auth"))
+            // The half of the name's check that is not a regular
+            // expression: no service takes the identity service's own name.
+            .check("services_name_check", col("name").ne("identity"))
             .check("services_signup_check", col("signup").in_list(vec!["closed", "invite", "open"])),
         TableDef::new("clients")
             .column(text("id"))
@@ -300,8 +306,8 @@ fn tables() -> Vec<TableDef> {
     ]
 }
 
-/// Everything auth's migrations create: its twenty tables, and the one row
-/// the services migration seeds.
+/// Everything the service's migrations create: its twenty tables, and the
+/// one row the services migration seeds.
 async fn schema(db: &Client) -> DbResult<()> {
     db.create_table_if_not_exists(schema_migrations()).await?;
     for table in tables() {
@@ -336,18 +342,18 @@ fn user_row(id: &str, username: &str, email: Option<&str>, kind: &str, owner: Op
         .set("password_hash", password_hash)
 }
 
-/// Q12: a person who signed up with a password.
+/// A person who signed up with a password.
 fn person(id: &str, username: &str, email: Option<&str>) -> Insert {
     user_row(id, username, email, "person", None, Some("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"))
 }
 
-/// Q12: a bot, which has an owner and no password.
+/// A bot, which has an owner and no password.
 fn bot(id: &str, username: &str, owner: &str) -> Insert {
     user_row(id, username, None, "bot", Some(owner), None)
 }
 
-/// Q55: a session that signed in now, idle for at most seven days and
-/// ending after thirty, all by the server's clock.
+/// A session that signed in now, idle for at most seven days and ending
+/// after thirty, all by the server's clock.
 fn new_session(id: &str, user: &str, token: &str) -> Insert {
     Insert::into("sessions")
         .set("id", id)
@@ -361,7 +367,7 @@ fn new_session(id: &str, user: &str, token: &str) -> Insert {
         .set("ends_at", now() + days(30))
 }
 
-/// Q24: gives a user a role on a service, replacing the one they had.
+/// Gives a user a role on a service, replacing the one they had.
 fn grant_role(user: &str, service: &str, role: &str, by: &str) -> Insert {
     Insert::into("access")
         .set("user_id", user)
@@ -374,7 +380,7 @@ fn grant_role(user: &str, service: &str, role: &str, by: &str) -> Insert {
         .returning(["service", "role", "granted_by", "granted_at"])
 }
 
-/// Q21: the role of a user who may still sign in.
+/// The role of a user who may still sign in.
 fn role_of(user: &str, service: &str) -> Query {
     Query::table("access")
         .alias("a")
@@ -383,18 +389,17 @@ fn role_of(user: &str, service: &str) -> Query {
         .select("role", col("a.role"))
 }
 
-/// Q129: one line of the audit log. Its number and its time are the
-/// server's.
+/// One line of the audit log. Its number and its time are the server's.
 fn audit_entry(actor: Option<&str>, action: &str, user: Option<&str>, detail: Json) -> Insert {
     Insert::into("audit").set("actor", actor).set("action", action).set("user_id", user).set("ip", "203.0.113.7").set("detail", detail)
 }
 
-/// Q122: an event for a service, queued by the transaction that caused it.
+/// An event for a service, queued by the transaction that caused it.
 fn event(service: &str, token: &str) -> Insert {
     Insert::into("outbox").set("service", service).set("token", token)
 }
 
-/// Q147.
+/// A service with two roles, which issues API keys and no app passwords.
 fn new_service(name: &str, signup: &str) -> Insert {
     Insert::into("services")
         .set("name", name)
@@ -410,7 +415,7 @@ fn new_service(name: &str, signup: &str) -> Insert {
         .set("created_by", "usr_admin")
 }
 
-/// Q144.
+/// A client of a service, with one redirect URI.
 fn new_client(id: &str, service: &str, kind: &str) -> Insert {
     Insert::into("clients")
         .set("id", id)
@@ -420,13 +425,13 @@ fn new_client(id: &str, service: &str, kind: &str) -> Insert {
         .set("post_logout_redirect_uris", no_texts())
 }
 
-/// Q142: every change to the services starts by counting it.
+/// Every change to the services starts by counting it.
 fn bump_revision() -> Update {
     Update::table("services_revision").set("revision", col("revision") + 1)
 }
 
-/// Q66: a refresh token of a public client, in a family of its own and
-/// tied to no session.
+/// A refresh token of a public client, in a family of its own and tied to
+/// no session.
 fn public_token(token: &str, family: &str, user: &str, client: &str) -> Insert {
     Insert::into("refresh_tokens")
         .set("token_hash", digest(token))
@@ -438,8 +443,8 @@ fn public_token(token: &str, family: &str, user: &str, client: &str) -> Insert {
         .set("amr", vec!["pwd"])
 }
 
-/// Q67: a refresh token of a confidential client, which copies what it
-/// needs from the session row and lives exactly as long.
+/// A refresh token of a confidential client, which copies what it needs
+/// from the session row and lives exactly as long.
 fn session_token(token: &str, client: &str, session: &str) -> Insert {
     Insert::into("refresh_tokens").columns(["token_hash", "family_id", "session_id", "user_id", "client_id", "expires_at", "amr"]).from_query(
         Query::table("sessions")
@@ -454,9 +459,9 @@ fn session_token(token: &str, client: &str, session: &str) -> Insert {
     )
 }
 
-/// Q63: the clients holding tokens of a session, or of a public client's
-/// family. The two columns have an index each, and a query reads one, so
-/// this reads the table.
+/// The clients holding tokens of a session, or of a public client's family.
+/// The two columns have an index each, and a query reads one, so this reads
+/// the table.
 fn clients_of(session_or_family: &str) -> Query {
     Query::table("refresh_tokens")
         .filter(col("session_id").eq(session_or_family).or(col("family_id").eq(session_or_family)))
@@ -464,19 +469,20 @@ fn clients_of(session_or_family: &str) -> Query {
         .distinct()
 }
 
-/// Q77.
+/// An authorization code issued to a client for a session, good for
+/// `lifetime_seconds` by the server's clock.
 fn new_code(code: &str, client: &str, session: &str, lifetime_seconds: i64) -> Insert {
     Insert::into("auth_codes")
         .set("code_hash", digest(code))
         .set("client_id", client)
         .set("session_id", session)
-        .set("redirect_uri", "https://mail.example/callback")
+        .set("redirect_uri", "https://files.example/callback")
         .set("code_challenge", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
         .set("nonce", "n-0S6_WzA2Mj")
         .set("expires_at", now() + seconds(lifetime_seconds))
 }
 
-/// Q78: spends a code if nobody has, and says whether it was still live.
+/// Spends a code if nobody has, and says whether it was still live.
 fn redeem(code: &str) -> Update {
     Update::table("auth_codes")
         .key([digest(code)])
@@ -486,8 +492,8 @@ fn redeem(code: &str) -> Update {
         .returning_expr("live", col("expires_at").gt(now()))
 }
 
-/// Q83: an API key or app password. The expiry arrives as text and the
-/// server reads it.
+/// An API key or app password. The expiry arrives as text and the server
+/// reads it.
 fn new_credential(id: &str, user: &str, kind: &str, service: &str, secret: &str, expires: Option<&str>) -> Insert {
     Insert::into("credentials")
         .set("id", id)
@@ -501,7 +507,8 @@ fn new_credential(id: &str, user: &str, kind: &str, service: &str, secret: &str,
         .returning(["id", "kind", "service", "scopes", "name", "created_at", "last_used_at", "expires_at"])
 }
 
-/// Q106.
+/// A one-time token for one purpose, good for `lifetime_seconds` by the
+/// server's clock.
 fn one_time_token(token: &str, purpose: &str, user: &str, email: Option<&str>, lifetime_seconds: i64) -> Insert {
     Insert::into("one_time_tokens")
         .set("token_hash", digest(token))
@@ -511,7 +518,7 @@ fn one_time_token(token: &str, purpose: &str, user: &str, email: Option<&str>, l
         .set("expires_at", now() + seconds(lifetime_seconds))
 }
 
-/// Q108: uses a token once, for the purpose it was made for.
+/// Uses a token once, for the purpose it was made for.
 fn consume_token(token: &str, purpose: &str) -> Update {
     Update::table("one_time_tokens")
         .key([digest(token)])
@@ -520,7 +527,9 @@ fn consume_token(token: &str, purpose: &str) -> Update {
         .returning(["user_id", "email"])
 }
 
-// R-S1, R-S2, R-S3, R-S4, R-S5, R-S6, R-S7, R-S10: auth §1, Q161.
+// R-S1, R-S2, R-S3, R-S4, R-S5, R-S6, R-S7, R-S10: the schema is described
+// as it was created: tables, keys, defaults, indexes on an expression and
+// over part of a table, checks and foreign keys.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_schema_reads_back_as_it_was_defined() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -566,7 +575,7 @@ async fn the_schema_reads_back_as_it_was_defined() -> DbResult<()> {
     assert_eq!(users.columns[9].default, Some(now()));
     assert!(!users.volatile);
 
-    // The index auth's sign-up errors are told apart by: unique, on an
+    // The index that tells one sign-up error from another: unique, on an
     // expression, over part of the table.
     let email = users.find_index("users_email").expect("the email index is there");
     assert!(email.unique);
@@ -611,21 +620,23 @@ async fn the_schema_reads_back_as_it_was_defined() -> DbResult<()> {
     Ok(())
 }
 
-// R-S7, R-W11: auth §1 (CHECK ... IN, NOT NULL, REFERENCES), §3.4.
+// R-S7, R-W11: a check on a set of values, NOT NULL and a foreign key each
+// refuse a row with an error code of their own, and a refused update changes
+// nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_row_that_breaks_a_check_a_not_null_or_a_foreign_key_is_refused() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
-    db.insert(new_service("mail", "invite")).await?;
+    db.insert(new_service("files", "invite")).await?;
 
     let outside_the_set = [
         (user_row("usr_x", "xavier", None, "robot", None, None), "users_kind_check"),
-        (new_credential("key_x", "usr_ann", "password", "mail", "secret", None), "credentials_kind_check"),
+        (new_credential("key_x", "usr_ann", "password", "files", "secret", None), "credentials_kind_check"),
         (one_time_token("token", "login", "usr_ann", None, 60), "one_time_tokens_purpose_check"),
-        (new_service("docs", "maybe"), "services_signup_check"),
-        (new_service("auth", "closed"), "services_name_check"),
-        (new_client("mail-tv", "mail", "native"), "clients_type_check"),
+        (new_service("chat", "maybe"), "services_signup_check"),
+        (new_service("identity", "closed"), "services_name_check"),
+        (new_client("files-tv", "files", "native"), "clients_type_check"),
         (Insert::into("services_revision").set("id", false), "services_revision_id_check"),
     ];
     for (insert, check) in outside_the_set {
@@ -651,7 +662,7 @@ async fn a_row_that_breaks_a_check_a_not_null_or_a_foreign_key_is_refused() -> D
     // A child needs its parent: a grant, a session and a client each
     // point at a row that is not there.
     for orphan in [
-        grant_role("usr_nobody", "mail", "member", "host-cli"),
+        grant_role("usr_nobody", "files", "member", "host-cli"),
         new_session("ses_x", "usr_nobody", "cookie"),
         new_client("wiki-web", "wiki", "public"),
     ] {
@@ -668,13 +679,14 @@ async fn a_row_that_breaks_a_check_a_not_null_or_a_foreign_key_is_refused() -> D
     Ok(())
 }
 
-// R-Q1, R-S7, R-W6, R-X2: auth Q140, Q142.
+// R-Q1, R-S7, R-W6, R-X2: a check holds a table to one row, and of ten
+// concurrent transactions that count it up each sees a number of its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_services_revision_is_one_row_that_every_change_counts_up() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
 
-    // Q140, read on every request.
+    // Read on every request.
     let revision = Query::table("services_revision").columns(["revision"]);
     assert_eq!(db.query_one(revision.clone()).await?.get::<i64>("revision")?, 0);
 
@@ -692,9 +704,9 @@ async fn the_services_revision_is_one_row_that_every_change_counts_up() -> DbRes
     let bumped = bumped.one()?;
     assert_eq!((bumped.get::<i64>("was")?, bumped.get::<i64>("revision")?), (0, 1));
 
-    // In Postgres this update was also the lock that put changes to the
-    // services one after another. Ten changes at once each see a number
-    // of their own.
+    // On Postgres this update is also the lock that puts changes to the
+    // services one after another. Ten changes at once each see a number of
+    // their own.
     let mut changes = Vec::new();
     for _ in 0..10 {
         let db = db.clone();
@@ -717,7 +729,8 @@ async fn the_services_revision_is_one_row_that_every_change_counts_up() -> DbRes
     Ok(())
 }
 
-// R-Q1, R-Q2, R-Q3, R-Q11: auth Q1, Q2, Q3, Q4, Q5, Q6.
+// R-Q1, R-Q2, R-Q3, R-Q11: lookups by primary key, by a unique index, by an
+// index on an expression and by an index over part of the table.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_user_is_found_by_id_by_username_and_by_email_in_any_case() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -729,7 +742,7 @@ async fn a_user_is_found_by_id_by_username_and_by_email_in_any_case() -> DbResul
     db.insert(bot("usr_bot2", "ann-bot-2", "usr_ann")).await?;
     let after = db.now().await?;
 
-    // Q1.
+    // By id, naming the columns wanted.
     let ann = db.query_one(Query::table("users").key(["usr_ann"]).columns(USER_COLUMNS)).await?;
     assert_eq!(ann.columns(), USER_COLUMNS);
     assert_eq!(ann.get::<String>("username")?, "ann");
@@ -741,25 +754,26 @@ async fn a_user_is_found_by_id_by_username_and_by_email_in_any_case() -> DbResul
     assert!(before <= created && created <= after);
     assert!(db.query_opt(Query::table("users").key(["usr_nobody"]).columns(USER_COLUMNS)).await?.is_none());
 
-    // Q2: the server folds what was typed the way it folded what is
+    // By address: the server folds what was typed the way it folded what is
     // stored, so one function decides what "the same address" means.
     for typed in ["ann@example.com", "ANN@EXAMPLE.COM", "Ann@Example.com"] {
         let found = db.query_one(Query::table("users").index("users_email", KeyRange::eq([val(typed).lower()])).columns(USER_COLUMNS)).await?;
         assert_eq!(found.get::<String>("id")?, "usr_ann", "{typed}");
     }
 
-    // Q5: whether an address is taken.
+    // Whether an address is taken.
     let taken = |address: &str| Query::table("users").index("users_email", KeyRange::eq([address.to_lowercase()])).select("one", 1);
     assert_eq!(db.query(taken("ANN@example.com")).await?.len(), 1);
     assert!(db.query(taken("bob@example.com")).await?.is_empty());
 
-    // Q3. The app lower-cases what was typed; the index itself is exact.
+    // By username. The service lower-cases what was typed; the index itself
+    // is exact.
     let bob = db.query_one(Query::table("users").index("users_username_key", KeyRange::eq(["bob"])).columns(USER_COLUMNS)).await?;
     assert_eq!(bob.get::<String>("id")?, "usr_bob");
     assert!(bob.is_null("email")?);
     assert!(db.query_opt(Query::table("users").index("users_username_key", KeyRange::eq(["Bob"]))).await?.is_none());
 
-    // Q4: who a token is issued for, unless they were disabled.
+    // Who a token is issued for, unless they were disabled.
     let holder = |id: &str| {
         Query::table("users")
             .key([id])
@@ -775,15 +789,15 @@ async fn a_user_is_found_by_id_by_username_and_by_email_in_any_case() -> DbResul
     db.update(Update::table("users").key(["usr_ann"]).set("disabled_at", Timestamp::now())).await?;
     assert!(db.query_opt(holder("usr_ann")).await?.is_none());
 
-    // Q6: the bots a user owns, through the index that holds only bots.
+    // The bots a user owns, through the index that holds only bots.
     let bots = |owner: &str| Query::table("users").index("users_owner", KeyRange::eq([owner]));
     assert_eq!(rows_of(&db, bots("usr_ann")).await?, 2);
     assert_eq!(rows_of(&db, bots("usr_bob")).await?, 0);
     Ok(())
 }
 
-/// Confirming a new address, as one transaction: the token is used (Q108)
-/// and its address becomes the user's (Q19).
+/// Confirming a new address, as one transaction: the token is used and its
+/// address becomes the user's.
 async fn confirm_email(db: &Client, token: &str, user: &str) -> DbResult<()> {
     db.transaction(|tx| async move {
         let token = tx.update(consume_token(token, "verify_email")).await?.one()?;
@@ -794,15 +808,16 @@ async fn confirm_email(db: &Client, token: &str, user: &str) -> DbResult<()> {
     .await
 }
 
-// R-S3, R-T9, R-W11, R-X1: auth Q12, Q14, Q16, Q19, Q108; §3.4.
+// R-S3, R-T9, R-W11, R-X1: a unique violation names the index it broke, and
+// a transaction in which a statement failed can only be given up.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_taken_username_or_email_is_reported_by_the_name_of_its_index() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", Some("Ann@Example.com"))).await?;
 
-    // auth answers these two with different messages, and has only the
-    // index's name to tell them apart.
+    // The service answers these two with different messages, and has only
+    // the index's name to tell them apart.
     let err = db.insert(person("usr_two", "ann", Some("other@example.com"))).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::UniqueViolation);
     assert!(err.violates("users_username_key") && !err.violates("users_email"), "{err}");
@@ -822,9 +837,9 @@ async fn a_taken_username_or_email_is_reported_by_the_name_of_its_index() -> DbR
     // A row does not collide with itself.
     db.update(Update::table("users").key(["usr_ann"]).set("email", "ANN@EXAMPLE.COM").set("updated_at", now())).await?;
 
-    // Patching a user (Q14, then Q16): the taken address fails the second
-    // statement, the transaction can then only be given up, and the
-    // rename before it goes too.
+    // Patching a user, a rename and then a new address: the taken address
+    // fails the second statement, the transaction can then only be given
+    // up, and the rename before it goes too.
     let tx = db.begin().await?;
     tx.update(Update::table("users").key(["usr_bob"]).set("name", "Robert").set("updated_at", now())).await?;
     let take_address =
@@ -855,9 +870,9 @@ async fn a_taken_username_or_email_is_reported_by_the_name_of_its_index() -> DbR
     Ok(())
 }
 
-/// Q7: the page of users after `cursor`, narrowed to those whose username,
-/// name or email starts with what was typed. One row more than the page is
-/// asked for: if it comes, there is another page.
+/// The page of users after `cursor`, narrowed to those whose username, name
+/// or email starts with what was typed. One row more than the page is asked
+/// for: if it comes, there is another page.
 fn user_page(cursor: &str, typed: &str, page: u64) -> Query {
     let pattern = format!("{}%", like_escape(&typed.to_lowercase()));
     Query::table("users")
@@ -872,7 +887,8 @@ fn user_page(cursor: &str, typed: &str, page: u64) -> Query {
         .limit(page + 1)
 }
 
-// R-Q4, R-Q7, R-T9: auth Q7.
+// R-Q4, R-Q7, R-T9: paging by a cursor over the primary key, with a search
+// by prefix whose pattern is escaped.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_admin_user_list_pages_by_id_and_searches_by_an_escaped_prefix() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -926,10 +942,10 @@ async fn the_admin_user_list_pages_by_id_and_searches_by_an_escaped_prefix() -> 
     Ok(())
 }
 
-/// Q8: the members of a service as its client may list them: enabled
-/// users only, found by the start of a username or name or by a whole
-/// address. Reading `access` through its `(service, user_id)` index gives
-/// them in the order of their ids.
+/// The members of a service as its client may list them: enabled users
+/// only, found by the start of a username or name or by a whole address.
+/// Reading `access` through its `(service, user_id)` index gives them in
+/// the order of their ids.
 fn member_page(service: &str, cursor: &str, typed: &str, page: u64) -> Query {
     let pattern = format!("{}%", like_escape(&typed.to_lowercase()));
     Query::table("access")
@@ -949,7 +965,7 @@ fn member_page(service: &str, cursor: &str, typed: &str, page: u64) -> Query {
         .limit(page + 1)
 }
 
-/// Q11: a user and, if they have one, their role on a service.
+/// A user and, if they have one, their role on a service.
 fn with_role(user: Query, service: &str) -> Query {
     user.alias("u")
         .left_join(Query::table("access").alias("a").key([col("u.id"), val(service)]))
@@ -957,7 +973,8 @@ fn with_role(user: Query, service: &str) -> Query {
         .select("role", col("a.role"))
 }
 
-// R-Q2, R-Q4, R-Q7, R-Q9: auth Q8, Q11.
+// R-Q2, R-Q4, R-Q7, R-Q9: an inner join and a left join by key, paged by a
+// cursor through a two-column index.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clients_user_list_joins_roles_to_enabled_users() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -969,54 +986,55 @@ async fn a_clients_user_list_joins_roles_to_enabled_users() -> DbResult<()> {
         ("usr_04", "dee", "Andrea Dee", Some("dee@example.com"), Some("member")),
         ("usr_05", "eli", "Eli", Some("eli@example.com"), None),
     ];
-    for (id, username, name, email, mail_role) in people {
+    for (id, username, name, email, files_role) in people {
         db.insert(person(id, username, email)).await?;
         db.update(Update::table("users").key([id]).set("name", name).set("updated_at", now())).await?;
-        if let Some(role) = mail_role {
-            db.insert(grant_role(id, "mail", role, "usr_admin")).await?;
+        if let Some(role) = files_role {
+            db.insert(grant_role(id, "files", role, "usr_admin")).await?;
         }
     }
-    db.insert(grant_role("usr_05", "docs", "member", "usr_admin")).await?;
-    db.insert(grant_role("usr_01", "docs", "member", "usr_admin")).await?;
+    db.insert(grant_role("usr_05", "chat", "member", "usr_admin")).await?;
+    db.insert(grant_role("usr_01", "chat", "member", "usr_admin")).await?;
     db.update(Update::table("users").key(["usr_03"]).set("disabled_at", Timestamp::now()).set("updated_at", now())).await?;
 
     // Each row carries columns of both tables. Cy has a role but is
-    // disabled; Eli is enabled but has no role on mail.
-    let mail = db.query(member_page("mail", "", "", 10)).await?;
-    assert_eq!(mail.columns(), ["id", "username", "name", "role"]);
-    assert_eq!(column::<String>(&mail, "id"), ["usr_01", "usr_02", "usr_04"]);
-    assert_eq!(column::<String>(&mail, "name"), ["Ann Lee", "Bob", "Andrea Dee"]);
-    assert_eq!(column::<String>(&mail, "role"), ["admin", "member", "member"]);
-    let docs = db.query(member_page("docs", "", "", 10)).await?;
-    assert_eq!(column::<String>(&docs, "id"), ["usr_01", "usr_05"]);
-    assert_eq!(column::<String>(&docs, "role"), ["member", "member"]);
+    // disabled; Eli is enabled but has no role on files.
+    let files = db.query(member_page("files", "", "", 10)).await?;
+    assert_eq!(files.columns(), ["id", "username", "name", "role"]);
+    assert_eq!(column::<String>(&files, "id"), ["usr_01", "usr_02", "usr_04"]);
+    assert_eq!(column::<String>(&files, "name"), ["Ann Lee", "Bob", "Andrea Dee"]);
+    assert_eq!(column::<String>(&files, "role"), ["admin", "member", "member"]);
+    let chat = db.query(member_page("chat", "", "", 10)).await?;
+    assert_eq!(column::<String>(&chat, "id"), ["usr_01", "usr_05"]);
+    assert_eq!(column::<String>(&chat, "role"), ["member", "member"]);
 
     // The limit counts rows that survived the join and the filter.
     let ids = |rows: Rows| column::<String>(&rows, "id");
-    assert_eq!(ids(db.query(member_page("mail", "", "", 1)).await?), ["usr_01", "usr_02"]);
-    assert_eq!(ids(db.query(member_page("mail", "usr_01", "", 1)).await?), ["usr_02", "usr_04"]);
-    assert_eq!(ids(db.query(member_page("mail", "usr_02", "", 1)).await?), ["usr_04"]);
-    assert!(db.query(member_page("mail", "usr_04", "", 1)).await?.is_empty());
+    assert_eq!(ids(db.query(member_page("files", "", "", 1)).await?), ["usr_01", "usr_02"]);
+    assert_eq!(ids(db.query(member_page("files", "usr_01", "", 1)).await?), ["usr_02", "usr_04"]);
+    assert_eq!(ids(db.query(member_page("files", "usr_02", "", 1)).await?), ["usr_04"]);
+    assert!(db.query(member_page("files", "usr_04", "", 1)).await?.is_empty());
     assert!(db.query(member_page("wiki", "", "", 10)).await?.is_empty());
 
     // A prefix finds usernames and names; an address only whole, in any
     // case. Bob has no address, which matches nothing and breaks nothing.
-    assert_eq!(ids(db.query(member_page("mail", "", "an", 10)).await?), ["usr_01", "usr_04"]);
-    assert_eq!(ids(db.query(member_page("mail", "", "ANN@EXAMPLE.COM", 10)).await?), ["usr_01"]);
-    assert!(db.query(member_page("mail", "", "ann@", 10)).await?.is_empty());
-    assert_eq!(ids(db.query(member_page("mail", "", "bob", 10)).await?), ["usr_02"]);
-    assert!(db.query(member_page("mail", "", "cy", 10)).await?.is_empty());
+    assert_eq!(ids(db.query(member_page("files", "", "an", 10)).await?), ["usr_01", "usr_04"]);
+    assert_eq!(ids(db.query(member_page("files", "", "ANN@EXAMPLE.COM", 10)).await?), ["usr_01"]);
+    assert!(db.query(member_page("files", "", "ann@", 10)).await?.is_empty());
+    assert_eq!(ids(db.query(member_page("files", "", "bob", 10)).await?), ["usr_02"]);
+    assert!(db.query(member_page("files", "", "cy", 10)).await?.is_empty());
 
-    // Q11: the left join keeps a user who has no role.
-    let eli = db.query_one(with_role(Query::table("users").key(["usr_05"]), "mail")).await?;
+    // The left join keeps a user who has no role.
+    let eli = db.query_one(with_role(Query::table("users").key(["usr_05"]), "files")).await?;
     assert_eq!((eli.get::<String>("id")?, eli.get::<Option<String>>("role")?), ("usr_05".to_string(), None));
-    let ann = db.query_one(with_role(Query::table("users").index("users_username_key", KeyRange::eq(["ann"])), "mail")).await?;
+    let ann = db.query_one(with_role(Query::table("users").index("users_username_key", KeyRange::eq(["ann"])), "files")).await?;
     assert_eq!((ann.get::<String>("id")?, ann.get::<Option<String>>("role")?), ("usr_01".to_string(), Some("admin".to_string())));
-    assert!(db.query_opt(with_role(Query::table("users").key(["usr_nobody"]), "mail")).await?.is_none());
+    assert!(db.query_opt(with_role(Query::table("users").key(["usr_nobody"]), "files")).await?.is_none());
     Ok(())
 }
 
-// R-Q3, R-Q6, R-Q15: auth Q9, Q10, Q88; §4.11.
+// R-Q3, R-Q6, R-Q15: many lookups in one index by one query, as many as ten
+// thousand, and a filter on a function of a column.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_learns_in_one_read_which_names_addresses_and_keys_exist() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1024,10 +1042,10 @@ async fn an_import_learns_in_one_read_which_names_addresses_and_keys_exist() -> 
     db.insert(person("usr_ann", "ann", Some("Ann@Example.com"))).await?;
     db.insert(person("usr_bob", "bob", None)).await?;
     db.insert(person("usr_zoe", "zoe", Some("ZOË@Example.com"))).await?;
-    db.insert(new_credential("key_1", "usr_ann", "api_key", "mail", "secret-1", None)).await?;
-    db.insert(new_credential("key_2", "usr_ann", "api_key", "mail", "secret-2", None)).await?;
+    db.insert(new_credential("key_1", "usr_ann", "api_key", "files", "secret-1", None)).await?;
+    db.insert(new_credential("key_2", "usr_ann", "api_key", "files", "secret-2", None)).await?;
 
-    // Q9: one index lookup per name, answered in the order asked.
+    // One index lookup per name, answered in the order asked.
     let wanted = ["zoe", "nobody", "ann", "zed"];
     let taken =
         db.query(Query::table("users").index_ranges("users_username_key", wanted.map(|name| KeyRange::eq([name]))).columns(["username"])).await?;
@@ -1044,7 +1062,7 @@ async fn an_import_learns_in_one_read_which_names_addresses_and_keys_exist() -> 
         .await?;
     assert_eq!(taken.column::<String>()?, ["bob"]);
 
-    // Q10: the app lower-cases the addresses it asks about and the server
+    // The caller lower-cases the addresses it asks about and the server
     // lower-cased the ones it indexed. The two must agree beyond ASCII.
     let asked: Vec<String> = ["ANN@example.com", "Zoë@EXAMPLE.com", "new@example.com"].iter().map(|address| address.to_lowercase()).collect();
     let used = db
@@ -1056,8 +1074,8 @@ async fn an_import_learns_in_one_read_which_names_addresses_and_keys_exist() -> 
         .await?;
     assert_eq!(used.column::<String>()?, ["ann@example.com", "zoë@example.com"]);
 
-    // Q88: the keys of an import that are already there, compared as the
-    // hex text the import carries.
+    // The keys of an import that are already there, compared as the hex
+    // text the import carries.
     let carried = vec![hex(&digest("secret-2")), hex(&digest("secret-9"))];
     let as_hex = || call(Func::Hex, [col("secret_hash")]);
     let known = db.query(Query::table("credentials").filter(as_hex().in_list(carried.clone())).select("h", as_hex())).await?;
@@ -1069,7 +1087,8 @@ async fn an_import_learns_in_one_read_which_names_addresses_and_keys_exist() -> 
     Ok(())
 }
 
-// R-W6, R-Q8, R-T3: auth Q13, Q14, Q15, Q17.
+// R-W6, R-Q8, R-T3: updates by key set columns to a value, to the server's
+// time and to NULL, and return the old value beside the new.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_user_update_writes_its_columns_and_the_servers_time() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1080,7 +1099,7 @@ async fn a_user_update_writes_its_columns_and_the_servers_time() -> DbResult<()>
     let ann = db.get("users", ["usr_ann"]).await?.expect("ann is there");
     let (created, first_update): (Timestamp, Timestamp) = (ann.get("created_at")?, ann.get("updated_at")?);
 
-    // Q14, here also returning the name that was replaced.
+    // A rename, here also returning the name that was replaced.
     let rename = Update::table("users").key(["usr_ann"]).set("name", "Ann Lee").set("updated_at", now());
     let renamed = db.update(rename.returning(["name", "created_at", "updated_at"]).returning_expr("was", old("name"))).await?;
     assert_eq!(renamed.affected(), 1);
@@ -1090,21 +1109,21 @@ async fn a_user_update_writes_its_columns_and_the_servers_time() -> DbResult<()>
     let updated: Timestamp = renamed.get("updated_at")?;
     assert!(updated >= first_update && updated <= db.now().await?);
 
-    // Q13: disabling stores the app's own clock, to the microsecond;
-    // enabling stores NULL.
+    // Disabling stores the caller's own clock, to the microsecond; enabling
+    // stores NULL.
     let at = ts("2026-03-05T10:20:30.123456Z");
     db.update(Update::table("users").key(["usr_ann"]).set("disabled_at", at).set("updated_at", now())).await?;
     assert_eq!(db.get("users", ["usr_ann"]).await?.expect("ann is there").get::<Option<Timestamp>>("disabled_at")?, Some(at));
     db.update(Update::table("users").key(["usr_ann"]).set("disabled_at", null()).set("updated_at", now())).await?;
     assert!(db.get("users", ["usr_ann"]).await?.expect("ann is there").is_null("disabled_at")?);
 
-    // Q15.
+    // A new password hash leaves the other columns alone.
     db.update(Update::table("users").key(["usr_ann"]).set("password_hash", "$argon2id$rehashed").set("updated_at", now())).await?;
     let ann = db.get("users", ["usr_ann"]).await?.expect("ann is there");
     assert_eq!(ann.get::<Option<String>>("password_hash")?.as_deref(), Some("$argon2id$rehashed"));
     assert_eq!(ann.get::<String>("name")?, "Ann Lee");
 
-    // Q17: the bot changes hands, and the index of owners follows.
+    // The bot changes hands, and the index of owners follows.
     let owned_by = |owner: &str| Query::table("users").index("users_owner", KeyRange::eq([owner])).columns(["id"]);
     assert_eq!(db.query(owned_by("usr_ann")).await?.column::<String>()?, ["usr_bot"]);
     db.update(Update::table("users").key(["usr_bot"]).set("owner_id", "usr_bob").set("updated_at", now())).await?;
@@ -1118,10 +1137,10 @@ async fn a_user_update_writes_its_columns_and_the_servers_time() -> DbResult<()>
     Ok(())
 }
 
-/// Activating an account, as auth does it: the token is used (Q108), the
-/// password set if the account still waits for one at the token's address
-/// (Q18), the change logged (Q129). When Q18 matches nothing the whole
-/// transaction is given up, so that the token is not used.
+/// Activating an account: the token is used, the password set if the
+/// account still waits for one at the token's address, the change logged.
+/// When the update of the account matches nothing the whole transaction is
+/// given up, so that the token is not used.
 async fn activate(db: &Client, token: &str, password_hash: &str) -> DbResult<bool> {
     let tx = db.begin().await?;
     let Some(used) = tx.update(consume_token(token, "activate")).await?.opt() else {
@@ -1149,7 +1168,8 @@ async fn activate(db: &Client, token: &str, password_hash: &str) -> DbResult<boo
     Ok(true)
 }
 
-// R-W7, R-X1, R-X7: auth Q18, Q106, Q108, Q129; §3.2 (activate).
+// R-W7, R-X1, R-X7: when a conditional update matches nothing its
+// transaction is given up, and the writes of one transaction carry one time.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_activation_that_matches_no_account_leaves_its_token_unused() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1191,7 +1211,7 @@ async fn an_activation_that_matches_no_account_leaves_its_token_unused() -> DbRe
     Ok(())
 }
 
-/// Q96: an invitation, good for a while by the server's clock.
+/// An invitation, good for a while by the server's clock.
 fn new_invite(id: &str, email: &str, service: &str, role: &str, token: &str, lifetime_seconds: i64) -> Insert {
     Insert::into("invites")
         .set("id", id)
@@ -1204,7 +1224,7 @@ fn new_invite(id: &str, email: &str, service: &str, role: &str, token: &str, lif
         .returning(INVITE_COLUMNS)
 }
 
-/// Q99: accepts an invitation once, while it is good.
+/// Accepts an invitation once, while it is good.
 fn accept_invite(token: &str, user: &str) -> Update {
     Update::table("invites")
         .index("invites_token_hash_key", KeyRange::eq([digest(token)]))
@@ -1214,7 +1234,8 @@ fn accept_invite(token: &str, user: &str) -> Update {
         .returning(INVITE_COLUMNS)
 }
 
-// R-S6, R-W10, R-X1: auth Q6, Q17, Q20, Q122, Q129; §1.22, §4.12.
+// R-S6, R-W10, R-X1: deleting a row cascades, sets NULL or is refused, as
+// each foreign key says, and a rollback brings every row back.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_user_empties_every_table_that_points_at_them() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1223,19 +1244,19 @@ async fn deleting_a_user_empties_every_table_that_points_at_them() -> DbResult<(
         let user = format!("usr_{name}");
         let session = format!("ses_{name}");
         db.insert(person(&user, name, Some(&format!("{name}@example.com")))).await?;
-        db.insert(grant_role(&user, "mail", "member", "usr_admin")).await?;
-        db.insert(grant_role(&user, "docs", "member", "usr_admin")).await?;
+        db.insert(grant_role(&user, "files", "member", "usr_admin")).await?;
+        db.insert(grant_role(&user, "chat", "member", "usr_admin")).await?;
         db.insert(Insert::into("totp").set("user_id", user.as_str()).set("secret_enc", digest("totp"))).await?;
         let passkey = Insert::into("passkeys").set("id", format!("pk_{name}")).set("user_id", user.as_str()).set("name", "laptop");
         db.insert(passkey.set("credential_id", digest(&format!("passkey-{name}"))).set("public_key", digest("cose"))).await?;
         db.insert(Insert::into("recovery_codes").set("user_id", user.as_str()).set("code_hash", digest(&format!("recovery-{name}")))).await?;
         db.insert(new_session(&session, &user, &format!("cookie-{name}"))).await?;
-        db.insert(session_token(&format!("web-{name}"), "mail-web", &session)).await?;
-        db.insert(new_code(&format!("code-{name}"), "mail-web", &session, 60)).await?;
-        db.insert(public_token(&format!("ios-{name}"), &format!("ses_ios_{name}"), &user, "mail-ios")).await?;
-        db.insert(new_credential(&format!("key_{name}"), &user, "api_key", "mail", &format!("secret-{name}"), None)).await?;
+        db.insert(session_token(&format!("web-{name}"), "files-web", &session)).await?;
+        db.insert(new_code(&format!("code-{name}"), "files-web", &session, 60)).await?;
+        db.insert(public_token(&format!("ios-{name}"), &format!("ses_ios_{name}"), &user, "files-ios")).await?;
+        db.insert(new_credential(&format!("key_{name}"), &user, "api_key", "files", &format!("secret-{name}"), None)).await?;
         db.insert(one_time_token(&format!("reset-{name}"), "reset", &user, None, 3600)).await?;
-        db.insert(new_invite(&format!("inv_{name}"), &format!("{name}@example.com"), "mail", "member", &format!("invite-{name}"), 3600)).await?;
+        db.insert(new_invite(&format!("inv_{name}"), &format!("{name}@example.com"), "files", "member", &format!("invite-{name}"), 3600)).await?;
         assert_eq!(db.update(accept_invite(&format!("invite-{name}"), &user)).await?.affected(), 1);
         db.insert(audit_entry(Some(&user), "login.ok", Some(&user), json!({}))).await?;
     }
@@ -1253,7 +1274,7 @@ async fn deleting_a_user_empties_every_table_that_points_at_them() -> DbResult<(
     let of = |table: &str, user: &str| Query::table(table).filter(col("user_id").eq(user));
 
     // A user who still owns a bot cannot be deleted, and the refused
-    // statement takes nothing with it. auth counts the bots first (Q6).
+    // statement takes nothing with it. The service counts the bots first.
     let err = db.delete(Delete::from("users").key(["usr_ann"])).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::ForeignKeyViolation);
     for (table, rows) in children {
@@ -1265,7 +1286,7 @@ async fn deleting_a_user_empties_every_table_that_points_at_them() -> DbResult<(
     // transaction.
     db.transaction(|tx| async move {
         assert_eq!(rows_of(&tx, Query::table("users").index("users_owner", KeyRange::eq(["usr_ann"]))).await?, 0);
-        tx.insert(event("mail", "user-deleted")).await?;
+        tx.insert(event("files", "user-deleted")).await?;
         let gone = tx.delete(Delete::from("users").key(["usr_ann"])).await?;
         assert_eq!(gone.affected(), 1);
         tx.insert(audit_entry(Some("usr_admin"), "user.delete", Some("usr_ann"), json!({"username": "ann"}))).await?;
@@ -1308,7 +1329,8 @@ async fn deleting_a_user_empties_every_table_that_points_at_them() -> DbResult<(
     Ok(())
 }
 
-// R-Q1, R-Q9, R-W4, R-W7: auth Q21, Q22, Q23, Q24, Q25, Q26, Q27, Q28.
+// R-Q1, R-Q9, R-W4, R-W7: an upsert on a two-column key, a read through a
+// join, and a delete that returns what it removed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_role_is_granted_by_upsert_read_for_enabled_users_and_revoked_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1316,47 +1338,47 @@ async fn a_role_is_granted_by_upsert_read_for_enabled_users_and_revoked_once() -
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(person("usr_bob", "bob", None)).await?;
 
-    // Q24: the first grant inserts.
-    let first = db.insert(grant_role("usr_ann", "mail", "member", "usr_admin")).await?;
+    // The first grant inserts.
+    let first = db.insert(grant_role("usr_ann", "files", "member", "usr_admin")).await?;
     assert_eq!(first.affected(), 1);
     let first = first.one()?;
     assert_eq!(first.columns(), ["service", "role", "granted_by", "granted_at"]);
     assert_eq!((first.get::<String>("role")?, first.get::<String>("granted_by")?), ("member".to_string(), "usr_admin".to_string()));
 
-    // Q22 then Q24: the role is read and then replaced in one
-    // transaction, where Postgres locked the row in between. The second
-    // grant updates the row it found: role and granter from the proposed
-    // row, the time from the clock.
+    // The role is read and then replaced in one transaction, where Postgres
+    // would lock the row in between. The second grant updates the row it
+    // found: role and granter from the proposed row, the time from the
+    // clock.
     let second = db
         .transaction(|tx| async move {
-            let current = tx.query_one(Query::table("access").key(["usr_ann", "mail"]).columns(["role"])).await?;
+            let current = tx.query_one(Query::table("access").key(["usr_ann", "files"]).columns(["role"])).await?;
             assert_eq!(current.get::<String>("role")?, "member");
-            tx.insert(grant_role("usr_ann", "mail", "admin", "cli_mail")).await?.one()
+            tx.insert(grant_role("usr_ann", "files", "admin", "cli_files")).await?.one()
         })
         .await?;
-    assert_eq!((second.get::<String>("role")?, second.get::<String>("granted_by")?), ("admin".to_string(), "cli_mail".to_string()));
+    assert_eq!((second.get::<String>("role")?, second.get::<String>("granted_by")?), ("admin".to_string(), "cli_files".to_string()));
     assert!(second.get::<Timestamp>("granted_at")? >= first.get::<Timestamp>("granted_at")?);
     assert_eq!(rows_of(&db, Query::table("access")).await?, 1);
 
-    // Q23 and Q26: the row as it now is, and whether there is one.
-    let row = db.query_one(Query::table("access").key(["usr_ann", "mail"]).columns(["service", "role", "granted_by", "granted_at"])).await?;
+    // The row as it now is, and whether there is one.
+    let row = db.query_one(Query::table("access").key(["usr_ann", "files"]).columns(["service", "role", "granted_by", "granted_at"])).await?;
     assert_eq!(row, second);
     let has_access = |user: &str, service: &str| Query::table("access").key([user, service]).select("one", 1);
-    assert_eq!(db.query(has_access("usr_ann", "mail")).await?.len(), 1);
-    assert!(db.query(has_access("usr_ann", "docs")).await?.is_empty());
-    assert!(db.query(has_access("usr_bob", "mail")).await?.is_empty());
+    assert_eq!(db.query(has_access("usr_ann", "files")).await?.len(), 1);
+    assert!(db.query(has_access("usr_ann", "chat")).await?.is_empty());
+    assert!(db.query(has_access("usr_bob", "files")).await?.is_empty());
 
-    // Q27: a user's roles come in the order of the service's name, which
-    // is the order of the key.
+    // A user's roles come in the order of the service's name, which is the
+    // order of the key.
     db.insert(grant_role("usr_ann", "wiki", "member", "usr_admin")).await?;
-    db.insert(grant_role("usr_ann", "docs", "owner", "usr_admin")).await?;
-    db.insert(grant_role("usr_bob", "mail", "member", "usr_admin")).await?;
+    db.insert(grant_role("usr_ann", "chat", "owner", "usr_admin")).await?;
+    db.insert(grant_role("usr_bob", "files", "member", "usr_admin")).await?;
     let roles = db.query(Query::table("access").range(KeyRange::eq(["usr_ann"])).columns(["service", "role", "granted_by", "granted_at"])).await?;
-    assert_eq!(column::<String>(&roles, "service"), ["docs", "mail", "wiki"]);
+    assert_eq!(column::<String>(&roles, "service"), ["chat", "files", "wiki"]);
     assert_eq!(column::<String>(&roles, "role"), ["owner", "admin", "member"]);
 
-    // Q21 and Q28: a disabled user has no role to speak of, though the
-    // row is still there.
+    // A disabled user has no role to speak of, though the row is still
+    // there.
     let view = |user: &str, service: &str| {
         Query::table("access")
             .alias("a")
@@ -1367,27 +1389,27 @@ async fn a_role_is_granted_by_upsert_read_for_enabled_users_and_revoked_once() -
             .select("granted_by", col("a.granted_by"))
             .select("granted_at", col("a.granted_at"))
     };
-    assert_eq!(db.query_one(role_of("usr_ann", "mail")).await?.get::<String>("role")?, "admin");
-    assert_eq!(db.query_one(view("usr_ann", "mail")).await?, second);
+    assert_eq!(db.query_one(role_of("usr_ann", "files")).await?.get::<String>("role")?, "admin");
+    assert_eq!(db.query_one(view("usr_ann", "files")).await?, second);
     assert!(db.query_opt(role_of("usr_ann", "calendar")).await?.is_none());
     db.update(Update::table("users").key(["usr_ann"]).set("disabled_at", Timestamp::now()).set("updated_at", now())).await?;
-    assert!(db.query_opt(role_of("usr_ann", "mail")).await?.is_none());
-    assert!(db.query_opt(view("usr_ann", "mail")).await?.is_none());
-    assert_eq!(db.query(has_access("usr_ann", "mail")).await?.len(), 1);
-    assert_eq!(db.query_one(role_of("usr_bob", "mail")).await?.get::<String>("role")?, "member");
+    assert!(db.query_opt(role_of("usr_ann", "files")).await?.is_none());
+    assert!(db.query_opt(view("usr_ann", "files")).await?.is_none());
+    assert_eq!(db.query(has_access("usr_ann", "files")).await?.len(), 1);
+    assert_eq!(db.query_one(role_of("usr_bob", "files")).await?.get::<String>("role")?, "member");
 
-    // Q25: the delete says what the role was, and only once.
-    let revoked = db.delete(Delete::from("access").key(["usr_ann", "mail"]).returning(["role"])).await?;
+    // The delete says what the role was, and only once.
+    let revoked = db.delete(Delete::from("access").key(["usr_ann", "files"]).returning(["role"])).await?;
     assert_eq!(revoked.affected(), 1);
     assert_eq!(revoked.one()?.get::<String>("role")?, "admin");
-    let again = db.delete(Delete::from("access").key(["usr_ann", "mail"]).returning(["role"])).await?;
+    let again = db.delete(Delete::from("access").key(["usr_ann", "files"]).returning(["role"])).await?;
     assert!(again.is_empty());
     assert_eq!(again.affected(), 0);
     assert_eq!(rows_of(&db, Query::table("access").range(KeyRange::eq(["usr_ann"]))).await?, 2);
     Ok(())
 }
 
-/// Q32: enrols a user in TOTP, replacing what they had.
+/// Enrols a user in TOTP, replacing what they had.
 fn enrol_totp(user: &str, sealed_secret: &[u8], step: i64) -> Insert {
     Insert::into("totp")
         .set("user_id", user)
@@ -1398,7 +1420,7 @@ fn enrol_totp(user: &str, sealed_secret: &[u8], step: i64) -> Insert {
         .update("created_at", now())
 }
 
-/// Q41: registers a passkey unless its credential id is already known.
+/// Registers a passkey unless its credential id is already known.
 fn new_passkey(id: &str, user: &str, credential_id: &[u8], name: &str) -> Insert {
     Insert::into("passkeys")
         .set("id", id)
@@ -1411,12 +1433,12 @@ fn new_passkey(id: &str, user: &str, credential_id: &[u8], name: &str) -> Insert
         .returning(["id"])
 }
 
-/// Q48.
+/// One recovery code of a user, not yet spent.
 fn recovery_code(user: &str, code: &str) -> Insert {
     Insert::into("recovery_codes").set("user_id", user).set("code_hash", digest(code))
 }
 
-/// Q49: spends a recovery code that has not been spent.
+/// Spends a recovery code that has not been spent.
 fn spend_code(user: &str, code: &str) -> Update {
     Update::table("recovery_codes")
         .key([val(user), val(digest(code))])
@@ -1425,7 +1447,7 @@ fn spend_code(user: &str, code: &str) -> Update {
         .returning_expr("one", 1)
 }
 
-/// Q31: which second factors a user has, in one row. SQL selected three
+/// Which second factors a user has, in one row. SQL would select three
 /// subqueries from nothing; a query here starts from a table, so this one
 /// starts from the user's own row and the subqueries read it.
 fn factors(user: &str) -> Query {
@@ -1438,7 +1460,8 @@ fn factors(user: &str) -> Query {
         .select("recovery_codes", scalar(unused_codes.select("n", count())))
 }
 
-// R-Q10, R-Q11: auth Q31, Q51.
+// R-Q10, R-Q11: one row made of an EXISTS and two counting subqueries, each
+// reading the outer row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_users_second_factors_are_counted_in_one_row() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1470,13 +1493,15 @@ async fn a_users_second_factors_are_counted_in_one_row() -> DbResult<()> {
     assert_eq!(summary(db.query_one(factors("usr_bob")).await?)?, (false, 1, 5));
     assert!(db.query_opt(factors("usr_nobody")).await?.is_none());
 
-    // Q51: the codes a user has left.
+    // The codes a user has left.
     let left = Query::table("recovery_codes").range(KeyRange::eq(["usr_ann"])).filter(col("used_at").is_null());
     assert_eq!(rows_of(&db, left).await?, 7);
     Ok(())
 }
 
-// R-W4, R-W7, R-X1, R-X3: auth Q32, Q33, Q34, Q35, Q36, Q37, Q38.
+// R-W4, R-W7, R-X1, R-X3: a compare-and-set update that one of several
+// concurrent requests wins, an upsert, and a read and a write of one row in
+// one transaction.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_totp_step_is_accepted_once_however_many_requests_carry_it() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1484,14 +1509,14 @@ async fn a_totp_step_is_accepted_once_however_many_requests_carry_it() -> DbResu
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(person("usr_bob", "bob", None)).await?;
 
-    // Q32 and Q33: enrolling again replaces the secret and the step.
+    // Enrolling again replaces the secret and the step.
     assert_eq!(db.insert(enrol_totp("usr_ann", b"v1:first", 0)).await?.affected(), 1);
     assert_eq!(db.insert(enrol_totp("usr_ann", b"v1:second", 100)).await?.affected(), 1);
     assert_eq!(rows_of(&db, Query::table("totp")).await?, 1);
     let stored = db.query_one(Query::table("totp").key(["usr_ann"]).columns(["secret_enc", "last_step"])).await?;
     assert_eq!((stored.get::<Vec<u8>>("secret_enc")?, stored.get::<i64>("last_step")?), (b"v1:second".to_vec(), 100));
 
-    // Q34: a step is taken only if it is later than the last one taken.
+    // A step is taken only if it is later than the last one taken.
     let accept = |step: i64| Update::table("totp").key(["usr_ann"]).filter(col("last_step").lt(step)).set("last_step", step).returning_expr("one", 1);
     assert_eq!(db.update(accept(101)).await?.len(), 1);
     assert!(db.update(accept(101)).await?.is_empty());
@@ -1510,9 +1535,9 @@ async fn a_totp_step_is_accepted_once_however_many_requests_carry_it() -> DbResu
     assert_eq!(accepted, 1);
     assert_eq!(db.get("totp", ["usr_ann"]).await?.expect("ann is enrolled").get::<i64>("last_step")?, 102);
 
-    // Q36, Q37, Q38: re-encrypting the secrets under a new key reads the
-    // ids in order, then reads and rewrites each row in a transaction of
-    // its own, so that no secret changes between its read and its write.
+    // Re-encrypting the secrets under a new key reads the ids in order,
+    // then reads and rewrites each row in a transaction of its own, so that
+    // no secret changes between its read and its write.
     db.insert(enrol_totp("usr_bob", b"v1:bob", 7)).await?;
     let ids: Vec<String> = db.query(Query::table("totp").select("id", col("user_id"))).await?.column()?;
     assert_eq!(ids, ["usr_ann", "usr_bob"]);
@@ -1529,7 +1554,7 @@ async fn a_totp_step_is_accepted_once_however_many_requests_carry_it() -> DbResu
     assert_eq!(sealed, [b"v2:second".to_vec(), b"v2:bob".to_vec()]);
     assert_eq!(db.get("totp", ["usr_ann"]).await?.expect("ann is enrolled").get::<i64>("last_step")?, 102);
 
-    // Q35: removing it says whether there was anything to remove.
+    // Removing it says whether there was anything to remove.
     let remove = || Delete::from("totp").key(["usr_ann"]).returning_expr("one", 1);
     assert_eq!(db.delete(remove()).await?.len(), 1);
     assert!(db.delete(remove()).await?.is_empty());
@@ -1537,8 +1562,8 @@ async fn a_totp_step_is_accepted_once_however_many_requests_carry_it() -> DbResu
     Ok(())
 }
 
-/// Q42: the passkey with this credential id, if its owner is a person who
-/// may sign in.
+/// The passkey with this credential id, if its owner is a person who may
+/// sign in.
 fn passkey_for(credential_id: &[u8]) -> Query {
     Query::table("passkeys")
         .alias("p")
@@ -1551,7 +1576,8 @@ fn passkey_for(credential_id: &[u8]) -> Query {
         .select("sign_count", col("p.sign_count"))
 }
 
-// R-Q1, R-Q9, R-W5, R-W7: auth Q39, Q40, Q41, Q42, Q43, Q45, Q46.
+// R-Q1, R-Q9, R-W5, R-W7: an insert that does nothing on a conflict in one
+// named index, and byte strings up to 1023 bytes long as unique keys.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_passkey_is_registered_once_and_found_by_its_credential_id() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1559,8 +1585,8 @@ async fn a_passkey_is_registered_once_and_found_by_its_credential_id() -> DbResu
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(person("usr_bob", "bob", None)).await?;
 
-    // Q41: the insert answers with the id it stored, or with nothing when
-    // the authenticator is already registered, to anyone.
+    // The insert answers with the id it stored, or with nothing when the
+    // authenticator is already registered, to anyone.
     let first = db.insert(new_passkey("pk_1", "usr_ann", b"credential-a", "laptop")).await?;
     assert_eq!((first.affected(), first.column::<String>()?), (1, vec!["pk_1".to_string()]));
     let taken = db.insert(new_passkey("pk_2", "usr_bob", b"credential-a", "borrowed")).await?;
@@ -1579,7 +1605,7 @@ async fn a_passkey_is_registered_once_and_found_by_its_credential_id() -> DbResu
     assert_eq!(db.insert(new_passkey("pk_4", "usr_bob", &longer, "other key")).await?.len(), 1);
     assert!(db.insert(new_passkey("pk_5", "usr_bob", &long, "copy")).await?.is_empty());
 
-    // Q42.
+    // Found by its credential id, however long.
     let found = db.query_one(passkey_for(&long)).await?;
     assert_eq!(
         (found.get::<String>("id")?, found.get::<String>("user_id")?, found.get::<i64>("sign_count")?),
@@ -1590,10 +1616,10 @@ async fn a_passkey_is_registered_once_and_found_by_its_credential_id() -> DbResu
     assert_eq!(db.query_one(passkey_for(b"credential-a")).await?.get::<String>("id")?, "pk_1");
     assert!(db.query_opt(passkey_for(b"credential-z")).await?.is_none());
 
-    // Q43: a use is counted and timed.
+    // A use is counted and timed.
     db.update(Update::table("passkeys").key(["pk_1"]).set("sign_count", 41).set("last_used_at", now())).await?;
 
-    // Q39: a user's passkeys, oldest first. Q40: just their ids.
+    // A user's passkeys, oldest first; then just their credential ids.
     let listed = db
         .query(Query::table("passkeys").index("passkeys_user", KeyRange::eq(["usr_ann"])).order_by(col("created_at")).columns([
             "id",
@@ -1615,20 +1641,20 @@ async fn a_passkey_is_registered_once_and_found_by_its_credential_id() -> DbResu
     db.update(Update::table("users").key(["usr_bob"]).set("disabled_at", Timestamp::now()).set("updated_at", now())).await?;
     assert!(db.query_opt(passkey_for(&longer)).await?.is_none());
 
-    // Q45: only its owner deletes a passkey, and learns its name.
+    // Only its owner deletes a passkey, and learns its name.
     let delete = |id: &str, user: &str| Delete::from("passkeys").key([id]).filter(col("user_id").eq(user)).returning(["name"]);
     assert!(db.delete(delete("pk_1", "usr_bob")).await?.is_empty());
     assert_eq!(db.delete(delete("pk_1", "usr_ann")).await?.column::<String>()?, ["laptop"]);
     assert!(db.delete(delete("pk_1", "usr_ann")).await?.is_empty());
 
-    // Q46: clearing a user's second factors removes the rest of theirs.
+    // Clearing a user's second factors removes the rest of theirs.
     assert_eq!(db.delete(Delete::from("passkeys").index("passkeys_user", KeyRange::eq(["usr_ann"]))).await?.affected(), 1);
     assert_eq!(db.query(Query::table("passkeys").columns(["id"])).await?.column::<String>()?, ["pk_4"]);
     Ok(())
 }
 
-/// Replacing a user's recovery codes: the old ones go (Q47) and ten new
-/// ones are inserted one by one (Q48), in one transaction.
+/// Replacing a user's recovery codes: the old ones go and ten new ones are
+/// inserted one by one, in one transaction.
 async fn regenerate_codes(db: &Client, user: &str, batch: &str) -> DbResult<()> {
     let tx = db.begin().await?;
     tx.delete(Delete::rows(Query::table("recovery_codes").range(KeyRange::eq([user])))).await?;
@@ -1638,7 +1664,9 @@ async fn regenerate_codes(db: &Client, user: &str, batch: &str) -> DbResult<()> 
     tx.commit().await
 }
 
-// R-S2, R-W2, R-W7, R-X1, R-X2: auth Q47, Q48, Q49, Q50, Q51.
+// R-S2, R-W2, R-W7, R-X1, R-X2: a set of rows is replaced in one
+// transaction that nobody sees half done, and a row is spent once by a
+// conditional update.
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_codes_are_replaced_together_and_spent_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1674,8 +1702,8 @@ async fn recovery_codes_are_replaced_together_and_spent_once() -> DbResult<()> {
     let err = db.insert(recovery_code("usr_ann", "second-0")).await.unwrap_err();
     assert!(err.is_unique_violation() && err.violates(PRIMARY), "{err}");
 
-    // Q50 looks without spending; Q49 spends, once, and only the code of
-    // the user it belongs to.
+    // Looking does not spend a code; spending does, once, and only the code
+    // of the user it belongs to.
     assert_eq!(db.query(unspent("usr_ann", "second-3")).await?.len(), 1);
     assert_eq!(db.query(unspent("usr_ann", "second-3")).await?.len(), 1);
     assert!(db.update(spend_code("usr_bob", "second-3")).await?.is_empty());
@@ -1684,15 +1712,15 @@ async fn recovery_codes_are_replaced_together_and_spent_once() -> DbResult<()> {
     assert!(db.query(unspent("usr_ann", "second-3")).await?.is_empty());
     assert!(db.update(spend_code("usr_ann", "never-issued")).await?.is_empty());
 
-    // Q51.
+    // Nine of her ten codes are left.
     assert_eq!(rows_of(&db, codes("usr_ann").filter(col("used_at").is_null())).await?, 9);
     assert_eq!(rows_of(&db, codes("usr_ann")).await?, 10);
     Ok(())
 }
 
-/// Q52: the session behind a cookie, if it is live by the server's clock
-/// and its user is a person who may sign in. Run for every request that
-/// carries a session cookie.
+/// The session behind a cookie, if it is live by the server's clock and its
+/// user is a person who may sign in. Run for every request that carries a
+/// session cookie.
 fn load_session(token: &str) -> Query {
     Query::table("sessions")
         .alias("s")
@@ -1709,7 +1737,8 @@ fn load_session(token: &str) -> Query {
         .select("email", col("u.email"))
 }
 
-// R-Q1, R-Q8, R-Q9, R-T7: auth Q52, Q55.
+// R-Q1, R-Q8, R-Q9, R-T7: a lookup in a unique index over bytes, joined to
+// another table by key, with arithmetic on times and a list of texts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_is_loaded_by_its_token_hash_with_its_user_and_its_age() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1718,7 +1747,8 @@ async fn a_session_is_loaded_by_its_token_hash_with_its_user_and_its_age() -> Db
     db.insert(person("usr_off", "off", None)).await?;
     db.insert(bot("usr_bot", "ann-bot", "usr_ann")).await?;
 
-    // Q55 relies on the defaults for when the session was made and seen.
+    // The insert relies on the defaults for when the session was made and
+    // seen.
     let before = db.now().await?;
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
     let after = db.now().await?;
@@ -1769,14 +1799,14 @@ async fn a_session_is_loaded_by_its_token_hash_with_its_user_and_its_age() -> Db
     Ok(())
 }
 
-/// Q53: a session seen now stays good for `idle_days` more, but never
-/// past its absolute end.
+/// A session seen now stays good for `idle_days` more, but never past its
+/// absolute end.
 fn touch_session(id: &str, idle_days: i64) -> Update {
     Update::table("sessions").key([id]).set("last_seen_at", now()).set("expires_at", least([now() + days(idle_days), col("ends_at")]))
 }
 
-/// Q54: signing in again in a browser that has a session keeps the
-/// session's id and replaces everything else.
+/// Signing in again in a browser that has a session keeps the session's id
+/// and replaces everything else.
 fn sign_in_again(id: &str, token: &str, amr: Vec<&str>) -> Update {
     Update::table("sessions")
         .key([id])
@@ -1791,8 +1821,8 @@ fn sign_in_again(id: &str, token: &str, amr: Vec<&str>) -> Update {
         .returning(["id"])
 }
 
-/// Q61: a live session of an enabled user, with the time of its sign-in
-/// in whole seconds since 1970 as a token carries it.
+/// A live session of an enabled user, with the time of its sign-in in whole
+/// seconds since 1970 as a token carries it.
 fn live_session(id: &str) -> Query {
     Query::table("sessions")
         .alias("s")
@@ -1805,7 +1835,9 @@ fn live_session(id: &str) -> Query {
         .select("auth_time", call(Func::Floor, [call(Func::DatePart, [val("epoch"), col("s.auth_time")])]).cast(Type::Int))
 }
 
-// R-Q16, R-S3, R-W6, R-W7: auth Q53, Q54, Q56, Q58, Q60, Q61.
+// R-Q16, R-S3, R-W6, R-W7: updates that compute times with LEAST and return
+// what they wrote, a time read as whole seconds since 1970, and a unique
+// column that stays unique under update.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_slides_to_its_absolute_end_and_keeps_its_id_through_a_new_sign_in() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1815,8 +1847,8 @@ async fn a_session_slides_to_its_absolute_end_and_keeps_its_id_through_a_new_sig
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
     let made: Timestamp = db.get("sessions", ["ses_1"]).await?.expect("the session is there").get("created_at")?;
 
-    // Q53: far from its end, the session gets its seven idle days from
-    // the moment it is seen.
+    // Far from its end, the session gets its seven idle days from the
+    // moment it is seen.
     let touched = db.update(touch_session("ses_1", 7).returning(["last_seen_at", "expires_at", "ends_at"])).await?.one()?;
     let (seen, expires, ends): (Timestamp, Timestamp, Timestamp) =
         (touched.get("last_seen_at")?, touched.get("expires_at")?, touched.get("ends_at")?);
@@ -1829,8 +1861,8 @@ async fn a_session_slides_to_its_absolute_end_and_keeps_its_id_through_a_new_sig
     assert_eq!(touched.get::<Timestamp>("expires_at")?, touched.get::<Timestamp>("ends_at")?);
     assert_eq!(db.update(touch_session("ses_gone", 7)).await?.affected(), 0);
 
-    // Q54: the old cookie stops working, the new one finds the same
-    // session with a fresh sign-in and a full life.
+    // The old cookie stops working, the new one finds the same session with
+    // a fresh sign-in and a full life.
     let before = db.now().await?;
     let kept = db.update(sign_in_again("ses_1", "cookie-2", vec!["pwd", "otp", "mfa"])).await?;
     let after = db.now().await?;
@@ -1847,14 +1879,15 @@ async fn a_session_slides_to_its_absolute_end_and_keeps_its_id_through_a_new_sig
     // back, and the caller makes a new one instead.
     assert!(db.update(sign_in_again("ses_gone", "cookie-9", vec!["pwd"])).await?.is_empty());
 
-    // Q61.
+    // For a token: the factors, and the time of the sign-in in whole
+    // seconds.
     let live = db.query_one(live_session("ses_1")).await?;
     assert_eq!(live.get::<Vec<String>>("amr")?, ["pwd", "otp", "mfa"]);
     assert_eq!(live.get::<i64>("auth_time")?, signed_in.micros().div_euclid(1_000_000));
     assert!(db.query_opt(live_session("ses_gone")).await?.is_none());
 
-    // Q56: a step-up changes the cookie and the factors, not the time of
-    // the sign-in.
+    // A step-up changes the cookie and the factors, not the time of the
+    // sign-in.
     db.update(Update::table("sessions").key(["ses_1"]).set("token_hash", digest("cookie-3")).set("amr", vec!["pwd", "hwk", "mfa"])).await?;
     let stepped = db.query_one(load_session("cookie-3")).await?;
     assert_eq!(stepped.get::<Vec<String>>("amr")?, ["pwd", "hwk", "mfa"]);
@@ -1866,7 +1899,7 @@ async fn a_session_slides_to_its_absolute_end_and_keeps_its_id_through_a_new_sig
     let err = db.update(Update::table("sessions").key(["ses_2"]).set("token_hash", digest("cookie-3")).set("amr", vec!["pwd"])).await.unwrap_err();
     assert!(err.is_unique_violation() && err.violates("sessions_token_hash_key"), "{err}");
 
-    // Q58: a user's sessions. Q60: whether a session is theirs.
+    // A user's sessions, and whether a session is theirs.
     assert_eq!(sorted(&db, Query::table("sessions").index("sessions_user", KeyRange::eq(["usr_ann"])).columns(["id"])).await?, ["ses_1", "ses_2"]);
     let owns = |id: &str, user: &str| Query::table("sessions").key([id]).filter(col("user_id").eq(user)).select("one", 1);
     assert_eq!(db.query(owns("ses_2", "usr_ann")).await?.len(), 1);
@@ -1879,7 +1912,8 @@ async fn a_session_slides_to_its_absolute_end_and_keeps_its_id_through_a_new_sig
     Ok(())
 }
 
-// R-Q2, R-Q11, R-T3: auth Q59, Q65, Q74.
+// R-Q2, R-Q11, R-T3: an index range read in another order, groups with MIN
+// and MAX ordered by an aggregate, and DISTINCT.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_device_list_shows_live_sessions_and_token_families_latest_first() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1898,7 +1932,7 @@ async fn the_device_list_shows_live_sessions_and_token_families_latest_first() -
     db.update(Update::table("sessions").key(["ses_d"]).set("expires_at", now() - seconds(1))).await?;
     db.update(Update::table("sessions").key(["ses_c"]).set("ip", null()).set("user_agent", null())).await?;
 
-    // Q59: her live sessions, the one seen last first.
+    // Her live sessions, the one seen last first.
     let devices = db
         .query(
             Query::table("sessions")
@@ -1916,13 +1950,13 @@ async fn the_device_list_shows_live_sessions_and_token_families_latest_first() -
     // Apps on public clients have no session: each is a family of
     // refresh tokens, a new token per rotation.
     let tokens = [
-        ("ios-1", "ses_ios", "mail-ios", 240),
-        ("ios-2", "ses_ios", "mail-ios", 120),
-        ("ios-3", "ses_ios", "mail-ios", 1),
-        ("android-1", "ses_android", "mail-android", 48),
-        ("android-2", "ses_android", "mail-android", 3),
-        ("revoked-1", "ses_revoked", "mail-ios", 5),
-        ("expired-1", "ses_expired", "mail-ios", 6),
+        ("ios-1", "ses_ios", "files-ios", 240),
+        ("ios-2", "ses_ios", "files-ios", 120),
+        ("ios-3", "ses_ios", "files-ios", 1),
+        ("android-1", "ses_android", "files-android", 48),
+        ("android-2", "ses_android", "files-android", 3),
+        ("revoked-1", "ses_revoked", "files-ios", 5),
+        ("expired-1", "ses_expired", "files-ios", 6),
     ];
     for (token, family, client, made_hours_ago) in tokens {
         db.insert(public_token(token, family, "usr_ann", client).set("created_at", ago(made_hours_ago))).await?;
@@ -1930,14 +1964,14 @@ async fn the_device_list_shows_live_sessions_and_token_families_latest_first() -
     // Left out: a revoked token even in a live family, a family that is
     // all revoked or all expired, a token tied to a session, and anybody
     // else's.
-    db.insert(public_token("ios-0", "ses_ios", "usr_ann", "mail-ios").set("created_at", ago(480)).set("revoked_at", ago(240))).await?;
+    db.insert(public_token("ios-0", "ses_ios", "usr_ann", "files-ios").set("created_at", ago(480)).set("revoked_at", ago(240))).await?;
     db.update(Update::table("refresh_tokens").key([digest("revoked-1")]).set("revoked_at", now())).await?;
     db.update(Update::table("refresh_tokens").key([digest("expired-1")]).set("expires_at", now() - seconds(1))).await?;
-    db.insert(session_token("web-1", "mail-web", "ses_a")).await?;
-    db.insert(public_token("bob-1", "ses_bob", "usr_bob", "mail-ios")).await?;
+    db.insert(session_token("web-1", "files-web", "ses_a")).await?;
+    db.insert(public_token("bob-1", "ses_bob", "usr_bob", "files-ios")).await?;
 
-    // Q74: one row per family and client, with the family's first and
-    // latest token, the latest used family first.
+    // One row per family and client, with the family's first and latest
+    // token, the latest used family first.
     let families = db
         .query(
             Query::table("refresh_tokens")
@@ -1953,12 +1987,12 @@ async fn the_device_list_shows_live_sessions_and_token_families_latest_first() -
         .await?;
     assert_eq!(families.columns(), ["id", "client_id", "created_at", "last_seen_at"]);
     assert_eq!(column::<String>(&families, "id"), ["ses_ios", "ses_android"]);
-    assert_eq!(column::<String>(&families, "client_id"), ["mail-ios", "mail-android"]);
+    assert_eq!(column::<String>(&families, "client_id"), ["files-ios", "files-android"]);
     assert_eq!(column::<Timestamp>(&families, "created_at"), [ago(240), ago(48)]);
     assert_eq!(column::<Timestamp>(&families, "last_seen_at"), [ago(1), ago(3)]);
 
-    // Q65: the families that are not revoked, each once, whether or not
-    // they have expired.
+    // The families that are not revoked, each once, whether or not they
+    // have expired.
     let live = Query::table("refresh_tokens")
         .index("refresh_tokens_user", KeyRange::eq(["usr_ann"]))
         .filter(col("session_id").is_null().and(col("revoked_at").is_null()))
@@ -1968,8 +2002,8 @@ async fn the_device_list_shows_live_sessions_and_token_families_latest_first() -
     Ok(())
 }
 
-// R-Q2, R-S6, R-T9, R-W10, R-X1: auth Q57, Q62, Q63, Q122, Q129; §3.2
-// (logout).
+// R-Q2, R-S6, R-T9, R-W10, R-X1: a delete cascades into two tables, for one
+// row and for many, and NULL equals nothing in a filter.
 #[tokio::test(flavor = "multi_thread")]
 async fn ending_a_session_takes_its_tokens_and_codes_with_it() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1977,19 +2011,19 @@ async fn ending_a_session_takes_its_tokens_and_codes_with_it() -> DbResult<()> {
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
     db.insert(new_session("ses_2", "usr_ann", "cookie-2")).await?;
-    db.insert(session_token("mail-1", "mail-web", "ses_1")).await?;
-    db.insert(session_token("mail-1b", "mail-web", "ses_1")).await?;
-    db.insert(session_token("docs-1", "docs-web", "ses_1")).await?;
-    db.insert(session_token("mail-2", "mail-web", "ses_2")).await?;
-    db.insert(new_code("code-1", "mail-web", "ses_1", 60)).await?;
-    db.insert(new_code("code-2", "mail-web", "ses_2", 60)).await?;
-    db.insert(public_token("ios-1", "ses_ios", "usr_ann", "mail-ios")).await?;
+    db.insert(session_token("files-1", "files-web", "ses_1")).await?;
+    db.insert(session_token("files-1b", "files-web", "ses_1")).await?;
+    db.insert(session_token("chat-1", "chat-web", "ses_1")).await?;
+    db.insert(session_token("files-2", "files-web", "ses_2")).await?;
+    db.insert(new_code("code-1", "files-web", "ses_1", 60)).await?;
+    db.insert(new_code("code-2", "files-web", "ses_2", 60)).await?;
+    db.insert(public_token("ios-1", "ses_ios", "usr_ann", "files-ios")).await?;
 
-    // Q63: each client once. A public client's token has no session, and
-    // NULL is not equal to anything: it is found by its family alone.
-    assert_eq!(sorted(&db, clients_of("ses_1")).await?, ["docs-web", "mail-web"]);
-    assert_eq!(sorted(&db, clients_of("ses_2")).await?, ["mail-web"]);
-    assert_eq!(sorted(&db, clients_of("ses_ios")).await?, ["mail-ios"]);
+    // Each client once. A public client's token has no session, and NULL is
+    // not equal to anything: it is found by its family alone.
+    assert_eq!(sorted(&db, clients_of("ses_1")).await?, ["chat-web", "files-web"]);
+    assert_eq!(sorted(&db, clients_of("ses_2")).await?, ["files-web"]);
+    assert_eq!(sorted(&db, clients_of("ses_ios")).await?, ["files-ios"]);
     assert!(sorted(&db, clients_of("ses_gone")).await?.is_empty());
 
     // Signing out: the clients are told, the session goes, the log says
@@ -2004,28 +2038,28 @@ async fn ending_a_session_takes_its_tokens_and_codes_with_it() -> DbResult<()> {
         Ok::<_, DbError>(())
     })
     .await?;
-    for token in ["mail-1", "mail-1b", "docs-1"] {
+    for token in ["files-1", "files-1b", "chat-1"] {
         assert!(db.get("refresh_tokens", [digest(token)]).await?.is_none(), "{token}");
     }
     assert!(db.get("auth_codes", [digest("code-1")]).await?.is_none());
-    assert!(db.get("refresh_tokens", [digest("mail-2")]).await?.is_some());
+    assert!(db.get("refresh_tokens", [digest("files-2")]).await?.is_some());
     assert!(db.get("auth_codes", [digest("code-2")]).await?.is_some());
     assert!(db.get("refresh_tokens", [digest("ios-1")]).await?.is_some());
     assert_eq!((rows_of(&db, Query::table("outbox")).await?, rows_of(&db, Query::table("audit")).await?), (2, 1));
     assert_eq!(db.delete(Delete::from("sessions").key(["ses_1"])).await?.affected(), 0);
 
-    // Q62: housekeeping removes sessions past either expiry, and the
-    // same children go with them.
+    // Housekeeping removes sessions past either expiry, and the same
+    // children go with them.
     db.insert(new_session("ses_3", "usr_ann", "cookie-3")).await?;
-    db.insert(session_token("mail-3", "mail-web", "ses_3")).await?;
+    db.insert(session_token("files-3", "files-web", "ses_3")).await?;
     db.update(Update::table("sessions").key(["ses_2"]).set("expires_at", now() - seconds(1))).await?;
     db.update(Update::table("sessions").key(["ses_3"]).set("ends_at", now() - seconds(1))).await?;
     db.insert(new_session("ses_4", "usr_ann", "cookie-4")).await?;
-    db.insert(session_token("mail-4", "mail-web", "ses_4")).await?;
+    db.insert(session_token("files-4", "files-web", "ses_4")).await?;
     let swept = db.delete(Delete::from("sessions").filter(col("expires_at").lt(now()).or(col("ends_at").lt(now())))).await?;
     assert_eq!(swept.affected(), 2);
     assert_eq!(db.query(Query::table("sessions").columns(["id"])).await?.column::<String>()?, ["ses_4"]);
-    assert_eq!(sorted(&db, Query::table("refresh_tokens").columns(["client_id"])).await?, ["mail-ios", "mail-web"]);
+    assert_eq!(sorted(&db, Query::table("refresh_tokens").columns(["client_id"])).await?, ["files-ios", "files-web"]);
     assert_eq!(rows_of(&db, Query::table("auth_codes")).await?, 0);
     Ok(())
 }
@@ -2034,7 +2068,8 @@ async fn refresh_token(db: &impl Db, token: &str) -> DbResult<Option<Row>> {
     db.get("refresh_tokens", [digest(token)]).await
 }
 
-// R-Q1, R-S5, R-W3, R-W7: auth Q66, Q67, Q68, Q72, Q73.
+// R-Q1, R-S5, R-W3, R-W7: an insert whose row is selected from another
+// table, the defaults of columns left out, and an update that happens once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refresh_token_copies_its_session_or_starts_a_family_of_its_own() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2044,15 +2079,15 @@ async fn a_refresh_token_copies_its_session_or_starts_a_family_of_its_own() -> D
     db.update(Update::table("sessions").key(["ses_1"]).set("amr", vec!["pwd", "otp", "mfa"])).await?;
     let session = db.get("sessions", ["ses_1"]).await?.expect("the session is there");
 
-    // Q67: the session's row supplies the family, the user, the expiry
-    // and the factors; the statement supplies the rest.
+    // The session's row supplies the family, the user, the expiry and the
+    // factors; the statement supplies the rest.
     let before = db.now().await?;
-    assert_eq!(db.insert(session_token("web-1", "mail-web", "ses_1")).await?.affected(), 1);
+    assert_eq!(db.insert(session_token("web-1", "files-web", "ses_1")).await?.affected(), 1);
     let after = db.now().await?;
     let token = refresh_token(&db, "web-1").await?.expect("the token is there");
     assert_eq!(token.get::<String>("family_id")?, "ses_1");
     assert_eq!(token.get::<Option<String>>("session_id")?.as_deref(), Some("ses_1"));
-    assert_eq!((token.get::<String>("user_id")?, token.get::<String>("client_id")?), ("usr_ann".to_string(), "mail-web".to_string()));
+    assert_eq!((token.get::<String>("user_id")?, token.get::<String>("client_id")?), ("usr_ann".to_string(), "files-web".to_string()));
     assert_eq!(token.get::<Timestamp>("expires_at")?, session.get::<Timestamp>("ends_at")?);
     assert_eq!(token.get::<Vec<String>>("amr")?, ["pwd", "otp", "mfa"]);
     assert!(token.is_null("rotated_at")? && token.is_null("revoked_at")?);
@@ -2061,13 +2096,13 @@ async fn a_refresh_token_copies_its_session_or_starts_a_family_of_its_own() -> D
 
     // The session ended a moment before: no row to copy, so no token,
     // and no error either.
-    assert_eq!(db.insert(session_token("web-2", "mail-web", "ses_gone")).await?.affected(), 0);
+    assert_eq!(db.insert(session_token("web-2", "files-web", "ses_gone")).await?.affected(), 0);
     assert!(refresh_token(&db, "web-2").await?.is_none());
-    let err = db.insert(session_token("web-1", "docs-web", "ses_1")).await.unwrap_err();
+    let err = db.insert(session_token("web-1", "chat-web", "ses_1")).await.unwrap_err();
     assert!(err.is_unique_violation() && err.violates(PRIMARY), "{err}");
 
-    // Q66: thirty days from the moment it is made, tied to no session.
-    db.insert(public_token("ios-1", "ses_ios", "usr_ann", "mail-ios")).await?;
+    // Thirty days from the moment it is made, tied to no session.
+    db.insert(public_token("ios-1", "ses_ios", "usr_ann", "files-ios")).await?;
     let token = refresh_token(&db, "ios-1").await?.expect("the token is there");
     assert!(token.is_null("session_id")?);
     assert_eq!(token.get::<Timestamp>("expires_at")?.micros() - token.get::<Timestamp>("created_at")?.micros(), 30 * DAY);
@@ -2076,17 +2111,17 @@ async fn a_refresh_token_copies_its_session_or_starts_a_family_of_its_own() -> D
         .set("token_hash", digest("bare"))
         .set("family_id", "ses_bare")
         .set("user_id", "usr_ann")
-        .set("client_id", "mail-ios");
+        .set("client_id", "files-ios");
     db.insert(bare.set("expires_at", now() + days(30))).await?;
     assert_eq!(refresh_token(&db, "bare").await?.expect("the token is there").get::<Vec<String>>("amr")?, no_texts());
 
-    // Q68.
+    // The family of a token, read by the token.
     let family = |token: &str| Query::table("refresh_tokens").key([digest(token)]).columns(["family_id"]);
     assert_eq!(db.query_one(family("ios-1")).await?.get::<String>("family_id")?, "ses_ios");
     assert!(db.query_opt(family("never-issued")).await?.is_none());
 
-    // Q72: a client may revoke its own tokens only. Q73: revoking is done
-    // once, and keeps the time of the first.
+    // A client may revoke its own tokens only. Revoking is done once, and
+    // keeps the time of the first.
     let revocable = |token: &str, client: &str| {
         Query::table("refresh_tokens")
             .key([digest(token)])
@@ -2094,21 +2129,21 @@ async fn a_refresh_token_copies_its_session_or_starts_a_family_of_its_own() -> D
             .columns(["family_id", "user_id"])
     };
     let revoke = |token: &str| Update::table("refresh_tokens").key([digest(token)]).filter(col("revoked_at").is_null()).set("revoked_at", now());
-    let own = db.query_one(revocable("web-1", "mail-web")).await?;
+    let own = db.query_one(revocable("web-1", "files-web")).await?;
     assert_eq!((own.get::<String>("family_id")?, own.get::<String>("user_id")?), ("ses_1".to_string(), "usr_ann".to_string()));
-    assert!(db.query_opt(revocable("web-1", "docs-web")).await?.is_none());
+    assert!(db.query_opt(revocable("web-1", "chat-web")).await?.is_none());
     assert_eq!(db.update(revoke("web-1")).await?.affected(), 1);
     let revoked: Timestamp = refresh_token(&db, "web-1").await?.expect("the token is there").get("revoked_at")?;
     assert_eq!(db.update(revoke("web-1")).await?.affected(), 0);
     assert_eq!(refresh_token(&db, "web-1").await?.expect("the token is there").get::<Timestamp>("revoked_at")?, revoked);
-    assert!(db.query_opt(revocable("web-1", "mail-web")).await?.is_none());
+    assert!(db.query_opt(revocable("web-1", "files-web")).await?.is_none());
     Ok(())
 }
 
-/// Q69: everything the refresh grant needs to know about a token, with
-/// the questions of time answered by the server's clock. A public
-/// client's token has no session: the join then gives NULLs, and the two
-/// session columns are NULL rather than false.
+/// Everything the refresh grant needs to know about a token, with the
+/// questions of time answered by the server's clock. A public client's
+/// token has no session: the join then gives NULLs, and the two session
+/// columns are NULL rather than false.
 fn refresh_read(token: &str, grace_seconds: f64) -> Query {
     Query::table("refresh_tokens")
         .alias("r")
@@ -2127,15 +2162,16 @@ fn refresh_read(token: &str, grace_seconds: f64) -> Query {
         .select("session_live", col("s.expires_at").gt(now()).and(col("s.ends_at").gt(now())))
 }
 
-/// The flags of Q69: revoked, live, rotated, rotated within the grace
-/// period, session live. The last two can be NULL.
+/// The flags `refresh_read` answers with: revoked, live, rotated, rotated
+/// within the grace period, session live. The last two can be NULL.
 type RefreshFlags = (bool, bool, bool, Option<bool>, Option<bool>);
 
 fn refresh_flags(row: &Row) -> DbResult<RefreshFlags> {
     Ok((row.get("revoked")?, row.get("live")?, row.get("rotated")?, row.get("in_grace")?, row.get("session_live")?))
 }
 
-// R-Q1, R-Q8, R-Q9, R-T9: auth Q69.
+// R-Q1, R-Q8, R-Q9, R-T9: a left join whose missing side reads as NULL, and
+// comparisons with the server's clock that answer true, false or NULL.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_refresh_read_joins_the_session_if_any_and_answers_on_server_time() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2143,8 +2179,8 @@ async fn the_refresh_read_joins_the_session_if_any_and_answers_on_server_time() 
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
     db.update(Update::table("sessions").key(["ses_1"]).set("amr", vec!["pwd", "otp"])).await?;
-    db.insert(session_token("web-1", "mail-web", "ses_1")).await?;
-    db.insert(public_token("ios-1", "ses_ios", "usr_ann", "mail-ios")).await?;
+    db.insert(session_token("web-1", "files-web", "ses_1")).await?;
+    db.insert(public_token("ios-1", "ses_ios", "usr_ann", "files-ios")).await?;
 
     let web = db.query_one(refresh_read("web-1", 10.0)).await?;
     assert_eq!(
@@ -2153,7 +2189,7 @@ async fn the_refresh_read_joins_the_session_if_any_and_answers_on_server_time() 
     );
     assert_eq!(refresh_flags(&web)?, (false, true, false, None, Some(true)));
     assert_eq!((web.get::<String>("family_id")?, web.get::<Option<String>>("session_id")?), ("ses_1".to_string(), Some("ses_1".to_string())));
-    assert_eq!((web.get::<String>("user_id")?, web.get::<String>("client_id")?), ("usr_ann".to_string(), "mail-web".to_string()));
+    assert_eq!((web.get::<String>("user_id")?, web.get::<String>("client_id")?), ("usr_ann".to_string(), "files-web".to_string()));
     assert_eq!(web.get::<Option<Vec<String>>>("session_amr")?, Some(vec!["pwd".to_string(), "otp".to_string()]));
 
     // No session to join: the row still comes, with NULL where the
@@ -2183,8 +2219,8 @@ async fn the_refresh_read_joins_the_session_if_any_and_answers_on_server_time() 
     Ok(())
 }
 
-/// Q64: ends a public client's family of tokens. What it returns feeds
-/// the events, and says whether there was anything to end.
+/// Ends a public client's family of tokens. What it returns feeds the
+/// events, and says whether there was anything to end.
 fn end_family(family: &str, user: &str) -> Update {
     Update::table("refresh_tokens")
         .index("refresh_tokens_family", KeyRange::eq([family]))
@@ -2210,12 +2246,11 @@ enum Refreshed {
     Refused,
 }
 
-/// auth's refresh grant for a public client (§3.2, §7.1). In Postgres it
-/// took a shared lock on the client's row (Q160), read the family (Q68)
-/// to take an advisory lock on it (Q167), and locked the token's row
-/// while reading it (Q69). A writing transaction is alone with the
-/// database from its first statement to its commit, so the same
-/// statements run here without any of the three.
+/// The refresh grant for a public client. On Postgres it would take a
+/// shared lock on the client's row, read the family to take an advisory
+/// lock on it, and lock the token's row while reading it. A writing
+/// transaction is alone with the database from its first statement to its
+/// commit, so the same statements run here without any of the three.
 async fn refresh(db: &Client, client: &str, service: &str, presented: &str, issued: &str) -> DbResult<Refreshed> {
     let tx = db.begin().await?;
     let registered = tx.query_opt(Query::table("clients").key([client]).filter(col("service").eq(service)).select("one", 1)).await?.is_some();
@@ -2231,7 +2266,7 @@ async fn refresh(db: &Client, client: &str, service: &str, presented: &str, issu
     }
 
     if rotated && in_grace != Some(true) {
-        // Q70, then Q63 and Q122 to tell the family's clients, then Q129.
+        // The family is revoked, its clients are told, and the log says so.
         let live_tokens =
             Update::table("refresh_tokens").index("refresh_tokens_family", KeyRange::eq([family.as_str()])).filter(col("revoked_at").is_null());
         let revoked = tx.update(live_tokens.set("revoked_at", now())).await?.affected();
@@ -2243,7 +2278,7 @@ async fn refresh(db: &Client, client: &str, service: &str, presented: &str, issu
         return Ok(Refreshed::Reused);
     }
 
-    // Q21 and Q4: still a member of the service, still enabled.
+    // Still a member of the service, still enabled.
     let member = tx.query_opt(role_of(&user, service)).await?.is_some();
     let enabled = Query::table("users").key([user.as_str()]).filter(col("disabled_at").is_null()).columns(["id", "username", "name", "email"]);
     let holder = tx.query_opt(enabled.select("email_verified", col("email_verified_at").is_not_null())).await?;
@@ -2252,60 +2287,60 @@ async fn refresh(db: &Client, client: &str, service: &str, presented: &str, issu
         return Ok(Refreshed::Refused);
     }
 
-    // Q71: the time of the first rotation is kept. Q66: the family's
-    // next token.
+    // The time of the first rotation is kept. Then the family's next token.
     tx.update(Update::table("refresh_tokens").key([digest(presented)]).set("rotated_at", coalesce([col("rotated_at"), now()]))).await?;
     tx.insert(public_token(issued, &family, &user, client)).await?;
     tx.commit().await?;
     Ok(if rotated { Refreshed::Retried } else { Refreshed::Rotated })
 }
 
-// R-Q9, R-W6, R-W7, R-X1, R-X2: auth Q4, Q21, Q63, Q66, Q69, Q70, Q71, Q122,
-// Q129, Q160, Q167; §3.2 (refresh grant), §7.1.
+// R-Q9, R-W6, R-W7, R-X1, R-X2: several reads, a decision and the writes
+// that follow from it are one writing transaction, where SQL would take two
+// row locks and an advisory lock.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refresh_token_is_rotated_and_its_reuse_revokes_the_whole_family() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    db.insert(new_service("mail", "invite")).await?;
-    db.insert(new_service("docs", "invite")).await?;
-    db.insert(new_client("mail-ios", "mail", "public")).await?;
-    db.insert(new_client("docs-ios", "docs", "public")).await?;
+    db.insert(new_service("files", "invite")).await?;
+    db.insert(new_service("chat", "invite")).await?;
+    db.insert(new_client("files-ios", "files", "public")).await?;
+    db.insert(new_client("chat-ios", "chat", "public")).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
-    db.insert(grant_role("usr_ann", "mail", "member", "usr_admin")).await?;
-    db.insert(public_token("t1", "ses_phone", "usr_ann", "mail-ios")).await?;
-    db.insert(public_token("tablet-1", "ses_tablet", "usr_ann", "mail-ios")).await?;
+    db.insert(grant_role("usr_ann", "files", "member", "usr_admin")).await?;
+    db.insert(public_token("t1", "ses_phone", "usr_ann", "files-ios")).await?;
+    db.insert(public_token("tablet-1", "ses_tablet", "usr_ann", "files-ios")).await?;
 
     // The old token stays, marked; the new one joins its family. Both
     // writes carry the transaction's one time.
-    assert_eq!(refresh(&db, "mail-ios", "mail", "t1", "t2").await?, Refreshed::Rotated);
+    assert_eq!(refresh(&db, "files-ios", "files", "t1", "t2").await?, Refreshed::Rotated);
     let rotated_at: Timestamp = refresh_token(&db, "t1").await?.expect("the old token is kept").get("rotated_at")?;
     let next = refresh_token(&db, "t2").await?.expect("the new token is there");
     assert_eq!((next.get::<String>("family_id")?, next.get::<Option<String>>("session_id")?), ("ses_phone".to_string(), None));
-    assert_eq!((next.get::<String>("user_id")?, next.get::<String>("client_id")?), ("usr_ann".to_string(), "mail-ios".to_string()));
+    assert_eq!((next.get::<String>("user_id")?, next.get::<String>("client_id")?), ("usr_ann".to_string(), "files-ios".to_string()));
     assert!(next.is_null("rotated_at")? && next.is_null("revoked_at")?);
     assert_eq!(next.get::<Timestamp>("created_at")?, rotated_at);
 
     // Another client's token, a client that is not the service's, a
     // token never issued: refused, and nothing is written.
-    assert_eq!(refresh(&db, "docs-ios", "docs", "t2", "x1").await?, Refreshed::Refused);
-    assert_eq!(refresh(&db, "mail-ios", "docs", "t2", "x2").await?, Refreshed::Refused);
-    assert_eq!(refresh(&db, "mail-ios", "mail", "never-issued", "x3").await?, Refreshed::Refused);
+    assert_eq!(refresh(&db, "chat-ios", "chat", "t2", "x1").await?, Refreshed::Refused);
+    assert_eq!(refresh(&db, "files-ios", "chat", "t2", "x2").await?, Refreshed::Refused);
+    assert_eq!(refresh(&db, "files-ios", "files", "never-issued", "x3").await?, Refreshed::Refused);
     assert!(refresh_token(&db, "t2").await?.expect("the token is there").is_null("rotated_at")?);
     assert_eq!(rows_of(&db, Query::table("refresh_tokens")).await?, 3);
 
-    // The app did not get its answer and asks again with the old token a
+    // The client did not get its answer and asks again with the old token a
     // moment later: it gets another token, and the time of the first
     // rotation stands.
-    assert_eq!(refresh(&db, "mail-ios", "mail", "t1", "t2-again").await?, Refreshed::Retried);
+    assert_eq!(refresh(&db, "files-ios", "files", "t1", "t2-again").await?, Refreshed::Retried);
     assert_eq!(refresh_token(&db, "t1").await?.expect("the old token is kept").get::<Timestamp>("rotated_at")?, rotated_at);
     assert!(refresh_token(&db, "t2-again").await?.is_some());
-    assert_eq!(refresh(&db, "mail-ios", "mail", "t2", "t3").await?, Refreshed::Rotated);
+    assert_eq!(refresh(&db, "files-ios", "files", "t2", "t3").await?, Refreshed::Rotated);
 
     // Long after its rotation the first token comes back. Every token of
     // the family is revoked at one moment, none is issued, the service
     // is told and the log says so.
     db.update(Update::table("refresh_tokens").key([digest("t1")]).set("rotated_at", now() - seconds(30))).await?;
-    assert_eq!(refresh(&db, "mail-ios", "mail", "t1", "t4").await?, Refreshed::Reused);
+    assert_eq!(refresh(&db, "files-ios", "files", "t1", "t4").await?, Refreshed::Reused);
     assert!(refresh_token(&db, "t4").await?.is_none());
     let family = db.query(Query::table("refresh_tokens").index("refresh_tokens_family", KeyRange::eq(["ses_phone"])).columns(["revoked_at"])).await?;
     let revoked_at = column::<Option<Timestamp>>(&family, "revoked_at");
@@ -2314,7 +2349,7 @@ async fn a_refresh_token_is_rotated_and_its_reuse_revokes_the_whole_family() -> 
     assert!(refresh_token(&db, "tablet-1").await?.expect("the other device's token is there").is_null("revoked_at")?);
     assert_eq!(
         db.query(Query::table("outbox").columns(["service", "token"])).await?.map::<(String, String)>()?,
-        [("mail".to_string(), "family-revoked:mail-ios".to_string())]
+        [("files".to_string(), "family-revoked:files-ios".to_string())]
     );
     let logged = db.query_one(Query::table("audit")).await?;
     assert_eq!((logged.get::<String>("action")?, logged.get::<Option<String>>("user_id")?), ("token.reuse".to_string(), Some("usr_ann".to_string())));
@@ -2322,29 +2357,30 @@ async fn a_refresh_token_is_rotated_and_its_reuse_revokes_the_whole_family() -> 
     assert_eq!(logged.get::<Timestamp>("at")?, revoked_at[0].expect("the family is revoked"));
 
     // The newest token of the family is as dead as the oldest.
-    assert_eq!(refresh(&db, "mail-ios", "mail", "t3", "t5").await?, Refreshed::Refused);
+    assert_eq!(refresh(&db, "files-ios", "files", "t3", "t5").await?, Refreshed::Refused);
     assert!(refresh_token(&db, "t5").await?.is_none());
 
     // Her other device is refused while she has no role, without its
     // token being marked, and carries on once she has one again.
-    db.delete(Delete::from("access").key(["usr_ann", "mail"])).await?;
-    assert_eq!(refresh(&db, "mail-ios", "mail", "tablet-1", "tablet-2").await?, Refreshed::Refused);
+    db.delete(Delete::from("access").key(["usr_ann", "files"])).await?;
+    assert_eq!(refresh(&db, "files-ios", "files", "tablet-1", "tablet-2").await?, Refreshed::Refused);
     assert!(refresh_token(&db, "tablet-1").await?.expect("the token is there").is_null("rotated_at")?);
-    db.insert(grant_role("usr_ann", "mail", "member", "usr_admin")).await?;
-    assert_eq!(refresh(&db, "mail-ios", "mail", "tablet-1", "tablet-2").await?, Refreshed::Rotated);
+    db.insert(grant_role("usr_ann", "files", "member", "usr_admin")).await?;
+    assert_eq!(refresh(&db, "files-ios", "files", "tablet-1", "tablet-2").await?, Refreshed::Rotated);
     Ok(())
 }
 
-// R-X2, R-X3, R-X8: auth Q64, Q66, Q69, Q71, Q167; §3.3 (the family lock).
+// R-X2, R-X3, R-X8: writing transactions that race run one after another,
+// which also settles a race over a row that is not there yet to be locked.
 #[tokio::test(flavor = "multi_thread")]
 async fn racing_refreshes_rotate_a_token_once_and_a_racing_sign_out_leaves_no_live_token() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    db.insert(new_service("mail", "invite")).await?;
-    db.insert(new_client("mail-ios", "mail", "public")).await?;
+    db.insert(new_service("files", "invite")).await?;
+    db.insert(new_client("files-ios", "files", "public")).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
-    db.insert(grant_role("usr_ann", "mail", "member", "usr_admin")).await?;
-    db.insert(public_token("t1", "ses_phone", "usr_ann", "mail-ios")).await?;
+    db.insert(grant_role("usr_ann", "files", "member", "usr_admin")).await?;
+    db.insert(public_token("t1", "ses_phone", "usr_ann", "files-ios")).await?;
 
     // Five requests carry the same token at once. One of them finds it
     // fresh; each of the others runs after a commit and finds it rotated
@@ -2352,7 +2388,7 @@ async fn racing_refreshes_rotate_a_token_once_and_a_racing_sign_out_leaves_no_li
     let mut requests = Vec::new();
     for n in 0..5 {
         let db = db.clone();
-        requests.push(tokio::spawn(async move { refresh(&db, "mail-ios", "mail", "t1", &format!("next-{n}")).await }));
+        requests.push(tokio::spawn(async move { refresh(&db, "files-ios", "files", "t1", &format!("next-{n}")).await }));
     }
     let mut outcomes = Vec::new();
     for request in requests {
@@ -2362,17 +2398,17 @@ async fn racing_refreshes_rotate_a_token_once_and_a_racing_sign_out_leaves_no_li
     assert_eq!(outcomes.iter().filter(|outcome| **outcome == Refreshed::Retried).count(), 4, "{outcomes:?}");
     assert_eq!(rows_of(&db, Query::table("refresh_tokens").index("refresh_tokens_family", KeyRange::eq(["ses_phone"]))).await?, 6);
 
-    // A sign-out (Q64) races a rotation. Row locks could not make this
-    // safe, because the token a rotation is about to insert is not there
-    // to be locked: Postgres needed a lock on the family's name. Here
-    // one of the two simply runs first, and either way no token of the
-    // family is live afterwards.
+    // A sign-out races a rotation. Row locks could not make this safe,
+    // because the token a rotation is about to insert is not there to be
+    // locked: Postgres would need a lock on the family's name. Here one of
+    // the two simply runs first, and either way no token of the family is
+    // live afterwards.
     for round in 0..10 {
         let family = format!("ses_race_{round}");
-        db.insert(public_token(&format!("race-{round}"), &family, "usr_ann", "mail-ios")).await?;
+        db.insert(public_token(&format!("race-{round}"), &family, "usr_ann", "files-ios")).await?;
         let rotation = {
             let db = db.clone();
-            tokio::spawn(async move { refresh(&db, "mail-ios", "mail", &format!("race-{round}"), &format!("race-{round}-next")).await })
+            tokio::spawn(async move { refresh(&db, "files-ios", "files", &format!("race-{round}"), &format!("race-{round}-next")).await })
         };
         let sign_out = {
             let (db, family) = (db.clone(), family.clone());
@@ -2388,9 +2424,9 @@ async fn racing_refreshes_rotate_a_token_once_and_a_racing_sign_out_leaves_no_li
 }
 
 /// "End every session of a user", inside the caller's transaction: each
-/// session's clients are told and the session deleted (Q58, Q63, Q122,
-/// Q57), then each family of a public client is ended (Q65, Q64, Q122).
-/// Answers with how many sessions and how many tokens it ended.
+/// session's clients are told and the session deleted, then each family of
+/// a public client is ended. Answers with how many sessions and how many
+/// tokens it ended.
 async fn end_sessions(tx: &Transaction, user: &str) -> DbResult<(usize, u64)> {
     let sessions: Vec<String> = tx.query(Query::table("sessions").index("sessions_user", KeyRange::eq([user])).columns(["id"])).await?.column()?;
     for id in &sessions {
@@ -2415,8 +2451,8 @@ async fn end_sessions(tx: &Transaction, user: &str) -> DbResult<(usize, u64)> {
     Ok((sessions.len(), tokens))
 }
 
-// R-W6, R-X1: auth Q15, Q57, Q58, Q63, Q64, Q65, Q122, Q129; §3.2 (change
-// password, end every session).
+// R-W6, R-X1: deletes, updates and inserts in several tables commit
+// together, and every row they wrote carries the transaction's one time.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_password_change_ends_every_session_and_token_family_of_the_user() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2425,17 +2461,17 @@ async fn a_password_change_ends_every_session_and_token_family_of_the_user() -> 
     db.insert(person("usr_bob", "bob", None)).await?;
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
     db.insert(new_session("ses_2", "usr_ann", "cookie-2")).await?;
-    db.insert(session_token("mail-1", "mail-web", "ses_1")).await?;
-    db.insert(session_token("docs-1", "docs-web", "ses_1")).await?;
-    db.insert(session_token("mail-2", "mail-web", "ses_2")).await?;
-    db.insert(public_token("ios-1", "ses_ios", "usr_ann", "mail-ios")).await?;
-    db.insert(public_token("ios-2", "ses_ios", "usr_ann", "mail-ios")).await?;
-    db.insert(public_token("tv-1", "ses_tv", "usr_ann", "mail-tv")).await?;
+    db.insert(session_token("files-1", "files-web", "ses_1")).await?;
+    db.insert(session_token("chat-1", "chat-web", "ses_1")).await?;
+    db.insert(session_token("files-2", "files-web", "ses_2")).await?;
+    db.insert(public_token("ios-1", "ses_ios", "usr_ann", "files-ios")).await?;
+    db.insert(public_token("ios-2", "ses_ios", "usr_ann", "files-ios")).await?;
+    db.insert(public_token("tv-1", "ses_tv", "usr_ann", "files-tv")).await?;
     let long_ago = db.now().await?.plus_secs(-3600);
-    db.insert(public_token("old-1", "ses_old", "usr_ann", "mail-ios").set("revoked_at", long_ago)).await?;
+    db.insert(public_token("old-1", "ses_old", "usr_ann", "files-ios").set("revoked_at", long_ago)).await?;
     db.insert(new_session("ses_b", "usr_bob", "cookie-b")).await?;
-    db.insert(session_token("mail-b", "mail-web", "ses_b")).await?;
-    db.insert(public_token("ios-b", "ses_ios_b", "usr_bob", "mail-ios")).await?;
+    db.insert(session_token("files-b", "files-web", "ses_b")).await?;
+    db.insert(public_token("ios-b", "ses_ios_b", "usr_bob", "files-ios")).await?;
 
     let ended = db
         .transaction(|tx| async move {
@@ -2475,7 +2511,7 @@ async fn a_password_change_ends_every_session_and_token_family_of_the_user() -> 
 
     // Nobody else is signed out.
     assert!(db.query_opt(load_session("cookie-b")).await?.is_some());
-    assert!(refresh_token(&db, "mail-b").await?.is_some());
+    assert!(refresh_token(&db, "files-b").await?.is_some());
     assert!(refresh_token(&db, "ios-b").await?.expect("bob's token is there").is_null("revoked_at")?);
 
     // A second pass finds nothing left to end.
@@ -2484,7 +2520,8 @@ async fn a_password_change_ends_every_session_and_token_family_of_the_user() -> 
     Ok(())
 }
 
-// R-Q1, R-Q8, R-W6, R-W7, R-X1: auth Q77, Q78.
+// R-Q1, R-Q8, R-W6, R-W7, R-X1: a conditional update returns the row and a
+// computed column to the first caller, and nothing to the next.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_auth_code_is_redeemed_once_and_says_whether_it_was_still_live() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2492,21 +2529,21 @@ async fn an_auth_code_is_redeemed_once_and_says_whether_it_was_still_live() -> D
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
 
-    // Q77: sixty seconds to live, by the server's clock.
+    // Sixty seconds to live, by the server's clock.
     let before = db.now().await?;
-    db.insert(new_code("code-1", "mail-web", "ses_1", 60)).await?;
+    db.insert(new_code("code-1", "files-web", "ses_1", 60)).await?;
     let after = db.now().await?;
     let expires: Timestamp = db.get("auth_codes", [digest("code-1")]).await?.expect("the code is there").get("expires_at")?;
     assert!(before.plus_secs(60) <= expires && expires <= after.plus_secs(60));
 
-    // Q78: the first redemption gets the row and marks it; the second
-    // gets nothing and changes nothing.
+    // The first redemption gets the row and marks it; the second gets
+    // nothing and changes nothing.
     let first = db.update(redeem("code-1")).await?;
     assert_eq!(first.affected(), 1);
     let first = first.one()?;
     assert_eq!(first.columns(), ["client_id", "session_id", "redirect_uri", "code_challenge", "nonce", "live"]);
-    assert_eq!((first.get::<String>("client_id")?, first.get::<String>("session_id")?), ("mail-web".to_string(), "ses_1".to_string()));
-    assert_eq!(first.get::<String>("redirect_uri")?, "https://mail.example/callback");
+    assert_eq!((first.get::<String>("client_id")?, first.get::<String>("session_id")?), ("files-web".to_string(), "ses_1".to_string()));
+    assert_eq!(first.get::<String>("redirect_uri")?, "https://files.example/callback");
     assert_eq!(first.get::<String>("code_challenge")?, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
     assert_eq!(first.get::<Option<String>>("nonce")?.as_deref(), Some("n-0S6_WzA2Mj"));
     assert!(first.get::<bool>("live")?);
@@ -2520,14 +2557,14 @@ async fn an_auth_code_is_redeemed_once_and_says_whether_it_was_still_live() -> D
     // A code past its minute is redeemed all the same, with the answer
     // that it was no longer live. The grant is refused but its
     // transaction commits, so the code stays spent.
-    db.insert(new_code("code-2", "mail-web", "ses_1", -1)).await?;
+    db.insert(new_code("code-2", "files-web", "ses_1", -1)).await?;
     let live = db.transaction(|tx| async move { tx.update(redeem("code-2")).await?.one()?.get::<bool>("live") }).await?;
     assert!(!live);
     assert!(!db.get("auth_codes", [digest("code-2")]).await?.expect("the code is there").is_null("used_at")?);
     assert!(db.update(redeem("code-2")).await?.is_empty());
 
     // A redemption whose transaction is given up did not happen.
-    db.insert(new_code("code-3", "mail-web", "ses_1", 60)).await?;
+    db.insert(new_code("code-3", "files-web", "ses_1", 60)).await?;
     let tx = db.begin().await?;
     assert_eq!(tx.update(redeem("code-3")).await?.len(), 1);
     assert!(tx.update(redeem("code-3")).await?.is_empty());
@@ -2535,23 +2572,23 @@ async fn an_auth_code_is_redeemed_once_and_says_whether_it_was_still_live() -> D
     assert_eq!(db.update(redeem("code-3")).await?.len(), 1);
 
     // A code belongs to a session that exists.
-    let err = db.insert(new_code("code-4", "mail-web", "ses_gone", 60)).await.unwrap_err();
+    let err = db.insert(new_code("code-4", "files-web", "ses_gone", 60)).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::ForeignKeyViolation);
     Ok(())
 }
 
-// R-W7, R-X2, R-X3: auth Q67, Q78, Q160; §3.2 (code grant), and the race in
-// conformance/oauth.test.ts:967.
+// R-W7, R-X2, R-X3: of five concurrent conditional updates of one row, in
+// transactions or alone, exactly one finds its condition true.
 #[tokio::test(flavor = "multi_thread")]
 async fn five_racing_redemptions_of_one_auth_code_have_one_winner() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    db.insert(new_service("mail", "invite")).await?;
-    db.insert(new_client("mail-web", "mail", "confidential")).await?;
+    db.insert(new_service("files", "invite")).await?;
+    db.insert(new_client("files-web", "files", "confidential")).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
-    db.insert(new_code("code-1", "mail-web", "ses_1", 60)).await?;
-    db.insert(new_code("code-2", "mail-web", "ses_1", 60)).await?;
+    db.insert(new_code("code-1", "files-web", "ses_1", 60)).await?;
+    db.insert(new_code("code-2", "files-web", "ses_1", 60)).await?;
 
     // As the token endpoint runs it: each request a transaction that
     // checks the client, redeems the code and issues a refresh token.
@@ -2560,11 +2597,11 @@ async fn five_racing_redemptions_of_one_auth_code_have_one_winner() -> DbResult<
         let db = db.clone();
         requests.push(tokio::spawn(async move {
             db.transaction(|tx| async move {
-                tx.query_one(Query::table("clients").key(["mail-web"]).filter(col("service").eq("mail")).select("one", 1)).await?;
+                tx.query_one(Query::table("clients").key(["files-web"]).filter(col("service").eq("files")).select("one", 1)).await?;
                 if tx.update(redeem("code-1")).await?.is_empty() {
                     return Ok(false);
                 }
-                tx.insert(session_token(&format!("issued-{n}"), "mail-web", "ses_1")).await?;
+                tx.insert(session_token(&format!("issued-{n}"), "files-web", "ses_1")).await?;
                 Ok::<_, DbError>(true)
             })
             .await
@@ -2595,7 +2632,9 @@ async fn five_racing_redemptions_of_one_auth_code_have_one_winner() -> DbResult<
     Ok(())
 }
 
-// R-Q2, R-Q11, R-S3, R-W1, R-W7: auth Q82, Q83, Q84, Q85, Q87.
+// R-Q2, R-Q11, R-S3, R-W1, R-W7: an insert returns the row as stored, with
+// the server's defaults; counts and lists through an index; a unique column
+// over bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credential_is_stored_with_the_servers_defaults_listed_and_revoked_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2603,17 +2642,17 @@ async fn a_credential_is_stored_with_the_servers_defaults_listed_and_revoked_onc
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(person("usr_bob", "bob", None)).await?;
 
-    // Q83: the insert answers with the row as stored: the time it was
-    // made is the server's, the expiry is the text it was given, read.
+    // The insert answers with the row as stored: the time it was made is
+    // the server's, the expiry is the text it was given, read.
     let before = db.now().await?;
-    let made = db.insert(new_credential("key_1", "usr_ann", "api_key", "mail", "secret-1", Some("2031-05-06T07:08:09.25+02:00"))).await?;
+    let made = db.insert(new_credential("key_1", "usr_ann", "api_key", "files", "secret-1", Some("2031-05-06T07:08:09.25+02:00"))).await?;
     let after = db.now().await?;
     assert_eq!(made.affected(), 1);
     let made = made.one()?;
     assert_eq!(made.columns(), ["id", "kind", "service", "scopes", "name", "created_at", "last_used_at", "expires_at"]);
     assert_eq!(
         (made.get::<String>("id")?, made.get::<String>("kind")?, made.get::<String>("service")?),
-        ("key_1".to_string(), "api_key".to_string(), "mail".to_string())
+        ("key_1".to_string(), "api_key".to_string(), "files".to_string())
     );
     assert_eq!(
         (made.get::<Vec<String>>("scopes")?, made.get::<String>("name")?),
@@ -2623,16 +2662,16 @@ async fn a_credential_is_stored_with_the_servers_defaults_listed_and_revoked_onc
     assert!(before <= created && created <= after);
     assert_eq!(made.get::<Option<Timestamp>>("last_used_at")?, None);
     assert_eq!(made.get::<Option<Timestamp>>("expires_at")?, Some(ts("2031-05-06T05:08:09.25Z")));
-    let unending = db.insert(new_credential("apw_1", "usr_ann", "app_password", "mail", "secret-2", None)).await?.one()?;
+    let unending = db.insert(new_credential("apw_1", "usr_ann", "app_password", "files", "secret-2", None)).await?.one()?;
     assert!(unending.is_null("expires_at")?);
-    db.insert(new_credential("key_2", "usr_ann", "api_key", "docs", "secret-3", None)).await?;
-    db.insert(new_credential("key_3", "usr_bob", "api_key", "mail", "secret-4", None)).await?;
+    db.insert(new_credential("key_2", "usr_ann", "api_key", "chat", "secret-3", None)).await?;
+    db.insert(new_credential("key_3", "usr_bob", "api_key", "files", "secret-4", None)).await?;
 
     // No two credentials share a secret, whoever they belong to.
-    let err = db.insert(new_credential("key_9", "usr_bob", "api_key", "mail", "secret-1", None)).await.unwrap_err();
+    let err = db.insert(new_credential("key_9", "usr_bob", "api_key", "files", "secret-1", None)).await.unwrap_err();
     assert!(err.is_unique_violation() && err.violates("credentials_secret_hash_key"), "{err}");
 
-    // Q82: how many of a kind a user has, against the limit. Q84: which.
+    // How many of a kind a user has, against the limit, and which.
     let live = |user: &str, kind: &str| {
         Query::table("credentials").index("credentials_user", KeyRange::eq([user])).filter(col("kind").eq(kind).and(col("revoked_at").is_null()))
     };
@@ -2654,8 +2693,8 @@ async fn a_credential_is_stored_with_the_servers_defaults_listed_and_revoked_onc
     assert_eq!(column::<String>(&listed, "id"), ["key_1", "key_2"]);
     assert_eq!(listed.first(), Some(&made));
 
-    // Q85: revoked by its owner, as the kind it is, once. The answer is
-    // the service to tell.
+    // Revoked by its owner, as the kind it is, once. The answer is the
+    // service to tell.
     let revoke = |id: &str, user: &str, kind: &str| {
         Update::table("credentials")
             .key([id])
@@ -2665,30 +2704,30 @@ async fn a_credential_is_stored_with_the_servers_defaults_listed_and_revoked_onc
     };
     assert!(db.update(revoke("key_1", "usr_bob", "api_key")).await?.is_empty());
     assert!(db.update(revoke("key_1", "usr_ann", "app_password")).await?.is_empty());
-    assert_eq!(db.update(revoke("key_1", "usr_ann", "api_key")).await?.column::<String>()?, ["mail"]);
+    assert_eq!(db.update(revoke("key_1", "usr_ann", "api_key")).await?.column::<String>()?, ["files"]);
     assert!(db.update(revoke("key_1", "usr_ann", "api_key")).await?.is_empty());
     assert_eq!(rows_of(&db, live("usr_ann", "api_key")).await?, 1);
 
     // A revoked credential is kept, and its secret stays taken.
     assert!(!db.get("credentials", ["key_1"]).await?.expect("the row is kept").is_null("revoked_at")?);
     assert!(db
-        .insert(new_credential("key_9", "usr_ann", "api_key", "mail", "secret-1", None))
+        .insert(new_credential("key_9", "usr_ann", "api_key", "files", "secret-1", None))
         .await
         .unwrap_err()
         .violates("credentials_secret_hash_key"));
 
-    // Q87.
+    // A use is timed by the server.
     db.update(Update::table("credentials").key(["key_2"]).set("last_used_at", now())).await?;
     let used: Timestamp = db.get("credentials", ["key_2"]).await?.expect("the row is there").get("last_used_at")?;
     assert!(used >= created && used <= db.now().await?);
     Ok(())
 }
 
-/// Q86: what a service learns about a secret a caller showed it: the
-/// credential, its user and the user's role on the service, if all three
-/// are in order. auth has hashed secrets in two ways over time and looks
-/// for either: two lookups in the unique index, then one row of `users`
-/// and one of `access` by their keys.
+/// What a service learns about a secret a caller showed it: the credential,
+/// its user and the user's role on the service, if all three are in order.
+/// Secrets have been hashed in two ways over time and either is looked for:
+/// two lookups in the unique index, then one row of `users` and one of
+/// `access` by their keys.
 fn introspect(secret: &str, service: &str) -> Query {
     let candidates = [digest(secret), digest(&format!("v0:{secret}"))].map(|hash| KeyRange::eq([hash]));
     Query::table("credentials")
@@ -2705,18 +2744,19 @@ fn introspect(secret: &str, service: &str) -> Query {
         .select("stale", col("c.last_used_at").is_null().or(col("c.last_used_at").lt(now() - minutes(1))))
 }
 
-// R-Q1, R-Q6, R-Q8, R-Q9, R-T9: auth Q86, Q87.
+// R-Q1, R-Q6, R-Q8, R-Q9, R-T9: two lookups in a unique index, each joined
+// to two more tables by key, with conditions on times that may be NULL.
 #[tokio::test(flavor = "multi_thread")]
 async fn introspection_reads_a_credential_its_user_and_their_role_in_one_query() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(person("usr_bob", "bob", None)).await?;
-    db.insert(grant_role("usr_ann", "mail", "member", "usr_admin")).await?;
-    db.insert(grant_role("usr_bob", "mail", "admin", "usr_admin")).await?;
-    db.insert(new_credential("key_1", "usr_ann", "api_key", "mail", "s1", None)).await?;
+    db.insert(grant_role("usr_ann", "files", "member", "usr_admin")).await?;
+    db.insert(grant_role("usr_bob", "files", "admin", "usr_admin")).await?;
+    db.insert(new_credential("key_1", "usr_ann", "api_key", "files", "s1", None)).await?;
 
-    let found = db.query_one(introspect("s1", "mail")).await?;
+    let found = db.query_one(introspect("s1", "files")).await?;
     assert_eq!(found.columns(), ["id", "user_id", "scopes", "username", "role", "stale"]);
     assert_eq!(
         (found.get::<String>("id")?, found.get::<String>("user_id")?, found.get::<String>("username")?),
@@ -2727,58 +2767,56 @@ async fn introspection_reads_a_credential_its_user_and_their_role_in_one_query()
         (vec!["read".to_string(), "write".to_string()], "member".to_string())
     );
 
-    // Never used, or last used over a minute ago: time to note the use
-    // (Q87). Used within the minute: not again.
+    // Never used, or last used over a minute ago: time to note the use.
+    // Used within the minute: not again.
     let stale = |row: Row| row.get::<bool>("stale");
     assert!(stale(found)?);
     db.update(Update::table("credentials").key(["key_1"]).set("last_used_at", now())).await?;
-    assert!(!stale(db.query_one(introspect("s1", "mail")).await?)?);
+    assert!(!stale(db.query_one(introspect("s1", "files")).await?)?);
     db.update(Update::table("credentials").key(["key_1"]).set("last_used_at", now() - seconds(61))).await?;
-    assert!(stale(db.query_one(introspect("s1", "mail")).await?)?);
+    assert!(stale(db.query_one(introspect("s1", "files")).await?)?);
 
     // A secret stored under the older hashing is found by the second
     // lookup, and each row carries its own user's role.
-    db.insert(new_credential("key_2", "usr_bob", "api_key", "mail", "v0:s2", None)).await?;
-    let older = db.query_one(introspect("s2", "mail")).await?;
+    db.insert(new_credential("key_2", "usr_bob", "api_key", "files", "v0:s2", None)).await?;
+    let older = db.query_one(introspect("s2", "files")).await?;
     assert_eq!((older.get::<String>("id")?, older.get::<String>("role")?), ("key_2".to_string(), "admin".to_string()));
 
     // An expiry still to come does not hide a credential; one that has
     // passed does.
-    db.insert(new_credential("key_3", "usr_ann", "api_key", "mail", "s3", Some("2099-01-01T00:00:00Z"))).await?;
-    assert!(db.query_opt(introspect("s3", "mail")).await?.is_some());
+    db.insert(new_credential("key_3", "usr_ann", "api_key", "files", "s3", Some("2099-01-01T00:00:00Z"))).await?;
+    assert!(db.query_opt(introspect("s3", "files")).await?.is_some());
     db.update(Update::table("credentials").key(["key_3"]).set("expires_at", now() - seconds(1))).await?;
-    assert!(db.query_opt(introspect("s3", "mail")).await?.is_none());
+    assert!(db.query_opt(introspect("s3", "files")).await?.is_none());
 
     // Asked about by another service; or its user has no role on its
     // own service, until she is given one.
-    assert!(db.query_opt(introspect("s1", "docs")).await?.is_none());
-    db.insert(new_credential("key_4", "usr_ann", "api_key", "docs", "s4", None)).await?;
-    assert!(db.query_opt(introspect("s4", "docs")).await?.is_none());
-    db.insert(grant_role("usr_ann", "docs", "owner", "usr_admin")).await?;
-    assert_eq!(db.query_one(introspect("s4", "docs")).await?.get::<String>("role")?, "owner");
+    assert!(db.query_opt(introspect("s1", "chat")).await?.is_none());
+    db.insert(new_credential("key_4", "usr_ann", "api_key", "chat", "s4", None)).await?;
+    assert!(db.query_opt(introspect("s4", "chat")).await?.is_none());
+    db.insert(grant_role("usr_ann", "chat", "owner", "usr_admin")).await?;
+    assert_eq!(db.query_one(introspect("s4", "chat")).await?.get::<String>("role")?, "owner");
 
     // Revoked; unknown; its user disabled.
     db.update(Update::table("credentials").key(["key_4"]).set("revoked_at", now())).await?;
-    assert!(db.query_opt(introspect("s4", "docs")).await?.is_none());
-    assert!(db.query_opt(introspect("never-issued", "mail")).await?.is_none());
+    assert!(db.query_opt(introspect("s4", "chat")).await?.is_none());
+    assert!(db.query_opt(introspect("never-issued", "files")).await?.is_none());
     db.update(Update::table("users").key(["usr_bob"]).set("disabled_at", Timestamp::now()).set("updated_at", now())).await?;
-    assert!(db.query_opt(introspect("s2", "mail")).await?.is_none());
-    assert!(db.query_opt(introspect("s1", "mail")).await?.is_some());
+    assert!(db.query_opt(introspect("s2", "files")).await?.is_none());
+    assert!(db.query_opt(introspect("s1", "files")).await?.is_some());
     Ok(())
 }
 
-/// Q169, and Q170 where the text is a time: whether it is one, and
-/// whether that time is still to come. SQL asked the server without
-/// naming a table; a query here reads one, so this reads the table that
-/// always has exactly one row.
+/// Whether a text is a time, and whether that time is still to come. SQL
+/// would ask the server without naming a table; a query here reads one, so
+/// this reads the table that always has exactly one row.
 fn expiry_check(text: &str) -> Query {
     let parsed = || call(Func::ParseTimestamp, [val(text)]);
     Query::table("services_revision").select("ok", parsed().is_not_null()).select("ahead", parsed().gt(now()))
 }
 
-/// Q89: an API key carried over from another system with the times it
-/// had there, each as text. A key without a time of creation gets the
-/// server's.
+/// An API key carried over from another system with the times it had there,
+/// each as text. A key without a time of creation gets the server's.
 fn imported_key(
     id: &str,
     user: &str,
@@ -2792,7 +2830,7 @@ fn imported_key(
         .set("id", id)
         .set("user_id", user)
         .set("kind", "api_key")
-        .set("service", "mail")
+        .set("service", "files")
         .set("scopes", vec!["read"])
         .set("name", "imported")
         .set("secret_hash", digest(secret))
@@ -2802,16 +2840,17 @@ fn imported_key(
         .set("revoked_at", revoked)
 }
 
-// R-Q8, R-Q22, R-T3, R-T4, R-W11: auth Q83, Q89, Q169, Q170; §4.5.
+// R-Q8, R-Q22, R-T3, R-T4, R-W11: the server reads a timestamp given as
+// text, in a column and in an expression, and refuses text that is not one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_timestamp_given_as_text_is_read_or_refused_by_the_server() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
 
-    // The shapes auth lets through to the server, and the moment each
-    // means: a zone as Z or an offset, none at all (UTC), fractions of a
-    // second, the end of a day written as its 24th hour, a leap day.
+    // The shapes the service lets through to the server, and the moment
+    // each means: a zone as Z or an offset, none at all (UTC), fractions of
+    // a second, the end of a day written as its 24th hour, a leap day.
     let times = [
         ("2031-05-06T07:08:09Z", "2031-05-06T07:08:09Z"),
         ("2031-05-06T07:08:09.123456+02:00", "2031-05-06T05:08:09.123456Z"),
@@ -2824,11 +2863,12 @@ async fn a_timestamp_given_as_text_is_read_or_refused_by_the_server() -> DbResul
     for (n, (text, moment)) in times.into_iter().enumerate() {
         let check = db.query_one(expiry_check(text)).await?;
         assert_eq!((check.get::<bool>("ok")?, check.get::<Option<bool>>("ahead")?), (true, Some(true)), "{text}");
-        // Q170 as SQL wrote it: the text converted, then compared.
+        // As SQL would write it: the text converted, then compared.
         let ahead = db.query_one(Query::table("services_revision").select("ahead", val(text).cast(Type::Timestamp).gt(now()))).await?;
         assert!(ahead.get::<bool>("ahead")?, "{text}");
-        // Q83: written to the column, the text is the same moment.
-        let stored = db.insert(new_credential(&format!("key_{n}"), "usr_ann", "api_key", "mail", &format!("secret-{n}"), Some(text))).await?.one()?;
+        // Written to the column, the text is the same moment.
+        let stored =
+            db.insert(new_credential(&format!("key_{n}"), "usr_ann", "api_key", "files", &format!("secret-{n}"), Some(text))).await?.one()?;
         assert_eq!(stored.get::<Option<Timestamp>>("expires_at")?, Some(ts(moment)), "{text}");
     }
     let past = db.query_one(expiry_check("2001-02-03T04:05:06Z")).await?;
@@ -2841,7 +2881,7 @@ async fn a_timestamp_given_as_text_is_read_or_refused_by_the_server() -> DbResul
     {
         let check = db.query_one(expiry_check(text)).await?;
         assert_eq!((check.get::<bool>("ok")?, check.get::<Option<bool>>("ahead")?), (false, None), "{text:?}");
-        let err = db.insert(new_credential("key_bad", "usr_ann", "api_key", "mail", "secret-bad", Some(text))).await.unwrap_err();
+        let err = db.insert(new_credential("key_bad", "usr_ann", "api_key", "files", "secret-bad", Some(text))).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::TypeMismatch, "{text:?}");
     }
     assert!(db.get("credentials", ["key_bad"]).await?.is_none());
@@ -2851,7 +2891,7 @@ async fn a_timestamp_given_as_text_is_read_or_refused_by_the_server() -> DbResul
     assert_eq!(err.code, ErrorCode::TypeMismatch);
     assert!(db.query_one(Query::table("services_revision").select("at", impossible().try_cast(Type::Timestamp))).await?.is_null("at")?);
 
-    // Q89: an imported key keeps the times it came with.
+    // An imported key keeps the times it came with.
     db.insert(imported_key(
         "key_old",
         "usr_ann",
@@ -2874,15 +2914,15 @@ async fn a_timestamp_given_as_text_is_read_or_refused_by_the_server() -> DbResul
     Ok(())
 }
 
-/// The user import (§3.2): for each person an account, a line in the log,
-/// a role and an activation token, all in one transaction, because the
-/// import's contract is to write all or nothing.
+/// The user import: for each person an account, a line in the log, a role
+/// and an activation token, all in one transaction, because the import's
+/// contract is to write all or nothing.
 async fn import_users(db: &Client, people: &[(String, String, String)]) -> DbResult<()> {
     db.transaction(|tx| async move {
         for (id, username, email) in people {
             tx.insert(user_row(id, username, Some(email), "person", None, None)).await?;
             tx.insert(audit_entry(Some("host-cli"), "user.import", Some(id), json!({"username": username}))).await?;
-            tx.insert(grant_role(id, "mail", "member", "host-cli")).await?;
+            tx.insert(grant_role(id, "files", "member", "host-cli")).await?;
             tx.insert(one_time_token(&format!("activate-{id}"), "activate", id, Some(email), 14 * 86_400)).await?;
         }
         Ok(())
@@ -2890,7 +2930,9 @@ async fn import_users(db: &Client, people: &[(String, String, String)]) -> DbRes
     .await
 }
 
-// R-S5, R-W2, R-W11, R-X1, R-X2: auth Q12, Q24, Q106, Q129; §3.2 (imports).
+// R-S5, R-W2, R-W11, R-X1, R-X2: a transaction of twelve hundred inserts is
+// all or nothing, and the numbers the server assigns follow the order of
+// writing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_of_three_hundred_users_that_fails_midway_writes_nothing() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2940,21 +2982,21 @@ async fn an_import_of_three_hundred_users_that_fails_midway_writes_nothing() -> 
     Ok(())
 }
 
-/// Q93.
+/// A secret for a client, live from the moment it is stored.
 fn new_secret(client: &str, secret: &str) -> Insert {
     Insert::into("client_secrets").set("client_id", client).set("secret_hash", digest(secret))
 }
 
-/// Q91: whether this is one of the client's live secrets.
+/// Whether this is one of the client's live secrets.
 fn client_secret(client: &str, secret: &str) -> Query {
     Query::table("client_secrets").key([val(client), val(digest(secret))]).filter(col("revoked_at").is_null()).select("one", 1)
 }
 
-/// Q92: revokes every live secret of a client but the newest. SQL did it
-/// in one statement, comparing each row against a subquery for the
-/// newest. Here the newest is read and the others are revoked by two
-/// statements of the caller's transaction: nobody can add a secret
-/// between them and have it revoked for not being the one that was read.
+/// Revokes every live secret of a client but the newest. SQL would do it in
+/// one statement, comparing each row against a subquery for the newest.
+/// Here the newest is read and the others are revoked by two statements of
+/// the caller's transaction: nobody can add a secret between them and have
+/// it revoked for not being the one that was read.
 async fn retire_old_secrets(tx: &Transaction, client: &str) -> DbResult<u64> {
     let live = || Query::table("client_secrets").range(KeyRange::eq([client])).filter(col("revoked_at").is_null());
     let Some(newest) = tx.query_opt(live().order_by(col("created_at").desc()).limit(1).columns(["secret_hash"])).await? else {
@@ -2965,13 +3007,12 @@ async fn retire_old_secrets(tx: &Transaction, client: &str) -> DbResult<u64> {
     Ok(retired.affected())
 }
 
-/// Giving a client of the mail service a new secret (§3.2): the client is
-/// checked to be the service's (Q160), and its old secrets but the newest
-/// are retired, so that the one in use keeps working while the new one is
-/// rolled out.
+/// Giving a client of the files service a new secret: the client is checked
+/// to be the service's, and its old secrets but the newest are retired, so
+/// that the one in use keeps working while the new one is rolled out.
 async fn add_client_secret(db: &Client, client: &str, secret: &str) -> DbResult<()> {
     db.transaction(|tx| async move {
-        tx.query_one(Query::table("clients").key([client]).filter(col("service").eq("mail")).select("one", 1)).await?;
+        tx.query_one(Query::table("clients").key([client]).filter(col("service").eq("files")).select("one", 1)).await?;
         let retired = retire_old_secrets(&tx, client).await?;
         tx.insert(new_secret(client, secret)).await?;
         tx.insert(audit_entry(Some("usr_admin"), "client.secret", None, json!({"client": client, "retired": retired}))).await?;
@@ -2980,17 +3021,19 @@ async fn add_client_secret(db: &Client, client: &str, secret: &str) -> DbResult<
     .await
 }
 
-// R-Q1, R-Q4, R-Q10, R-W7, R-X2: auth Q91, Q92, Q93, Q94, Q129, Q160; §7.9.
+// R-Q1, R-Q4, R-Q10, R-W7, R-X2: "all but the newest" as a read and an
+// update in one transaction, where SQL would compare against a subquery,
+// also when five do it at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn retiring_a_clients_old_secrets_revokes_all_but_the_newest() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    db.insert(new_service("mail", "invite")).await?;
-    db.insert(new_client("mail-web", "mail", "confidential")).await?;
+    db.insert(new_service("files", "invite")).await?;
+    db.insert(new_client("files-web", "files", "confidential")).await?;
     // Each secret is given an age of its own, so that "newest" does not
     // hang on how fine the clock is.
     for (client, secret, hours_old) in
-        [("mail-web", "s1", 3), ("mail-web", "s2", 2), ("mail-web", "s3", 1), ("docs-web", "d1", 5), ("docs-web", "d2", 4)]
+        [("files-web", "s1", 3), ("files-web", "s2", 2), ("files-web", "s3", 1), ("chat-web", "d1", 5), ("chat-web", "d2", 4)]
     {
         db.insert(new_secret(client, secret)).await?;
         db.update(Update::table("client_secrets").key([val(client), val(digest(secret))]).set("created_at", now() - hours(hours_old))).await?;
@@ -2999,24 +3042,24 @@ async fn retiring_a_clients_old_secrets_revokes_all_but_the_newest() -> DbResult
         Ok(db.query(client_secret(client, secret)).await?.len() == 1)
     }
 
-    // Q91: a client proves itself with any of its live secrets, and only
-    // with its own.
-    assert!(works(&db, "mail-web", "s1").await? && works(&db, "mail-web", "s2").await? && works(&db, "mail-web", "s3").await?);
-    assert!(!works(&db, "docs-web", "s1").await? && !works(&db, "mail-web", "never-issued").await?);
+    // A client proves itself with any of its live secrets, and only with
+    // its own.
+    assert!(works(&db, "files-web", "s1").await? && works(&db, "files-web", "s2").await? && works(&db, "files-web", "s3").await?);
+    assert!(!works(&db, "chat-web", "s1").await? && !works(&db, "files-web", "never-issued").await?);
 
-    // Q92.
-    assert_eq!(db.transaction(|tx| async move { retire_old_secrets(&tx, "mail-web").await }).await?, 2);
-    assert!(works(&db, "mail-web", "s3").await?);
-    assert!(!works(&db, "mail-web", "s1").await? && !works(&db, "mail-web", "s2").await?);
-    assert!(works(&db, "docs-web", "d1").await? && works(&db, "docs-web", "d2").await?);
-    assert_eq!(db.transaction(|tx| async move { retire_old_secrets(&tx, "mail-web").await }).await?, 0);
+    // All but the newest are retired, and only that client's.
+    assert_eq!(db.transaction(|tx| async move { retire_old_secrets(&tx, "files-web").await }).await?, 2);
+    assert!(works(&db, "files-web", "s3").await?);
+    assert!(!works(&db, "files-web", "s1").await? && !works(&db, "files-web", "s2").await?);
+    assert!(works(&db, "chat-web", "d1").await? && works(&db, "chat-web", "d2").await?);
+    assert_eq!(db.transaction(|tx| async move { retire_old_secrets(&tx, "files-web").await }).await?, 0);
     assert_eq!(db.transaction(|tx| async move { retire_old_secrets(&tx, "wiki-web").await }).await?, 0);
     // Revoked secrets are kept.
-    assert_eq!(rows_of(&db, Query::table("client_secrets").range(KeyRange::eq(["mail-web"]))).await?, 3);
+    assert_eq!(rows_of(&db, Query::table("client_secrets").range(KeyRange::eq(["files-web"]))).await?, 3);
 
     // A new secret: the one in use and the new one both work.
-    add_client_secret(&db, "mail-web", "s4").await?;
-    assert!(works(&db, "mail-web", "s3").await? && works(&db, "mail-web", "s4").await?);
+    add_client_secret(&db, "files-web", "s4").await?;
+    assert!(works(&db, "files-web", "s3").await? && works(&db, "files-web", "s4").await?);
 
     // Five new secrets asked for at once. Each request retires all but
     // the newest it finds and adds its own, one request after another,
@@ -3025,33 +3068,33 @@ async fn retiring_a_clients_old_secrets_revokes_all_but_the_newest() -> DbResult
     let mut requests = Vec::new();
     for n in 0..5 {
         let db = db.clone();
-        requests.push(tokio::spawn(async move { add_client_secret(&db, "mail-web", &format!("rolled-{n}")).await }));
+        requests.push(tokio::spawn(async move { add_client_secret(&db, "files-web", &format!("rolled-{n}")).await }));
     }
     for request in requests {
         request.await.expect("the task ran")?;
     }
     let live = Query::table("client_secrets").filter(col("revoked_at").is_null());
-    assert_eq!(rows_of(&db, live.clone().range(KeyRange::eq(["mail-web"]))).await?, 2);
-    assert!(!works(&db, "mail-web", "s3").await? && !works(&db, "mail-web", "s4").await?);
+    assert_eq!(rows_of(&db, live.clone().range(KeyRange::eq(["files-web"]))).await?, 2);
+    assert!(!works(&db, "files-web", "s3").await? && !works(&db, "files-web", "s4").await?);
 
-    // Q94: every live secret, the newest first, for the admin page.
+    // Every live secret, the newest first, for the admin page.
     let listed = db.query(live.order_by(col("created_at").desc()).columns(["client_id", "created_at"])).await?;
-    assert_eq!(column::<String>(&listed, "client_id"), ["mail-web", "mail-web", "docs-web", "docs-web"]);
+    assert_eq!(column::<String>(&listed, "client_id"), ["files-web", "files-web", "chat-web", "chat-web"]);
     assert!(column::<Timestamp>(&listed, "created_at").windows(2).all(|pair| pair[0] >= pair[1]));
     assert_eq!(rows_of(&db, Query::table("audit")).await?, 6);
     Ok(())
 }
 
-/// Q97: an invitation that can still be accepted, by its token.
+/// An invitation that can still be accepted, by its token.
 fn open_invite(token: &str) -> Query {
     Query::table("invites")
         .index("invites_token_hash_key", KeyRange::eq([digest(token)]))
         .filter(col("accepted_at").is_null().and(col("expires_at").gt(now())))
 }
 
-/// Making an account from an invitation (§3.2): the user, the log, the
-/// invitation accepted, the role it promised and the service's event are
-/// one transaction. An error anywhere, such as a taken username or an
+/// Making an account from an invitation: the user, the log, the invitation
+/// accepted, the role it promised and the service's event are one
+/// transaction. An error anywhere, such as a taken username or an
 /// invitation that is no longer open, undoes all of it.
 async fn join_by_invite(db: &Client, token: &str, id: &str, username: &str) -> DbResult<()> {
     db.transaction(|tx| async move {
@@ -3066,17 +3109,18 @@ async fn join_by_invite(db: &Client, token: &str, id: &str, username: &str) -> D
     .await
 }
 
-// R-Q1, R-Q8, R-S3, R-W1, R-W7, R-X1: auth Q12, Q24, Q96, Q97, Q98, Q99, Q122,
-// Q129; §3.2 (invitations).
+// R-Q1, R-Q8, R-S3, R-W1, R-W7, R-X1: an update through a unique index
+// happens once and only before a deadline, and a transaction is undone by
+// an error in a later statement.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invitation_is_accepted_once_while_it_is_good() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
 
-    // Q96: fourteen days to accept, by the server's clock.
+    // Fourteen days to accept, by the server's clock.
     let before = db.now().await?;
-    let made = db.insert(new_invite("inv_1", "new@example.com", "mail", "member", "token-1", 14 * 86_400)).await?.one()?;
+    let made = db.insert(new_invite("inv_1", "new@example.com", "files", "member", "token-1", 14 * 86_400)).await?.one()?;
     let after = db.now().await?;
     assert_eq!(made.columns(), INVITE_COLUMNS);
     assert_eq!(
@@ -3087,12 +3131,12 @@ async fn an_invitation_is_accepted_once_while_it_is_good() -> DbResult<()> {
     let expires: Timestamp = made.get("expires_at")?;
     assert!(before.plus_secs(14 * 86_400) <= expires && expires <= after.plus_secs(14 * 86_400));
 
-    // Q97 and Q98: found by its token while it is open.
+    // Found by its token while it is open.
     assert_eq!(db.query_one(open_invite("token-1").columns(INVITE_COLUMNS)).await?, made);
-    assert_eq!(db.query_one(open_invite("token-1").columns(["service"])).await?.get::<String>("service")?, "mail");
+    assert_eq!(db.query_one(open_invite("token-1").columns(["service"])).await?.get::<String>("service")?, "files");
     assert!(db.query_opt(open_invite("never-sent")).await?.is_none());
 
-    // Q99: accepted once, answering with the row as it now is.
+    // Accepted once, answering with the row as it now is.
     let accepted = db.update(accept_invite("token-1", "usr_ann")).await?;
     assert_eq!(accepted.affected(), 1);
     let accepted = accepted.one()?;
@@ -3102,16 +3146,16 @@ async fn an_invitation_is_accepted_once_while_it_is_good() -> DbResult<()> {
     assert!(db.query_opt(open_invite("token-1")).await?.is_none());
 
     // One that has expired is neither found nor accepted.
-    db.insert(new_invite("inv_2", "late@example.com", "mail", "member", "token-2", -1)).await?;
+    db.insert(new_invite("inv_2", "late@example.com", "files", "member", "token-2", -1)).await?;
     assert!(db.query_opt(open_invite("token-2")).await?.is_none());
     assert_eq!(db.update(accept_invite("token-2", "usr_ann")).await?.affected(), 0);
     assert!(db.get("invites", ["inv_2"]).await?.expect("the invitation is there").is_null("accepted_at")?);
 
     // No two invitations share a token, and only a user who exists can
     // accept one.
-    let err = db.insert(new_invite("inv_3", "x@example.com", "mail", "member", "token-1", 3600)).await.unwrap_err();
+    let err = db.insert(new_invite("inv_3", "x@example.com", "files", "member", "token-1", 3600)).await.unwrap_err();
     assert!(err.is_unique_violation() && err.violates("invites_token_hash_key"), "{err}");
-    db.insert(new_invite("inv_3", "bob@example.com", "docs", "editor", "token-3", 3600)).await?;
+    db.insert(new_invite("inv_3", "bob@example.com", "chat", "editor", "token-3", 3600)).await?;
     assert_eq!(db.update(accept_invite("token-3", "usr_nobody")).await.unwrap_err().code, ErrorCode::ForeignKeyViolation);
 
     // The invited person picks a username that is taken: no account, no
@@ -3128,7 +3172,7 @@ async fn an_invitation_is_accepted_once_while_it_is_good() -> DbResult<()> {
         db.get("invites", ["inv_3"]).await?.expect("the invitation is there").get::<Option<String>>("accepted_by")?.as_deref(),
         Some("usr_bob")
     );
-    assert_eq!(db.query_one(role_of("usr_bob", "docs")).await?.get::<String>("role")?, "editor");
+    assert_eq!(db.query_one(role_of("usr_bob", "chat")).await?.get::<String>("role")?, "editor");
     assert_eq!((rows_of(&db, Query::table("audit")).await?, rows_of(&db, Query::table("outbox")).await?), (1, 1));
 
     // The same link opened by somebody else: the invitation is taken,
@@ -3140,9 +3184,9 @@ async fn an_invitation_is_accepted_once_while_it_is_good() -> DbResult<()> {
     Ok(())
 }
 
-/// Q100: a page of invitations after `cursor`, all of them or one
-/// service's. Each case has an index in the order wanted: the primary
-/// key, or `(service, id)`.
+/// A page of invitations after `cursor`, all of them or one service's. Each
+/// case has an index in the order wanted: the primary key, or
+/// `(service, id)`.
 fn invite_page(service: &str, cursor: &str, page: u64) -> Query {
     let invites = if service.is_empty() {
         Query::table("invites").range(KeyRange::new(Bound::excluded([cursor]), Bound::Unbounded))
@@ -3152,19 +3196,26 @@ fn invite_page(service: &str, cursor: &str, page: u64) -> Query {
     invites.columns(INVITE_COLUMNS).limit(page)
 }
 
-// R-Q2, R-Q4, R-W7: auth Q100, Q101, Q102.
+// R-Q2, R-Q4, R-W7: paging by a cursor over the primary key or within one
+// prefix of a two-column index, and a filtered delete that returns its row.
 #[tokio::test(flavor = "multi_thread")]
 async fn invitations_are_paged_by_id_for_all_services_or_for_one() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    for (id, service) in
-        [("inv_01", "mail"), ("inv_02", "docs"), ("inv_03", "mail"), ("inv_04", "mail"), ("inv_05", "docs"), ("inv_06", "mail"), ("inv_07", "wiki")]
-    {
+    for (id, service) in [
+        ("inv_01", "files"),
+        ("inv_02", "chat"),
+        ("inv_03", "files"),
+        ("inv_04", "files"),
+        ("inv_05", "chat"),
+        ("inv_06", "files"),
+        ("inv_07", "wiki"),
+    ] {
         db.insert(new_invite(id, "someone@example.com", service, "member", id, 3600)).await?;
     }
     let ids = |rows: Rows| column::<String>(&rows, "id");
 
-    // Q100, for the admin: every service's.
+    // For the admin: every service's.
     assert_eq!(ids(db.query(invite_page("", "", 3)).await?), ["inv_01", "inv_02", "inv_03"]);
     assert_eq!(ids(db.query(invite_page("", "inv_03", 3)).await?), ["inv_04", "inv_05", "inv_06"]);
     assert_eq!(ids(db.query(invite_page("", "inv_06", 3)).await?), ["inv_07"]);
@@ -3172,46 +3223,47 @@ async fn invitations_are_paged_by_id_for_all_services_or_for_one() -> DbResult<(
 
     // For a service's client: its own, in the same order, and never a
     // neighbour's once its own run out.
-    assert_eq!(ids(db.query(invite_page("mail", "", 3)).await?), ["inv_01", "inv_03", "inv_04"]);
-    assert_eq!(ids(db.query(invite_page("mail", "inv_04", 3)).await?), ["inv_06"]);
-    assert!(db.query(invite_page("mail", "inv_06", 3)).await?.is_empty());
-    assert_eq!(ids(db.query(invite_page("docs", "inv_02", 3)).await?), ["inv_05"]);
+    assert_eq!(ids(db.query(invite_page("files", "", 3)).await?), ["inv_01", "inv_03", "inv_04"]);
+    assert_eq!(ids(db.query(invite_page("files", "inv_04", 3)).await?), ["inv_06"]);
+    assert!(db.query(invite_page("files", "inv_06", 3)).await?.is_empty());
+    assert_eq!(ids(db.query(invite_page("chat", "inv_02", 3)).await?), ["inv_05"]);
     assert!(db.query(invite_page("calendar", "", 3)).await?.is_empty());
-    let page = db.query(invite_page("mail", "", 3)).await?;
+    let page = db.query(invite_page("files", "", 3)).await?;
     assert_eq!(page.columns(), INVITE_COLUMNS);
-    assert_eq!(column::<String>(&page, "service"), ["mail", "mail", "mail"]);
+    assert_eq!(column::<String>(&page, "service"), ["files", "files", "files"]);
 
-    // Q101: one invitation, which a client sees only if it is its
-    // service's.
+    // One invitation, which a client sees only if it is its service's.
     let one = |id: &str, service: &str| {
         Query::table("invites").key([id]).filter(any([val(service).eq(""), col("service").eq(service)])).columns(INVITE_COLUMNS)
     };
-    assert_eq!(db.query_one(one("inv_02", "")).await?.get::<String>("service")?, "docs");
-    assert!(db.query_opt(one("inv_02", "docs")).await?.is_some());
-    assert!(db.query_opt(one("inv_02", "mail")).await?.is_none());
+    assert_eq!(db.query_one(one("inv_02", "")).await?.get::<String>("service")?, "chat");
+    assert!(db.query_opt(one("inv_02", "chat")).await?.is_some());
+    assert!(db.query_opt(one("inv_02", "files")).await?.is_none());
     assert!(db.query_opt(one("inv_99", "")).await?.is_none());
 
-    // Q102: withdrawn under the same rule, once.
+    // Withdrawn under the same rule, once.
     let withdraw = |id: &str, service: &str| {
         Delete::from("invites").key([id]).filter(any([val(service).eq(""), col("service").eq(service)])).returning(["service"])
     };
-    assert!(db.delete(withdraw("inv_02", "mail")).await?.is_empty());
+    assert!(db.delete(withdraw("inv_02", "files")).await?.is_empty());
     assert!(db.get("invites", ["inv_02"]).await?.is_some());
-    assert_eq!(db.delete(withdraw("inv_02", "docs")).await?.column::<String>()?, ["docs"]);
-    assert!(db.delete(withdraw("inv_02", "docs")).await?.is_empty());
+    assert_eq!(db.delete(withdraw("inv_02", "chat")).await?.column::<String>()?, ["chat"]);
+    assert!(db.delete(withdraw("inv_02", "chat")).await?.is_empty());
     assert_eq!(db.delete(withdraw("inv_07", "")).await?.column::<String>()?, ["wiki"]);
     assert_eq!(ids(db.query(invite_page("", "", 10)).await?), ["inv_01", "inv_03", "inv_04", "inv_05", "inv_06"]);
     Ok(())
 }
 
-// R-Q4, R-Q6, R-Q8, R-W7, R-W10: auth Q106, Q107, Q108, Q109, Q110, Q111, Q112.
+// R-Q4, R-Q6, R-Q8, R-W7, R-W10: a row that expires by the server's clock
+// is used once by a conditional update, and an index range is deleted with
+// a filter.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_time_token_is_used_once_for_its_purpose_before_it_expires() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", Some("ann@example.com"))).await?;
     db.insert(person("usr_bob", "bob", None)).await?;
-    // Q107: looks at a token without using it.
+    // Looks at a token without using it.
     let peek = |token: &str, purpose: &str| {
         Query::table("one_time_tokens")
             .key([digest(token)])
@@ -3219,7 +3271,7 @@ async fn a_one_time_token_is_used_once_for_its_purpose_before_it_expires() -> Db
             .columns(["user_id", "email"])
     };
 
-    // Q106: an hour to use it, by the server's clock.
+    // An hour to use it, by the server's clock.
     let before = db.now().await?;
     db.insert(one_time_token("reset-1", "reset", "usr_ann", None, 3600)).await?;
     let expires: Timestamp = db.get("one_time_tokens", [digest("reset-1")]).await?.expect("the token is there").get("expires_at")?;
@@ -3234,7 +3286,7 @@ async fn a_one_time_token_is_used_once_for_its_purpose_before_it_expires() -> Db
     assert!(db.query_opt(peek("reset-1", "activate")).await?.is_none());
     assert!(db.update(consume_token("reset-1", "activate")).await?.is_empty());
 
-    // Q108.
+    // Used, once.
     let used = db.update(consume_token("reset-1", "reset")).await?;
     assert_eq!(used.affected(), 1);
     assert_eq!(used.one()?.get::<String>("user_id")?, "usr_ann");
@@ -3246,9 +3298,9 @@ async fn a_one_time_token_is_used_once_for_its_purpose_before_it_expires() -> Db
     assert!(db.query_opt(peek("reset-2", "reset")).await?.is_none());
     assert!(db.update(consume_token("reset-2", "reset")).await?.is_empty());
 
-    // Q109: the address she most recently asked to switch to, among the
-    // requests still open. A used one, an expired one and a token of
-    // another purpose do not count, however late they expire.
+    // The address she most recently asked to switch to, among the requests
+    // still open. A used one, an expired one and a token of another purpose
+    // do not count, however late they expire.
     db.insert(one_time_token("verify-1", "verify_email", "usr_ann", Some("first@example.com"), 3600)).await?;
     db.insert(one_time_token("verify-2", "verify_email", "usr_ann", Some("second@example.com"), 3 * 3600)).await?;
     db.insert(one_time_token("verify-3", "verify_email", "usr_ann", Some("third@example.com"), 2 * 3600)).await?;
@@ -3267,22 +3319,22 @@ async fn a_one_time_token_is_used_once_for_its_purpose_before_it_expires() -> Db
         .columns(["email"]);
     assert_eq!(db.query_one(pending.clone()).await?.get::<Option<String>>("email")?.as_deref(), Some("second@example.com"));
 
-    // Q112: a confirmed address withdraws her other unused requests and
-    // reset links. Used tokens and other purposes stay.
+    // A confirmed address withdraws her other unused requests and reset
+    // links. Used tokens and other purposes stay.
     let withdrawn = db.delete(Delete::rows(hers(vec!["verify_email", "reset"]).filter(col("used_at").is_null()))).await?;
     assert_eq!(withdrawn.affected(), 5);
     assert!(db.query_opt(pending).await?.is_none());
     assert_eq!(sorted(&db, hers(vec!["verify_email", "reset", "activate"]).columns(["purpose"])).await?, ["activate", "reset", "verify_email"]);
 
-    // Q110: her requests to change address. Q111: every token of hers.
+    // Her requests to change address, then every token of hers.
     assert_eq!(db.delete(Delete::rows(hers(vec!["verify_email"]))).await?.affected(), 1);
     assert_eq!(db.delete(Delete::from("one_time_tokens").index("one_time_tokens_user", KeyRange::eq(["usr_ann"]))).await?.affected(), 2);
     assert_eq!(sorted(&db, Query::table("one_time_tokens").columns(["user_id"])).await?, ["usr_bob"]);
     Ok(())
 }
 
-/// Q116: a signing key, published and signing at the given hours from
-/// the server's now.
+/// A signing key, published and signing at the given hours from the
+/// server's now.
 fn new_key(kid: &str, publish_in_hours: i64, sign_in_hours: i64) -> Insert {
     Insert::into("signing_keys")
         .set("kid", kid)
@@ -3292,9 +3344,9 @@ fn new_key(kid: &str, publish_in_hours: i64, sign_in_hours: i64) -> Insert {
         .set("sign_from", now() + hours(sign_in_hours))
 }
 
-/// Q114: the keys to publish, in the order they sign, each saying whether
-/// it is the one that signs now: the one whose `sign_from` is the latest
-/// already reached.
+/// The keys to publish, in the order they sign, each saying whether it is
+/// the one that signs now: the one whose `sign_from` is the latest already
+/// reached.
 fn published_keys() -> Query {
     let signing_since = Query::table("signing_keys").alias("n").filter(col("n.sign_from").le(now())).select("latest", max(col("n.sign_from")));
     Query::table("signing_keys")
@@ -3307,7 +3359,8 @@ fn published_keys() -> Query {
         .select("signs", col("k.sign_from").eq(scalar(signing_since)))
 }
 
-// R-Q8, R-Q10, R-Q11, R-T6, R-T9: auth Q114, Q116, Q119, Q120, Q121.
+// R-Q8, R-Q10, R-Q11, R-T6, R-T9: a column compared with an aggregate from
+// a subquery, and JSON that is stored and returned whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_published_keys_say_which_one_signs_now() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3334,14 +3387,14 @@ async fn the_published_keys_say_which_one_signs_now() -> DbResult<()> {
     assert_eq!(column::<String>(&keys, "kid"), ["aK2-previous", "Bk3-current", "Ck4-next"]);
     assert_eq!(column::<bool>(&keys, "signs"), [false, true, false]);
     assert_eq!(column::<Vec<u8>>(&keys, "private_key_enc")[1], b"v1:Bk3-current");
-    // The public key is served as it is stored: whole, its members in
-    // the order jsonb gave them (shorter names first, then by bytes),
-    // not the order they were written in.
+    // The public key is served as it is stored: whole, its members in the
+    // order Postgres' jsonb gives them (shorter names first, then by
+    // bytes), not the order they were written in.
     let jwk: Json = keys.first().expect("a key is published").get("public_jwk")?;
     assert_eq!(jwk.to_string(), r#"{"x":"f83OJ3D2","y":"x_FEzRu9","alg":"ES256","crv":"P-256","kid":"aK2-previous","kty":"EC","use":"sig"}"#);
 
-    // Q119, Q120, Q121: re-encrypting the private keys reads every id in
-    // order, then each key in a transaction of its own.
+    // Re-encrypting the private keys reads every id in order, then each key
+    // in a transaction of its own.
     let kids: Vec<String> = db.query(Query::table("signing_keys").select("id", col("kid"))).await?.column()?;
     assert_eq!(kids, ["Bk3-current", "Ck4-next", "Zk1-retired", "aK2-previous", "dk5-unpublished"]);
     for kid in &kids {
@@ -3360,11 +3413,11 @@ async fn the_published_keys_say_which_one_signs_now() -> DbResult<()> {
     Ok(())
 }
 
-/// Q115: where the rotation stands: since when the current key signs,
-/// how many keys wait to sign, and whether the current one has signed
-/// for 89 days. SQL selected three subqueries from nothing; aggregates
-/// with a filter over the one table say the same, and an aggregate
-/// without groups always gives one row.
+/// Where the rotation stands: since when the current key signs, how many
+/// keys wait to sign, and whether the current one has signed for 89 days.
+/// SQL would select three subqueries from nothing; aggregates with a filter
+/// over the one table say the same, and an aggregate without groups always
+/// gives one row.
 fn rotation_state() -> Query {
     let current_from = || max(col("sign_from")).filter(col("sign_from").le(now()));
     Query::table("signing_keys")
@@ -3373,14 +3426,14 @@ fn rotation_state() -> Query {
         .select("due", current_from().le(now() - days(89)))
 }
 
-/// auth's hourly key rotation as one transaction (§3.2, §7.8), which in
-/// Postgres began with an advisory lock (Q167) so that two processes
-/// would not both add a key. It reads the state (Q115), adds a key if one
-/// is due and none waits (Q116), dates the retirement of every key that a
-/// later one has taken over from (Q117) and deletes keys a day after
-/// their retirement (Q118). Q117 was one statement whose subqueries read
-/// the table being updated; here the keys are read once and each
-/// superseded one is updated by its key. Answers whether a key was added.
+/// The hourly key rotation as one transaction, which on Postgres would
+/// begin with an advisory lock so that two processes do not both add a key.
+/// It reads the state, adds a key if one is due and none waits, dates the
+/// retirement of every key that a later one has taken over from and deletes
+/// keys a day after their retirement. In SQL the dating is one statement
+/// whose subqueries read the table being updated; here the keys are read
+/// once and each superseded one is updated by its key. Answers whether a
+/// key was added.
 async fn rotate_keys(db: &Client, kid: &str) -> DbResult<bool> {
     let tx = db.begin().await?;
     let state = tx.query_one(rotation_state()).await?;
@@ -3419,8 +3472,9 @@ async fn rotate_keys(db: &Client, kid: &str) -> DbResult<bool> {
     Ok(added)
 }
 
-// R-Q8, R-Q10, R-Q11, R-W6, R-W10, R-X2: auth Q115, Q116, Q117, Q118, Q167;
-// §3.2 (key rotation), §7.8.
+// R-Q8, R-Q10, R-Q11, R-W6, R-W10, R-X2: aggregates with a filter always
+// give one row, and a periodic job that reads, decides and writes is safe
+// to run in two processes at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn key_rotation_adds_a_key_when_one_is_due_and_retires_the_keys_it_replaces() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3496,12 +3550,12 @@ async fn key_rotation_adds_a_key_when_one_is_due_and_retires_the_keys_it_replace
     Ok(())
 }
 
-/// Q123: leases the oldest due events to the caller: counts the attempt
-/// and puts the next one a lease away, so that nobody else takes them
-/// meanwhile and a caller that dies leaves them to be retried. The index
-/// holds only events neither delivered nor given up, by the time they
-/// are due. Postgres needed `FOR UPDATE SKIP LOCKED` to keep two callers
-/// off the same rows; here a statement is not interleaved with another.
+/// Leases the oldest due events to the caller: counts the attempt and puts
+/// the next one a lease away, so that nobody else takes them meanwhile and
+/// a caller that dies leaves them to be retried. The index holds only
+/// events neither delivered nor given up, by the time they are due.
+/// Postgres needs `FOR UPDATE SKIP LOCKED` to keep two callers off the same
+/// rows; here a statement is not interleaved with another.
 fn lease_events(batch: u64, lease_seconds: i64) -> Update {
     let due = Query::table("outbox").index("outbox_pending", KeyRange::new(Bound::Unbounded, Bound::included([now()])));
     Update::rows(due.order_by(col("id")).limit(batch))
@@ -3510,24 +3564,26 @@ fn lease_events(batch: u64, lease_seconds: i64) -> Update {
         .returning(["id", "service", "token", "attempts"])
 }
 
-// R-S4, R-S5, R-W6, R-W9, R-X2, R-X3: auth Q122, Q123, Q124, Q125, Q126; §7.4.
+// R-S4, R-S5, R-W6, R-W9, R-X2, R-X3: a queue on an index over part of a
+// table, whose oldest due rows an ordered, limited update leases to one
+// taker at a time.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_outbox_leases_its_oldest_due_events_to_one_taker_at_a_time() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     for n in 1..=25 {
-        db.insert(event(if n % 2 == 0 { "mail" } else { "docs" }, &format!("event-{n}"))).await?;
+        db.insert(event(if n % 2 == 0 { "files" } else { "chat" }, &format!("event-{n}"))).await?;
     }
-    // Q122 leaves the number, the count of attempts and the time of the
-    // first attempt to the server.
+    // The insert leaves the number, the count of attempts and the time of
+    // the first attempt to the server.
     let queued = db.query(Query::table("outbox")).await?;
     assert_eq!(column::<i64>(&queued, "id"), (1..=25).collect::<Vec<i64>>());
     assert!(column::<i64>(&queued, "attempts").iter().all(|attempts| *attempts == 0));
     assert!(column::<Timestamp>(&queued, "next_attempt_at").windows(2).all(|pair| pair[0] <= pair[1]));
 
-    // Not to be leased: an event put off for an hour, one delivered
-    // (Q124), one given up (Q125). And one due for longer than the rest,
-    // which does not make it first: the order is that of the numbers.
+    // Not to be leased: an event put off for an hour, one delivered, one
+    // given up. And one due for longer than the rest, which does not make
+    // it first: the order is that of the numbers.
     db.update(Update::table("outbox").key([7]).set("next_attempt_at", now() + hours(1))).await?;
     db.update(Update::table("outbox").key([9]).set("delivered_at", now())).await?;
     db.update(Update::table("outbox").key([11]).set("failed_at", now())).await?;
@@ -3541,7 +3597,7 @@ async fn the_outbox_leases_its_oldest_due_events_to_one_taker_at_a_time() -> DbR
     first.sort();
     assert_eq!(first.iter().map(|event| event.0).collect::<Vec<_>>(), due[..20]);
     for (id, service, token, attempts) in &first {
-        assert_eq!((service.as_str(), token, *attempts), (if id % 2 == 0 { "mail" } else { "docs" }, &format!("event-{id}"), 1));
+        assert_eq!((service.as_str(), token, *attempts), (if id % 2 == 0 { "files" } else { "chat" }, &format!("event-{id}"), 1));
     }
     // What is leased is not due again for a minute, so the next call
     // gets the rest, and the one after that nothing.
@@ -3552,8 +3608,8 @@ async fn the_outbox_leases_its_oldest_due_events_to_one_taker_at_a_time() -> DbR
     assert_eq!(db.get("outbox", [7]).await?.expect("the event is there").get::<i64>("attempts")?, 0);
 
     // After the attempts: one delivered, one given up, one put off by a
-    // back-off the app computed, here 322.5 seconds (Q126). Two were
-    // leased by a process that died, and their minute has passed.
+    // back-off the caller computed, here 322.5 seconds. Two were leased by
+    // a process that died, and their minute has passed.
     db.update(Update::table("outbox").key([1]).set("delivered_at", now())).await?;
     db.update(Update::table("outbox").key([2]).set("failed_at", now())).await?;
     db.update(Update::table("outbox").key([3]).set("next_attempt_at", now() + seconds_f64(322.5))).await?;
@@ -3570,7 +3626,7 @@ async fn the_outbox_leases_its_oldest_due_events_to_one_taker_at_a_time() -> DbR
     // Sixty more events and six deliverers at once, each asking for
     // twenty: every event goes to exactly one of them.
     for n in 26..=85 {
-        db.insert(event("mail", &format!("event-{n}"))).await?;
+        db.insert(event("files", &format!("event-{n}"))).await?;
     }
     let mut deliverers = Vec::new();
     for _ in 0..6 {
@@ -3588,23 +3644,25 @@ async fn the_outbox_leases_its_oldest_due_events_to_one_taker_at_a_time() -> DbR
     Ok(())
 }
 
-/// A grant as the management API makes it (§3.2): the role, the line in
-/// the log and the service's event, inside the caller's transaction.
+/// A grant as the management API makes it: the role, the line in the log
+/// and the service's event, inside the caller's transaction.
 async fn put_access(tx: &Transaction, user: &str, role: &str) -> DbResult<()> {
-    tx.insert(grant_role(user, "mail", role, "usr_admin")).await?;
-    tx.insert(audit_entry(Some("usr_admin"), "access.put", Some(user), json!({"service": "mail", "role": role}))).await?;
-    tx.insert(event("mail", &format!("access:{user}:{role}"))).await?;
+    tx.insert(grant_role(user, "files", role, "usr_admin")).await?;
+    tx.insert(audit_entry(Some("usr_admin"), "access.put", Some(user), json!({"service": "files", "role": role}))).await?;
+    tx.insert(event("files", &format!("access:{user}:{role}"))).await?;
     Ok(())
 }
 
-// R-S5, R-W11, R-X1, R-X2: auth Q24, Q122, Q129; §4.3, §7.4.
+// R-S5, R-W11, R-X1, R-X2: rows written beside a change commit or vanish
+// with it, and the numbers the server assigns rise in the order of the
+// commits.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_event_and_its_log_line_exist_only_if_the_change_they_report_commits() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
     async fn written(db: &Client) -> DbResult<(i64, i64, String)> {
-        let role = db.query_one(role_of("usr_ann", "mail")).await?.get("role")?;
+        let role = db.query_one(role_of("usr_ann", "files")).await?.get("role")?;
         Ok((rows_of(db, Query::table("audit")).await?, rows_of(db, Query::table("outbox")).await?, role))
     }
 
@@ -3625,9 +3683,9 @@ async fn an_event_and_its_log_line_exist_only_if_the_change_they_report_commits(
     // and the log line with it.
     let failed = db
         .transaction(|tx| async move {
-            tx.insert(event("mail", "access:usr_nobody:member")).await?;
+            tx.insert(event("files", "access:usr_nobody:member")).await?;
             tx.insert(audit_entry(Some("usr_admin"), "access.put", Some("usr_nobody"), json!({}))).await?;
-            tx.insert(grant_role("usr_nobody", "mail", "member", "usr_admin")).await?;
+            tx.insert(grant_role("usr_nobody", "files", "member", "usr_admin")).await?;
             Ok::<_, DbError>(())
         })
         .await;
@@ -3642,20 +3700,20 @@ async fn an_event_and_its_log_line_exist_only_if_the_change_they_report_commits(
     let queued: Vec<String> = db.query(Query::table("outbox").columns(["token"])).await?.column()?;
     assert_eq!(queued, ["access:usr_ann:member", "access:usr_ann:owner"]);
 
-    // auth's own tests insert events and log lines with numbers far above
-    // the server's. The server carries on from there, and refuses a
+    // An event or a log line may be inserted with a number of its own, far
+    // above the server's. The server carries on from there, and refuses a
     // number that is taken.
-    db.insert(event("mail", "numbered").set("id", 1_000_000)).await?;
-    assert_eq!(db.insert(event("mail", "next").returning(["id"])).await?.one()?.get::<i64>("id")?, 1_000_001);
-    let err = db.insert(event("mail", "again").set("id", 1_000_000)).await.unwrap_err();
+    db.insert(event("files", "numbered").set("id", 1_000_000)).await?;
+    assert_eq!(db.insert(event("files", "next").returning(["id"])).await?.one()?.get::<i64>("id")?, 1_000_001);
+    let err = db.insert(event("files", "again").set("id", 1_000_000)).await.unwrap_err();
     assert!(err.is_unique_violation() && err.violates(PRIMARY), "{err}");
-    assert_eq!(db.insert(event("mail", "after").returning(["id"])).await?.one()?.get::<i64>("id")?, 1_000_002);
+    assert_eq!(db.insert(event("files", "after").returning(["id"])).await?.one()?.get::<i64>("id")?, 1_000_002);
     Ok(())
 }
 
-/// Q130: the log, newest first: the page before the line numbered
-/// `before`, of everyone's lines or of one user's. Both are a walk
-/// backwards, through the primary key or through `(user_id, id)`.
+/// The log, newest first: the page before the line numbered `before`, of
+/// everyone's lines or of one user's. Both are a walk backwards, through
+/// the primary key or through `(user_id, id)`.
 fn audit_page(user: &str, before: Option<i64>, page: u64) -> Query {
     let upper = before.map_or(Bound::Unbounded, |id| Bound::excluded([id]));
     let lines = if user.is_empty() {
@@ -3666,7 +3724,8 @@ fn audit_page(user: &str, before: Option<i64>, page: u64) -> Query {
     lines.reverse().limit(page).columns(["id", "at", "actor", "action", "user_id", "ip", "detail"])
 }
 
-// R-Q4, R-S5, R-T1, R-T6: auth Q129, Q130; §4.3, §4.8.
+// R-Q4, R-S5, R-T1, R-T6: keys the server numbers, 64-bit numbers as
+// cursors, an index walked backwards, and JSON kept whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_audit_log_is_numbered_by_the_server_and_paged_newest_first() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3678,7 +3737,7 @@ async fn the_audit_log_is_numbered_by_the_server_and_paged_newest_first() -> DbR
     }
     let after = db.now().await?;
 
-    // Q129: the number and the time are the server's.
+    // The number and the time are the server's.
     let lines = db.query(Query::table("audit")).await?;
     assert_eq!(column::<i64>(&lines, "id"), (1..=12).collect::<Vec<i64>>());
     let times = column::<Timestamp>(&lines, "at");
@@ -3690,10 +3749,10 @@ async fn the_audit_log_is_numbered_by_the_server_and_paged_newest_first() -> DbR
         (13, None, None, None)
     );
     assert_eq!(bare.get::<Json>("detail")?, json!({}));
-    // The detail comes back whole, as jsonb kept it: an object's members
-    // by the length of their names and then by bytes, at every depth; a
-    // list in the order it was written.
-    let detail = json!({"service": "mail", "uris": ["https://b.example", "https://a.example"], "by": "usr_admin", "nested": {"zz": 1, "a": null}});
+    // The detail comes back whole, as Postgres' jsonb keeps it: an object's
+    // members by the length of their names and then by bytes, at every
+    // depth; a list in the order it was written.
+    let detail = json!({"service": "files", "uris": ["https://b.example", "https://a.example"], "by": "usr_admin", "nested": {"zz": 1, "a": null}});
     db.insert(audit_entry(None, "service.update", None, detail)).await?;
     let line = db.query_one(audit_page("", None, 1)).await?;
     assert_eq!(line.columns(), ["id", "at", "actor", "action", "user_id", "ip", "detail"]);
@@ -3703,11 +3762,11 @@ async fn the_audit_log_is_numbered_by_the_server_and_paged_newest_first() -> DbR
     );
     assert_eq!(
         line.get::<Json>("detail")?.to_string(),
-        r#"{"by":"usr_admin","uris":["https://b.example","https://a.example"],"nested":{"a":null,"zz":1},"service":"mail"}"#
+        r#"{"by":"usr_admin","uris":["https://b.example","https://a.example"],"nested":{"a":null,"zz":1},"service":"files"}"#
     );
 
-    // Q130. The cursor is a number: 9 comes after 10, as it would not if
-    // the two were compared as text.
+    // The cursor is a number: 9 comes after 10, as it would not if the two
+    // were compared as text.
     let ids = |rows: Rows| column::<i64>(&rows, "id");
     assert_eq!(ids(db.query(audit_page("", None, 5)).await?), [14, 13, 12, 11, 10]);
     assert_eq!(ids(db.query(audit_page("", Some(10), 5)).await?), [9, 8, 7, 6, 5]);
@@ -3731,8 +3790,8 @@ async fn the_audit_log_is_numbered_by_the_server_and_paged_newest_first() -> DbR
     Ok(())
 }
 
-/// Q131: how often a user has signed in, and how often from this device.
-/// Run at every successful sign-in, over the user's lines only.
+/// How often a user has signed in, and how often from this device. Run at
+/// every successful sign-in, over the user's lines only.
 fn sign_in_history(user: &str, device: &str) -> Query {
     Query::table("audit")
         .index("audit_user", KeyRange::eq([user]))
@@ -3741,7 +3800,8 @@ fn sign_in_history(user: &str, device: &str) -> Query {
         .select("on_device", count().filter(col("detail").json_text(["device"]).eq(device)))
 }
 
-// R-Q11, R-Q13, R-T9: auth Q131.
+// R-Q11, R-Q13, R-T9: two counts in one pass over an index range, one of
+// them filtered on a member of a JSON column.
 #[tokio::test(flavor = "multi_thread")]
 async fn sign_in_history_counts_a_users_logins_and_those_from_one_device() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3783,18 +3843,18 @@ async fn sign_in_history_counts_a_users_logins_and_those_from_one_device() -> Db
     Ok(())
 }
 
-/// What Q133 and Q138 answer as `retry_after`: the seconds until the
+/// What the rate limiter answers as `retry_after`: the seconds until the
 /// key's window has passed, rounded up, and at least one.
 fn retry_after(window_seconds: i64) -> Expr {
     let left = (col("window_start") + seconds(window_seconds) - now()) / 1_000_000.0;
     greatest([val(1), call(Func::Ceil, [left])]).cast(Type::Int)
 }
 
-/// Q133: counts a hit against a key in one statement and answers with
-/// the count. The first hit starts a window; a hit after the window has
-/// passed starts a new one at 1. Both assignments read the row as it was,
-/// so the count's test of the window is not fooled by the window's own
-/// assignment before it.
+/// Counts a hit against a key in one statement and answers with the count.
+/// The first hit starts a window; a hit after the window has passed starts
+/// a new one at 1. Both assignments read the row as it was, so the count's
+/// test of the window is not fooled by the window's own assignment before
+/// it.
 fn hit(key: &str, window_seconds: i64) -> Insert {
     let passed = || col("window_start").le(now() - seconds(window_seconds));
     Insert::into("throttle")
@@ -3808,7 +3868,9 @@ fn hit(key: &str, window_seconds: i64) -> Insert {
         .returning_expr("retry_after", retry_after(window_seconds))
 }
 
-// R-Q16, R-S10, R-W4, R-X2, R-X3, R-X7: auth Q133; §7.5.
+// R-Q16, R-S10, R-W4, R-X2, R-X3, R-X7: an upsert on a volatile table whose
+// assignments all read the row as it was, and which counts every one of
+// twenty concurrent hits.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_rate_limiter_counts_a_hit_in_one_statement_and_restarts_a_window_that_has_passed() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3860,7 +3922,7 @@ async fn the_rate_limiter_counts_a_hit_in_one_statement_and_restarts_a_window_th
     let mut requests = Vec::new();
     for _ in 0..20 {
         let db = db.clone();
-        requests.push(tokio::spawn(async move { db.insert(hit("client:mail-web:token", 60)).await?.one()?.get::<i64>("hits") }));
+        requests.push(tokio::spawn(async move { db.insert(hit("client:files-web:token", 60)).await?.one()?.get::<i64>("hits") }));
     }
     let mut counts = Vec::new();
     for request in requests {
@@ -3871,8 +3933,8 @@ async fn the_rate_limiter_counts_a_hit_in_one_statement_and_restarts_a_window_th
     Ok(())
 }
 
-/// Q135: counts a failed sign-in, and restarts the clock its back-off is
-/// measured from.
+/// Counts a failed sign-in, and restarts the clock its back-off is measured
+/// from.
 fn failure(key: &str) -> Insert {
     Insert::into("throttle")
         .set("key", key)
@@ -3883,16 +3945,18 @@ fn failure(key: &str) -> Insert {
         .update("hits", col("hits") + 1)
 }
 
-/// Q134: how many seconds a login that keeps failing must still wait.
-/// Nothing for the first four failures; from the fifth a minute, doubled
-/// by each further one, up to a quarter of an hour.
+/// How many seconds a login that keeps failing must still wait. Nothing for
+/// the first four failures; from the fifth a minute, doubled by each
+/// further one, up to a quarter of an hour.
 fn back_off(key: &str) -> Query {
     let pause = least([val(60) * call(Func::Power, [val(2), col("hits") - 5]), val(900)]);
     let left = (col("window_start") + (pause * 1_000_000).cast(Type::Int) - now()) / 1_000_000.0;
     Query::table("throttle").key([key]).filter(col("hits").ge(5)).select("wait", greatest([val(0), call(Func::Ceil, [left])]).cast(Type::Int))
 }
 
-// R-Q16, R-W4, R-X7: auth Q134, Q135, Q136; §7.5.
+// R-Q16, R-W4, R-X7: an upsert that counts, and arithmetic with POWER,
+// LEAST, GREATEST and CEIL against a clock that stands still inside a
+// transaction.
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_failures_back_off_by_doubling_up_to_a_quarter_of_an_hour() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3920,8 +3984,8 @@ async fn repeated_failures_back_off_by_doubling_up_to_a_quarter_of_an_hour() -> 
     tx.commit().await?;
     assert_eq!(db.get("throttle", [key]).await?.expect("the key is counted").get::<i64>("hits")?, 10);
 
-    // As auth runs them, each statement on its own: the fifth failure
-    // costs about a minute.
+    // As the service runs them, each statement on its own: the fifth
+    // failure costs about a minute.
     let other = "login:user:usr_bob";
     for _ in 0..5 {
         assert_eq!(db.insert(failure(other)).await?.affected(), 1);
@@ -3929,7 +3993,7 @@ async fn repeated_failures_back_off_by_doubling_up_to_a_quarter_of_an_hour() -> 
     let wait: i64 = db.query_one(back_off(other)).await?.get("wait")?;
     assert!((55..=60).contains(&wait), "{wait} seconds");
 
-    // Q136: a sign-in that succeeds forgets the failures.
+    // A sign-in that succeeds forgets the failures.
     assert_eq!(db.delete(Delete::from("throttle").key([other])).await?.affected(), 1);
     assert!(db.query_opt(back_off(other)).await?.is_none());
     assert_eq!(db.delete(Delete::from("throttle").key([other])).await?.affected(), 0);
@@ -3938,14 +4002,15 @@ async fn repeated_failures_back_off_by_doubling_up_to_a_quarter_of_an_hour() -> 
     Ok(())
 }
 
-// R-Q16, R-W5, R-X3: auth Q137, Q138.
+// R-Q16, R-W5, R-X3: an insert that does nothing on a conflict tells the
+// first caller from the rest, also when five arrive together.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_once_only_key_goes_to_the_first_to_ask_and_a_count_can_be_read_without_counting() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
 
-    // Q137: a WebAuthn challenge may be answered once. The insert says
-    // whether this was the first time the key was seen.
+    // A WebAuthn challenge may be answered once. The insert says whether
+    // this was the first time the key was seen.
     let first_time =
         |key: &str| Insert::into("throttle").set("key", key).set("window_start", now()).set("hits", 1).on_conflict_do_nothing().returning(["key"]);
     let taken = db.insert(first_time("once:webauthn:challenge-1")).await?;
@@ -3967,8 +4032,7 @@ async fn a_once_only_key_goes_to_the_first_to_ask_and_a_count_can_be_read_withou
     }
     assert_eq!(accepted, 1);
 
-    // Q138: what a key's count is while its window lasts, without adding
-    // to it.
+    // What a key's count is while its window lasts, without adding to it.
     let peek = |key: &str| {
         Query::table("throttle")
             .key([key])
@@ -3977,24 +4041,24 @@ async fn a_once_only_key_goes_to_the_first_to_ask_and_a_count_can_be_read_withou
             .select("retry_after", retry_after(60))
     };
     for _ in 0..3 {
-        db.insert(hit("introspect:mail-web", 60)).await?;
+        db.insert(hit("introspect:files-web", 60)).await?;
     }
     for _ in 0..2 {
-        let seen = db.query_one(peek("introspect:mail-web")).await?;
+        let seen = db.query_one(peek("introspect:files-web")).await?;
         assert_eq!(seen.get::<i64>("hits")?, 3);
         assert!((55..=60).contains(&seen.get::<i64>("retry_after")?));
     }
-    db.update(Update::table("throttle").key(["introspect:mail-web"]).set("window_start", now() - seconds(60))).await?;
-    assert!(db.query_opt(peek("introspect:mail-web")).await?.is_none());
-    assert!(db.query_opt(peek("introspect:docs-web")).await?.is_none());
+    db.update(Update::table("throttle").key(["introspect:files-web"]).set("window_start", now() - seconds(60))).await?;
+    assert!(db.query_opt(peek("introspect:files-web")).await?.is_none());
+    assert!(db.query_opt(peek("introspect:chat-web")).await?.is_none());
     Ok(())
 }
 
-/// Q141: the revision and every service with its clients, in one read,
-/// so that all three come from one moment. The first join has no
-/// condition: the revision's row is paired with every service, and comes
-/// back alone when there is none. A service without clients comes back
-/// once, with NULL where a client's columns would be.
+/// The revision and every service with its clients, in one read, so that
+/// all three come from one moment. The first join has no condition: the
+/// revision's row is paired with every service, and comes back alone when
+/// there is none. A service without clients comes back once, with NULL
+/// where a client's columns would be.
 fn registry() -> Query {
     Query::table("services_revision")
         .alias("r")
@@ -4020,11 +4084,10 @@ fn registry() -> Query {
         .select("post_logout_redirect_uris", col("c.post_logout_redirect_uris"))
 }
 
-/// Registering a service (§3.2). The change is counted first (Q142),
-/// which in Postgres also made every other change to the services wait.
-/// Then the checks: the name is free (Q145), there is room for another
-/// service (Q146), each client's id is free (Q143). Then the rows (Q147,
-/// Q144) and the log (Q129). A refusal undoes the count as well.
+/// Registering a service. The change is counted first, which on Postgres
+/// also makes every other change to the services wait. Then the checks: the
+/// name is free, there is room for another service, each client's id is
+/// free. Then the rows and the log. A refusal undoes the count as well.
 async fn register_service(db: &Client, name: &str, clients: &[(&str, &str)]) -> DbResult<bool> {
     let tx = db.begin().await?;
     tx.update(bump_revision()).await?;
@@ -4046,8 +4109,9 @@ async fn register_service(db: &Client, name: &str, clients: &[(&str, &str)]) -> 
     Ok(true)
 }
 
-// R-Q9, R-Q11, R-Q21, R-T7, R-X1: auth Q129, Q141, Q142, Q143, Q144, Q145,
-// Q146, Q147; §3.2 (register a service), §7.3.
+// R-Q9, R-Q11, R-Q21, R-T7, R-X1: two left joins, the first without a
+// condition, read three tables at one moment, and lists of texts come back
+// as lists.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_registry_of_services_and_clients_is_loaded_whole_in_one_read() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4060,56 +4124,56 @@ async fn the_registry_of_services_and_clients_is_loaded_whole_in_one_read() -> D
     assert_eq!((empty.get::<i64>("revision")?, empty.get::<Option<String>>("name")?, empty.get::<Option<String>>("client_id")?), (0, None, None));
     assert_eq!(empty.get::<Option<Vec<String>>>("roles")?, None);
 
-    assert!(register_service(&db, "docs", &[("docs-web", "confidential")]).await?);
-    assert!(register_service(&db, "mail", &[("mail-web", "confidential"), ("mail-ios", "public")]).await?);
+    assert!(register_service(&db, "chat", &[("chat-web", "confidential")]).await?);
+    assert!(register_service(&db, "files", &[("files-web", "confidential"), ("files-ios", "public")]).await?);
     assert!(register_service(&db, "wiki", &[]).await?);
     // A name or a client id that is taken: refused, and nothing of the
     // attempt is left, not even the count of it.
-    assert!(!register_service(&db, "mail", &[("mail-tv", "public")]).await?);
-    assert!(!register_service(&db, "calendar", &[("calendar-web", "confidential"), ("mail-web", "confidential")]).await?);
+    assert!(!register_service(&db, "files", &[("files-tv", "public")]).await?);
+    assert!(!register_service(&db, "calendar", &[("calendar-web", "confidential"), ("files-web", "confidential")]).await?);
     assert_eq!(
         (rows_of(&db, Query::table("services")).await?, rows_of(&db, Query::table("clients")).await?, rows_of(&db, Query::table("audit")).await?),
         (3, 3, 3)
     );
-    assert_eq!(db.query_one(Query::table("clients").key(["mail-ios"]).columns(["service"])).await?.get::<String>("service")?, "mail");
+    assert_eq!(db.query_one(Query::table("clients").key(["files-ios"]).columns(["service"])).await?.get::<String>("service")?, "files");
 
-    // One row per client, and one for the service that has none. Every
-    // row carries the revision. The clients of mail were made in one
+    // One row per client, and one for the service that has none. Every row
+    // carries the revision. The two clients of one service were made in one
     // transaction, at one time, so their ids order them.
     let rows = db.query(registry()).await?;
     assert_eq!(column::<i64>(&rows, "revision"), [3, 3, 3, 3]);
-    assert_eq!(column::<Option<String>>(&rows, "name"), [some("docs"), some("mail"), some("mail"), some("wiki")]);
-    assert_eq!(column::<Option<String>>(&rows, "client_id"), [some("docs-web"), some("mail-ios"), some("mail-web"), None]);
+    assert_eq!(column::<Option<String>>(&rows, "name"), [some("chat"), some("files"), some("files"), some("wiki")]);
+    assert_eq!(column::<Option<String>>(&rows, "client_id"), [some("chat-web"), some("files-ios"), some("files-web"), None]);
     assert_eq!(column::<Option<String>>(&rows, "client_type"), [some("confidential"), some("public"), some("confidential"), None]);
     // Lists come back as lists, in the order written: a role's rank is
     // its place. An empty list is a list, and a missing client's is NULL.
-    let mail = rows.iter().nth(1).expect("mail has two rows");
-    assert_eq!(mail.get::<Vec<String>>("roles")?, ["admin", "member"]);
+    let files = rows.iter().nth(1).expect("the service has two rows");
+    assert_eq!(files.get::<Vec<String>>("roles")?, ["admin", "member"]);
     assert_eq!(
-        (mail.get::<Vec<String>>("mfa_roles")?, mail.get::<Vec<String>>("api_key_scopes")?),
+        (files.get::<Vec<String>>("mfa_roles")?, files.get::<Vec<String>>("api_key_scopes")?),
         (vec!["admin".to_string()], vec!["read".to_string(), "write".to_string()])
     );
-    assert_eq!(mail.get::<Vec<String>>("app_password_scopes")?, no_texts());
+    assert_eq!(files.get::<Vec<String>>("app_password_scopes")?, no_texts());
     assert_eq!(
-        (mail.get::<String>("signup")?, mail.get::<Option<String>>("default_role")?, mail.get::<bool>("manages_own_members")?),
+        (files.get::<String>("signup")?, files.get::<Option<String>>("default_role")?, files.get::<bool>("manages_own_members")?),
         ("invite".to_string(), some("member"), false)
     );
-    assert_eq!(mail.get::<Option<String>>("events_url")?, some("https://mail.example/events"));
-    assert_eq!(mail.get::<Vec<String>>("redirect_uris")?, ["https://mail.example/callback"]);
-    assert_eq!(mail.get::<Vec<String>>("post_logout_redirect_uris")?, no_texts());
+    assert_eq!(files.get::<Option<String>>("events_url")?, some("https://files.example/events"));
+    assert_eq!(files.get::<Vec<String>>("redirect_uris")?, ["https://files.example/callback"]);
+    assert_eq!(files.get::<Vec<String>>("post_logout_redirect_uris")?, no_texts());
     assert_eq!(column::<Option<Vec<String>>>(&rows, "redirect_uris")[3], None);
 
     // The order is by the time a service was made, then its name; within
     // a service by the time a client was made, then its id.
     db.update(Update::table("services").key(["wiki"]).set("created_at", now() - days(1))).await?;
-    db.update(Update::table("clients").key(["mail-web"]).set("created_at", now() - days(1))).await?;
+    db.update(Update::table("clients").key(["files-web"]).set("created_at", now() - days(1))).await?;
     let rows = db.query(registry()).await?;
-    assert_eq!(column::<Option<String>>(&rows, "name"), [some("wiki"), some("docs"), some("mail"), some("mail")]);
-    assert_eq!(column::<Option<String>>(&rows, "client_id"), [None, some("docs-web"), some("mail-web"), some("mail-ios")]);
+    assert_eq!(column::<Option<String>>(&rows, "name"), [some("wiki"), some("chat"), some("files"), some("files")]);
+    assert_eq!(column::<Option<String>>(&rows, "client_id"), [None, some("chat-web"), some("files-web"), some("files-ios")]);
     Ok(())
 }
 
-/// Q29: how many members of a service hold each of these roles.
+/// How many members of a service hold each of these roles.
 fn members_by_role(service: &str, roles: Vec<&str>) -> Query {
     Query::table("access")
         .index("access_service", KeyRange::eq([service]))
@@ -4120,8 +4184,7 @@ fn members_by_role(service: &str, roles: Vec<&str>) -> Query {
         .order_by(col("role"))
 }
 
-/// Q103: how many open invitations to a service promise each of these
-/// roles.
+/// How many open invitations to a service promise each of these roles.
 fn invited_by_role(service: &str, roles: Vec<&str>) -> Query {
     Query::table("invites")
         .index("invites_service", KeyRange::eq([service]))
@@ -4132,9 +4195,9 @@ fn invited_by_role(service: &str, roles: Vec<&str>) -> Query {
         .order_by(col("role"))
 }
 
-/// What goes with a client (Q95, Q75, Q80): its secrets and its refresh
-/// tokens are revoked, its codes deleted. None of the three has a foreign
-/// key to `clients`, because a client may be declared in a file instead.
+/// What goes with a client: its secrets and its refresh tokens are revoked,
+/// its codes deleted. None of the three has a foreign key to `clients`,
+/// because a client may be declared in a file instead.
 async fn retire_client(tx: &Transaction, client: &str) -> DbResult<(u64, u64, u64)> {
     let live_secrets = Query::table("client_secrets").range(KeyRange::eq([client])).filter(col("revoked_at").is_null());
     let secrets = tx.update(Update::rows(live_secrets).set("revoked_at", now())).await?;
@@ -4145,67 +4208,66 @@ async fn retire_client(tx: &Transaction, client: &str) -> DbResult<(u64, u64, u6
     Ok((secrets.affected(), tokens.affected(), codes.affected()))
 }
 
-// R-Q6, R-Q11, R-W6, R-W10, R-X1: auth Q29, Q75, Q79, Q80, Q95, Q103, Q129,
-// Q142, Q143, Q144, Q148, Q149, Q150, Q151, Q152; §3.2 (replace a service),
-// §7.3.
+// R-Q6, R-Q11, R-W6, R-W10, R-X1: counts by group over an index range, and
+// one transaction that reads, updates, deletes and inserts in many tables.
 #[tokio::test(flavor = "multi_thread")]
 async fn replacing_a_service_changes_it_and_its_clients_and_what_hung_on_them_together() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    assert!(register_service(&db, "mail", &[("mail-web", "confidential"), ("mail-old", "confidential")]).await?);
-    assert!(register_service(&db, "docs", &[("docs-web", "confidential")]).await?);
-    db.update(Update::table("clients").key(["mail-web"]).set("redirect_uris", vec!["https://mail.example/callback", "https://mail.example/old"]))
+    assert!(register_service(&db, "files", &[("files-web", "confidential"), ("files-old", "confidential")]).await?);
+    assert!(register_service(&db, "chat", &[("chat-web", "confidential")]).await?);
+    db.update(Update::table("clients").key(["files-web"]).set("redirect_uris", vec!["https://files.example/callback", "https://files.example/old"]))
         .await?;
     for (id, username, role) in [("usr_ann", "ann", "admin"), ("usr_bob", "bob", "member"), ("usr_cy", "cy", "member")] {
         db.insert(person(id, username, None)).await?;
-        db.insert(grant_role(id, "mail", role, "usr_admin")).await?;
+        db.insert(grant_role(id, "files", role, "usr_admin")).await?;
     }
-    db.insert(grant_role("usr_ann", "docs", "admin", "usr_admin")).await?;
+    db.insert(grant_role("usr_ann", "chat", "admin", "usr_admin")).await?;
     for (id, service, role, lifetime) in [
-        ("inv_1", "mail", "member", 3600),
-        ("inv_2", "mail", "member", -1),
-        ("inv_3", "mail", "admin", 3600),
-        ("inv_4", "mail", "admin", 3600),
-        ("inv_5", "docs", "admin", 3600),
+        ("inv_1", "files", "member", 3600),
+        ("inv_2", "files", "member", -1),
+        ("inv_3", "files", "admin", 3600),
+        ("inv_4", "files", "admin", 3600),
+        ("inv_5", "chat", "admin", 3600),
     ] {
         db.insert(new_invite(id, "someone@example.com", service, role, id, lifetime)).await?;
     }
     db.update(accept_invite("inv_3", "usr_ann")).await?;
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
-    for (token, client) in [("web-1", "mail-web"), ("old-1", "mail-old"), ("old-2", "mail-old"), ("docs-1", "docs-web")] {
+    for (token, client) in [("web-1", "files-web"), ("old-1", "files-old"), ("old-2", "files-old"), ("chat-1", "chat-web")] {
         db.insert(session_token(token, client, "ses_1")).await?;
     }
     db.update(Update::table("refresh_tokens").key([digest("old-2")]).set("revoked_at", now() - hours(1))).await?;
     let revoked_before: Timestamp = refresh_token(&db, "old-2").await?.expect("the token is there").get("revoked_at")?;
     for (code, client, redirect_uri) in [
-        ("code-kept", "mail-web", "callback"),
-        ("code-dropped", "mail-web", "old"),
-        ("code-old", "mail-old", "callback"),
-        ("code-docs", "docs-web", "callback"),
+        ("code-kept", "files-web", "callback"),
+        ("code-dropped", "files-web", "old"),
+        ("code-old", "files-old", "callback"),
+        ("code-chat", "chat-web", "callback"),
     ] {
         db.insert(new_code(code, client, "ses_1", 60)).await?;
-        db.update(Update::table("auth_codes").key([digest(code)]).set("redirect_uri", format!("https://mail.example/{redirect_uri}"))).await?;
+        db.update(Update::table("auth_codes").key([digest(code)]).set("redirect_uri", format!("https://files.example/{redirect_uri}"))).await?;
     }
-    for (client, secret) in [("mail-web", "s-web"), ("mail-old", "s-old"), ("docs-web", "s-docs")] {
+    for (client, secret) in [("files-web", "s-web"), ("files-old", "s-old"), ("chat-web", "s-chat")] {
         db.insert(new_secret(client, secret)).await?;
     }
 
-    // Q29 and Q103: before roles are dropped, auth counts who holds them
-    // and who was promised them. One row per role that anyone has; an
-    // expired or accepted invitation promises nothing.
+    // Before a role is dropped, those who hold it and those who were
+    // promised it are counted. One row per role that anyone has; an expired
+    // or accepted invitation promises nothing.
     let counted = |rows: Rows| rows.map::<(String, i64)>();
     let asked = || vec!["admin", "member", "guest"];
-    assert_eq!(counted(db.query(members_by_role("mail", asked())).await?)?, [("admin".to_string(), 1), ("member".to_string(), 2)]);
-    assert_eq!(counted(db.query(invited_by_role("mail", asked())).await?)?, [("admin".to_string(), 1), ("member".to_string(), 1)]);
-    assert_eq!(counted(db.query(members_by_role("mail", vec!["member"])).await?)?, [("member".to_string(), 2)]);
+    assert_eq!(counted(db.query(members_by_role("files", asked())).await?)?, [("admin".to_string(), 1), ("member".to_string(), 2)]);
+    assert_eq!(counted(db.query(invited_by_role("files", asked())).await?)?, [("admin".to_string(), 1), ("member".to_string(), 1)]);
+    assert_eq!(counted(db.query(members_by_role("files", vec!["member"])).await?)?, [("member".to_string(), 2)]);
     assert!(db.query(members_by_role("wiki", asked())).await?.is_empty());
 
     let dropped = db
         .transaction(|tx| async move {
             tx.update(bump_revision()).await?;
-            // Q148 and Q149: the service and its clients as they stand,
-            // the clients oldest first. Nothing can change them before
-            // this transaction ends, which Postgres needed row locks for.
+            // The service and its clients as they stand, the clients oldest
+            // first. Nothing can change them before this transaction ends,
+            // which Postgres needs row locks for.
             let service_columns = [
                 "name",
                 "roles",
@@ -4217,88 +4279,91 @@ async fn replacing_a_service_changes_it_and_its_clients_and_what_hung_on_them_to
                 "app_password_scopes",
                 "events_url",
             ];
-            let current = tx.query_one(Query::table("services").key(["mail"]).columns(service_columns)).await?;
+            let current = tx.query_one(Query::table("services").key(["files"]).columns(service_columns)).await?;
             assert_eq!(current.get::<Vec<String>>("roles")?, ["admin", "member"]);
             let client_columns = ["id", "type", "redirect_uris", "post_logout_redirect_uris"];
             let clients = tx
                 .query(
                     Query::table("clients")
-                        .index("clients_service", KeyRange::eq(["mail"]))
+                        .index("clients_service", KeyRange::eq(["files"]))
                         .order_by(col("created_at"))
                         .order_by(col("id"))
                         .columns(client_columns),
                 )
                 .await?;
-            assert_eq!(column::<String>(&clients, "id"), ["mail-old", "mail-web"]);
-            // Q143, Q29, Q103: the new client's id is free, and the role
-            // that goes is neither held nor promised.
-            assert!(tx.query_opt(Query::table("clients").key(["mail-app"]).columns(["service"])).await?.is_none());
-            assert!(tx.query(members_by_role("mail", vec!["guest"])).await?.is_empty());
-            assert!(tx.query(invited_by_role("mail", vec!["guest"])).await?.is_empty());
+            assert_eq!(column::<String>(&clients, "id"), ["files-old", "files-web"]);
+            // The new client's id is free, and the role that goes is
+            // neither held nor promised.
+            assert!(tx.query_opt(Query::table("clients").key(["files-app"]).columns(["service"])).await?.is_none());
+            assert!(tx.query(members_by_role("files", vec!["guest"])).await?.is_empty());
+            assert!(tx.query(invited_by_role("files", vec!["guest"])).await?.is_empty());
 
-            // Q150.
+            // The service's new definition.
             let redefined = Update::table("services")
-                .key(["mail"])
+                .key(["files"])
                 .set("roles", vec!["owner", "admin", "member"])
                 .set("mfa_roles", vec!["owner", "admin"])
                 .set("signup", "open")
                 .set("default_role", null())
                 .set("manages_own_members", true)
                 .set("api_key_scopes", no_texts())
-                .set("app_password_scopes", vec!["imap"])
-                .set("events_url", "https://mail.example/hooks")
+                .set("app_password_scopes", vec!["webdav"])
+                .set("events_url", "https://files.example/hooks")
                 .set("updated_at", now());
             assert_eq!(tx.update(redefined).await?.affected(), 1);
-            // The client that goes (Q95, Q75, Q80, then Q151).
-            let retired = retire_client(&tx, "mail-old").await?;
-            assert_eq!(tx.delete(Delete::from("clients").key(["mail-old"])).await?.affected(), 1);
-            // The client that stays loses a redirect URI (Q152), and the
-            // codes issued for that URI (Q79).
+            // The client that goes, after what hung on it.
+            let retired = retire_client(&tx, "files-old").await?;
+            assert_eq!(tx.delete(Delete::from("clients").key(["files-old"])).await?.affected(), 1);
+            // The client that stays loses a redirect URI, and the codes
+            // issued for that URI.
             tx.update(
                 Update::table("clients")
-                    .key(["mail-web"])
-                    .set("redirect_uris", vec!["https://mail.example/callback"])
-                    .set("post_logout_redirect_uris", vec!["https://mail.example/bye"]),
+                    .key(["files-web"])
+                    .set("redirect_uris", vec!["https://files.example/callback"])
+                    .set("post_logout_redirect_uris", vec!["https://files.example/bye"]),
             )
             .await?;
-            let stale =
-                Delete::from("auth_codes").filter(col("client_id").eq("mail-web").and(col("redirect_uri").in_list(vec!["https://mail.example/old"])));
+            let stale = Delete::from("auth_codes")
+                .filter(col("client_id").eq("files-web").and(col("redirect_uri").in_list(vec!["https://files.example/old"])));
             let stale = tx.delete(stale).await?.affected();
-            // The client that is new (Q144), and the log.
-            tx.insert(new_client("mail-app", "mail", "public")).await?;
-            tx.insert(audit_entry(Some("usr_admin"), "service.update", None, json!({"service": "mail"}))).await?;
+            // The client that is new, and the log.
+            tx.insert(new_client("files-app", "files", "public")).await?;
+            tx.insert(audit_entry(Some("usr_admin"), "service.update", None, json!({"service": "files"}))).await?;
             Ok::<_, DbError>((retired, stale))
         })
         .await?;
     assert_eq!(dropped, ((1, 1, 1), 1));
 
-    let mail = db.get("services", ["mail"]).await?.expect("mail is there");
-    assert_eq!(mail.get::<Vec<String>>("roles")?, ["owner", "admin", "member"]);
+    let files = db.get("services", ["files"]).await?.expect("the service is there");
+    assert_eq!(files.get::<Vec<String>>("roles")?, ["owner", "admin", "member"]);
     assert_eq!(
-        (mail.get::<String>("signup")?, mail.get::<Option<String>>("default_role")?, mail.get::<bool>("manages_own_members")?),
+        (files.get::<String>("signup")?, files.get::<Option<String>>("default_role")?, files.get::<bool>("manages_own_members")?),
         ("open".to_string(), None, true)
     );
-    assert_eq!((mail.get::<Vec<String>>("api_key_scopes")?, mail.get::<Vec<String>>("app_password_scopes")?), (no_texts(), vec!["imap".to_string()]));
-    assert!(mail.get::<Timestamp>("updated_at")? > mail.get::<Timestamp>("created_at")?);
-    assert!(!mail.get::<bool>("held")?);
+    assert_eq!(
+        (files.get::<Vec<String>>("api_key_scopes")?, files.get::<Vec<String>>("app_password_scopes")?),
+        (no_texts(), vec!["webdav".to_string()])
+    );
+    assert!(files.get::<Timestamp>("updated_at")? > files.get::<Timestamp>("created_at")?);
+    assert!(!files.get::<bool>("held")?);
     assert_eq!(db.query_one(Query::table("services_revision")).await?.get::<i64>("revision")?, 3);
 
     assert_eq!(
-        sorted(&db, Query::table("clients").index("clients_service", KeyRange::eq(["mail"])).columns(["id"])).await?,
-        ["mail-app", "mail-web"]
+        sorted(&db, Query::table("clients").index("clients_service", KeyRange::eq(["files"])).columns(["id"])).await?,
+        ["files-app", "files-web"]
     );
-    let web = db.get("clients", ["mail-web"]).await?.expect("the client is there");
+    let web = db.get("clients", ["files-web"]).await?.expect("the client is there");
     assert_eq!(
         (web.get::<Vec<String>>("redirect_uris")?, web.get::<Vec<String>>("post_logout_redirect_uris")?),
-        (vec!["https://mail.example/callback".to_string()], vec!["https://mail.example/bye".to_string()])
+        (vec!["https://files.example/callback".to_string()], vec!["https://files.example/bye".to_string()])
     );
 
     // Of the client that went: the secret and the live token are kept,
     // revoked at the time of the change; the token revoked earlier keeps
     // its own time; the code is gone.
-    let changed: Timestamp = mail.get("updated_at")?;
+    let changed: Timestamp = files.get("updated_at")?;
     assert_eq!(
-        db.query_one(Query::table("client_secrets").key([val("mail-old"), val(digest("s-old"))])).await?.get::<Option<Timestamp>>("revoked_at")?,
+        db.query_one(Query::table("client_secrets").key([val("files-old"), val(digest("s-old"))])).await?.get::<Option<Timestamp>>("revoked_at")?,
         Some(changed)
     );
     assert_eq!(refresh_token(&db, "old-1").await?.expect("the token is kept").get::<Option<Timestamp>>("revoked_at")?, Some(changed));
@@ -4308,24 +4373,23 @@ async fn replacing_a_service_changes_it_and_its_clients_and_what_hung_on_them_to
     // for the dropped URI is gone.
     assert!(db.get("auth_codes", [digest("code-dropped")]).await?.is_none());
     assert!(db.get("auth_codes", [digest("code-kept")]).await?.is_some());
-    assert!(db.get("auth_codes", [digest("code-docs")]).await?.is_some());
+    assert!(db.get("auth_codes", [digest("code-chat")]).await?.is_some());
     assert!(refresh_token(&db, "web-1").await?.expect("the token is there").is_null("revoked_at")?);
-    assert!(refresh_token(&db, "docs-1").await?.expect("the token is there").is_null("revoked_at")?);
+    assert!(refresh_token(&db, "chat-1").await?.expect("the token is there").is_null("revoked_at")?);
     assert_eq!(rows_of(&db, Query::table("client_secrets").filter(col("revoked_at").is_null())).await?, 2);
     assert_eq!(rows_of(&db, Query::table("access")).await?, 4);
     Ok(())
 }
 
-/// Deleting a service (§3.2, §7.3). What points at a service by name has
-/// no foreign key, so auth removes or revokes it by hand: roles (Q30),
-/// invitations (Q104), credentials (Q90), undelivered events (Q127), and
-/// what hangs on each client. Only the clients themselves go with the
-/// service's row (Q155).
+/// Deleting a service. What points at a service by name has no foreign key,
+/// so it is removed or revoked by hand: roles, invitations, credentials,
+/// undelivered events, and what hangs on each client. Only the clients
+/// themselves go with the service's row.
 async fn delete_service(db: &Client, name: &str) -> DbResult<bool> {
     let tx = db.begin().await?;
     tx.update(bump_revision()).await?;
-    // Q153, and Q154: its clients in a fixed order, which mattered when
-    // each row was locked as it was read.
+    // The service, and its clients in a fixed order, which matters where
+    // each row is locked as it is read.
     if tx.query_opt(Query::table("services").key([name]).columns(["name"])).await?.is_none() {
         tx.rollback().await?;
         return Ok(false);
@@ -4345,17 +4409,17 @@ async fn delete_service(db: &Client, name: &str) -> DbResult<bool> {
     Ok(gone == 1)
 }
 
-// R-S6, R-W6, R-W10, R-X1: auth Q30, Q75, Q80, Q90, Q95, Q104, Q127, Q129,
-// Q142, Q153, Q154, Q155; §3.2 (delete a service), §7.3.
+// R-S6, R-W6, R-W10, R-X1: deletes and updates of many rows by index and by
+// filter in one transaction, beside the one cascade a foreign key does.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_service_cleans_up_by_hand_what_no_foreign_key_reaches() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    assert!(register_service(&db, "mail", &[("mail-web", "confidential"), ("mail-ios", "public")]).await?);
-    assert!(register_service(&db, "docs", &[("docs-web", "confidential")]).await?);
+    assert!(register_service(&db, "files", &[("files-web", "confidential"), ("files-ios", "public")]).await?);
+    assert!(register_service(&db, "chat", &[("chat-web", "confidential")]).await?);
     db.insert(person("usr_ann", "ann", None)).await?;
     db.insert(new_session("ses_1", "usr_ann", "cookie-1")).await?;
-    for service in ["mail", "docs"] {
+    for service in ["files", "chat"] {
         let client = format!("{service}-web");
         db.insert(grant_role("usr_ann", service, "member", "usr_admin")).await?;
         db.insert(new_invite(&format!("inv_{service}"), "someone@example.com", service, "member", &format!("invite-{service}"), 3600)).await?;
@@ -4367,7 +4431,7 @@ async fn deleting_a_service_cleans_up_by_hand_what_no_foreign_key_reaches() -> D
         db.insert(session_token(&format!("token-{service}"), &client, "ses_1")).await?;
         db.insert(new_code(&format!("code-{service}"), &client, "ses_1", 60)).await?;
     }
-    db.insert(public_token("token-ios", "ses_ios", "usr_ann", "mail-ios")).await?;
+    db.insert(public_token("token-ios", "ses_ios", "usr_ann", "files-ios")).await?;
     async fn left(db: &Client, service: &str) -> DbResult<Vec<i64>> {
         let client = format!("{service}-web");
         let key = Query::table("credentials").key([format!("key_{service}")]);
@@ -4384,60 +4448,61 @@ async fn deleting_a_service_cleans_up_by_hand_what_no_foreign_key_reaches() -> D
             rows_of(db, Query::table("auth_codes").filter(col("client_id").eq(client.as_str()))).await?,
         ])
     }
-    assert_eq!(left(&db, "mail").await?, [1, 2, 1, 1, 1, 1, 3, 1, 1, 1]);
+    assert_eq!(left(&db, "files").await?, [1, 2, 1, 1, 1, 1, 3, 1, 1, 1]);
 
-    assert!(delete_service(&db, "mail").await?);
+    assert!(delete_service(&db, "files").await?);
     // The service and both its clients are gone, with its roles, its
     // invitation, its undelivered event and its client's code. The
     // credential, the secret and the tokens are kept, revoked. Events
     // already delivered or given up stay for the record.
-    assert_eq!(left(&db, "mail").await?, [0, 0, 0, 0, 1, 0, 2, 0, 0, 0]);
-    assert_eq!(sorted(&db, Query::table("outbox").filter(col("service").eq("mail")).columns(["token"])).await?, ["delivered", "given-up"]);
-    assert_eq!(rows_of(&db, Query::table("client_secrets").range(KeyRange::eq(["mail-web"]))).await?, 1);
-    assert!(!refresh_token(&db, "token-mail").await?.expect("the token is kept").is_null("revoked_at")?);
+    assert_eq!(left(&db, "files").await?, [0, 0, 0, 0, 1, 0, 2, 0, 0, 0]);
+    assert_eq!(sorted(&db, Query::table("outbox").filter(col("service").eq("files")).columns(["token"])).await?, ["delivered", "given-up"]);
+    assert_eq!(rows_of(&db, Query::table("client_secrets").range(KeyRange::eq(["files-web"]))).await?, 1);
+    assert!(!refresh_token(&db, "token-files").await?.expect("the token is kept").is_null("revoked_at")?);
     assert!(!refresh_token(&db, "token-ios").await?.expect("the token is kept").is_null("revoked_at")?);
     // The other service has everything it had.
-    assert_eq!(left(&db, "docs").await?, [1, 1, 1, 1, 1, 1, 3, 1, 1, 1]);
+    assert_eq!(left(&db, "chat").await?, [1, 1, 1, 1, 1, 1, 3, 1, 1, 1]);
     assert_eq!(db.query_one(Query::table("services_revision")).await?.get::<i64>("revision")?, 3);
     let logged = db.query_one(Query::table("audit").filter(col("action").eq("service.delete"))).await?;
-    assert_eq!(logged.get::<Json>("detail")?, json!({"service": "mail", "clients": ["mail-ios", "mail-web"]}));
+    assert_eq!(logged.get::<Json>("detail")?, json!({"service": "files", "clients": ["files-ios", "files-web"]}));
 
     // A service that is not there: nothing happens, and the count of
     // changes stays where it was.
-    assert!(!delete_service(&db, "mail").await?);
+    assert!(!delete_service(&db, "files").await?);
     assert_eq!(db.query_one(Query::table("services_revision")).await?.get::<i64>("revision")?, 3);
     Ok(())
 }
 
-// R-Q6, R-Q14, R-W7, R-X3: auth Q129, Q156, Q157, Q158; §3.2 (note held
-// services).
+// R-Q6, R-Q14, R-W7, R-X3: a list column compared with a list, an update of
+// several keys at once, and an update that returns each row it changed to
+// one caller only.
 #[tokio::test(flavor = "multi_thread")]
 async fn held_services_are_flagged_and_their_release_is_reported_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    for name in ["mail", "docs", "wiki"] {
+    for name in ["files", "chat", "wiki"] {
         db.insert(new_service(name, "invite")).await?;
     }
-    db.update(Update::table("services").key(["docs"]).set("api_key_scopes", no_texts())).await?;
+    db.update(Update::table("services").key(["chat"]).set("api_key_scopes", no_texts())).await?;
 
-    // Q156: the services that issue API keys, which are those whose list
-    // of scopes for them is not the empty list.
+    // The services that issue API keys, which are those whose list of
+    // scopes for them is not the empty list.
     let issuing = db.query(Query::table("services").filter(col("api_key_scopes").ne(no_texts())).columns(["name"])).await?;
-    assert_eq!(issuing.column::<String>()?, ["mail", "wiki"]);
+    assert_eq!(issuing.column::<String>()?, ["files", "wiki"]);
 
-    // Q157: of the services named, those not yet held are held now.
+    // Of the services named, those not yet held are held now.
     let hold = |names: Vec<&str>| {
         Update::rows(Query::table("services").keys(names.into_iter().map(|name| [name])).filter(col("held").not())).set("held", true)
     };
-    assert_eq!(db.update(hold(vec!["mail", "docs", "calendar"])).await?.affected(), 2);
-    assert_eq!(db.update(hold(vec!["mail", "docs"])).await?.affected(), 0);
+    assert_eq!(db.update(hold(vec!["files", "chat", "calendar"])).await?.affected(), 2);
+    assert_eq!(db.update(hold(vec!["files", "chat"])).await?.affected(), 0);
     let held = |rows: Rows| rows.map::<(String, bool)>();
     let flags = Query::table("services").columns(["name", "held"]);
-    assert_eq!(held(db.query(flags.clone()).await?)?, [("docs".to_string(), true), ("mail".to_string(), true), ("wiki".to_string(), false)]);
+    assert_eq!(held(db.query(flags.clone()).await?)?, [("chat".to_string(), true), ("files".to_string(), true), ("wiki".to_string(), false)]);
 
-    // Q158: at start-up every process releases the services that are no
-    // longer held and logs each release. Three start together: each
-    // service is named to exactly one of them, and logged once.
+    // At start-up every process releases the services that are no longer
+    // held and logs each release. Three start together: each service is
+    // named to exactly one of them, and logged once.
     let release =
         |names: Vec<&str>| Update::table("services").filter(col("name").in_list(names).and(col("held"))).set("held", false).returning(["name"]);
     let mut starts = Vec::new();
@@ -4445,7 +4510,7 @@ async fn held_services_are_flagged_and_their_release_is_reported_once() -> DbRes
         let db = db.clone();
         starts.push(tokio::spawn(async move {
             db.transaction(|tx| async move {
-                let released: Vec<String> = tx.update(release(vec!["mail", "docs", "wiki"])).await?.column()?;
+                let released: Vec<String> = tx.update(release(vec!["files", "chat", "wiki"])).await?.column()?;
                 for name in &released {
                     tx.insert(audit_entry(None, "service.released", None, json!({"service": name}))).await?;
                 }
@@ -4459,29 +4524,31 @@ async fn held_services_are_flagged_and_their_release_is_reported_once() -> DbRes
         released.extend(start.await.expect("the task ran")?);
     }
     released.sort();
-    assert_eq!(released, ["docs", "mail"]);
+    assert_eq!(released, ["chat", "files"]);
     assert_eq!(rows_of(&db, Query::table("audit")).await?, 2);
     assert!(held(db.query(flags).await?)?.iter().all(|(_, held)| !held));
     Ok(())
 }
 
-// R-X2, R-X8: auth Q24, Q142, Q150, Q155, Q159, Q160; §3.3 (shared row locks).
+// R-X2, R-X8: a writing transaction keeps every other writer waiting until
+// it ends, where SQL would take shared row locks, and keeps no reader
+// waiting.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grant_and_a_change_to_its_service_never_overlap() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    db.insert(new_service("mail", "invite")).await?;
-    db.insert(new_service("docs", "invite")).await?;
-    db.insert(new_client("mail-web", "mail", "confidential")).await?;
+    db.insert(new_service("files", "invite")).await?;
+    db.insert(new_service("chat", "invite")).await?;
+    db.insert(new_client("files-web", "files", "confidential")).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
 
-    // A grant checks the role against the service's definition (Q159),
-    // then writes. Postgres held a shared lock on the service's row in
-    // between, so that the definition could not change or vanish under
-    // it. Here the grant's transaction holds the write lock.
+    // A grant checks the role against the service's definition, then
+    // writes. Postgres would hold a shared lock on the service's row in
+    // between, so that the definition cannot change or vanish under it.
+    // Here the grant's transaction holds the write lock.
     let grant = db.begin().await?;
     let service = grant
-        .query_one(Query::table("services").key(["mail"]).columns([
+        .query_one(Query::table("services").key(["files"]).columns([
             "roles",
             "mfa_roles",
             "signup",
@@ -4491,37 +4558,37 @@ async fn a_grant_and_a_change_to_its_service_never_overlap() -> DbResult<()> {
         ]))
         .await?;
     assert!(service.get::<Vec<String>>("roles")?.contains(&"member".to_string()));
-    assert_eq!(grant.query(Query::table("clients").key(["mail-web"]).filter(col("service").eq("mail")).select("one", 1)).await?.len(), 1);
+    assert_eq!(grant.query(Query::table("clients").key(["files-web"]).filter(col("service").eq("files")).select("one", 1)).await?.len(), 1);
 
     // Another process deletes the service at that moment: it waits.
     let other = db.clone();
-    let removal = tokio::spawn(async move { other.delete(Delete::from("services").key(["mail"])).await.map(|rows| rows.affected()) });
+    let removal = tokio::spawn(async move { other.delete(Delete::from("services").key(["files"])).await.map(|rows| rows.affected()) });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!removal.is_finished(), "a change to the service waits for the grant");
     // Readers wait for neither, and see what is committed.
     assert_eq!(rows_of(&db, Query::table("services")).await?, 2);
-    assert!(db.query_opt(role_of("usr_ann", "mail")).await?.is_none());
+    assert!(db.query_opt(role_of("usr_ann", "files")).await?.is_none());
 
-    grant.insert(grant_role("usr_ann", "mail", "member", "usr_admin")).await?;
+    grant.insert(grant_role("usr_ann", "files", "member", "usr_admin")).await?;
     grant.commit().await?;
     assert_eq!(removal.await.expect("the task ran")?, 1);
     assert_eq!((rows_of(&db, Query::table("services")).await?, rows_of(&db, Query::table("clients")).await?), (1, 0));
-    assert_eq!(db.query_one(role_of("usr_ann", "mail")).await?.get::<String>("role")?, "member");
+    assert_eq!(db.query_one(role_of("usr_ann", "files")).await?.get::<String>("role")?, "member");
 
     // The other way round: while a change to a service is open, a grant
     // waits, and then judges by the service as changed.
     let change = db.begin().await?;
     change.update(bump_revision()).await?;
-    change.update(Update::table("services").key(["docs"]).set("roles", vec!["owner"]).set("updated_at", now())).await?;
+    change.update(Update::table("services").key(["chat"]).set("roles", vec!["owner"]).set("updated_at", now())).await?;
     let other = db.clone();
     let late_grant = tokio::spawn(async move {
         other
             .transaction(|tx| async move {
-                let roles: Vec<String> = tx.query_one(Query::table("services").key(["docs"]).columns(["roles"])).await?.get("roles")?;
+                let roles: Vec<String> = tx.query_one(Query::table("services").key(["chat"]).columns(["roles"])).await?.get("roles")?;
                 if !roles.contains(&"member".to_string()) {
                     return Ok(false);
                 }
-                tx.insert(grant_role("usr_ann", "docs", "member", "usr_admin")).await?;
+                tx.insert(grant_role("usr_ann", "chat", "member", "usr_admin")).await?;
                 Ok::<_, DbError>(true)
             })
             .await
@@ -4530,19 +4597,19 @@ async fn a_grant_and_a_change_to_its_service_never_overlap() -> DbResult<()> {
     assert!(!late_grant.is_finished(), "the grant waits for the change");
     change.commit().await?;
     assert!(!late_grant.await.expect("the task ran")?);
-    assert!(db.query_opt(role_of("usr_ann", "docs")).await?.is_none());
+    assert!(db.query_opt(role_of("usr_ann", "chat")).await?.is_none());
     Ok(())
 }
 
-/// auth's hourly housekeeping (§3.2, §5): eight deletes in one
-/// transaction, each for rows that expired long enough ago. Only one
-/// process runs it at a time and the others skip the pass, for which
-/// Postgres had a try-lock that lasted as long as the transaction. A
-/// writing transaction here would wait instead of skipping, so the pass
-/// is put inside a named lock that is only tried. Answers with what each
-/// delete removed, or `None` if another process was at it.
+/// The hourly housekeeping: eight deletes in one transaction, each for rows
+/// that expired long enough ago. Only one process runs it at a time and the
+/// others skip the pass, for which Postgres has a try-lock that lasts as
+/// long as the transaction. A writing transaction here would wait instead
+/// of skipping, so the pass is put inside a named lock that is only tried.
+/// Answers with what each delete removed, or `None` if another process was
+/// at it.
 async fn housekeeping(db: &Client, audit_days: i64) -> DbResult<Option<[u64; 8]>> {
-    let Some(lock) = db.try_lock("auth.housekeeping").await? else {
+    let Some(lock) = db.try_lock("app.housekeeping").await? else {
         return Ok(None);
     };
     let passes = [
@@ -4565,8 +4632,8 @@ async fn housekeeping(db: &Client, audit_days: i64) -> DbResult<Option<[u64; 8]>
     Ok(Some(removed))
 }
 
-// R-Q8, R-S4, R-S6, R-T9, R-W10, R-X1, R-X5: auth Q62, Q76, Q81, Q105, Q113,
-// Q128, Q132, Q139, Q166; §3.2 (housekeeping), §5.
+// R-Q8, R-S4, R-S6, R-T9, R-W10, R-X1, R-X5: eight filtered deletes in one
+// transaction, under a named lock that is tried and not waited for.
 #[tokio::test(flavor = "multi_thread")]
 async fn housekeeping_deletes_in_one_pass_what_expired_long_enough_ago() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4575,8 +4642,8 @@ async fn housekeeping_deletes_in_one_pass_what_expired_long_enough_ago() -> DbRe
     // For each rule a row just past its limit and one just short of it.
     // Codes: an hour after they expire.
     db.insert(new_session("ses_live", "usr_ann", "cookie-live")).await?;
-    db.insert(new_code("code-old", "mail-web", "ses_live", -61 * 60)).await?;
-    db.insert(new_code("code-recent", "mail-web", "ses_live", -59 * 60)).await?;
+    db.insert(new_code("code-old", "files-web", "ses_live", -61 * 60)).await?;
+    db.insert(new_code("code-recent", "files-web", "ses_live", -59 * 60)).await?;
     // One-time tokens: a day after they expire.
     db.insert(one_time_token("token-old", "reset", "usr_ann", None, -25 * 3600)).await?;
     db.insert(one_time_token("token-recent", "reset", "usr_ann", None, -23 * 3600)).await?;
@@ -4584,21 +4651,21 @@ async fn housekeeping_deletes_in_one_pass_what_expired_long_enough_ago() -> DbRe
     // and codes.
     db.insert(new_session("ses_idle", "usr_ann", "cookie-idle")).await?;
     db.insert(new_session("ses_ended", "usr_ann", "cookie-ended")).await?;
-    db.insert(session_token("web-idle", "mail-web", "ses_idle")).await?;
-    db.insert(new_code("code-idle", "mail-web", "ses_idle", 60)).await?;
+    db.insert(session_token("web-idle", "files-web", "ses_idle")).await?;
+    db.insert(new_code("code-idle", "files-web", "ses_idle", 60)).await?;
     db.update(Update::table("sessions").key(["ses_idle"]).set("expires_at", now() - seconds(1))).await?;
     db.update(Update::table("sessions").key(["ses_ended"]).set("ends_at", now() - seconds(1))).await?;
     // Refresh tokens: when they expire, or a day after they were revoked.
-    db.insert(public_token("ios-expired", "ses_a", "usr_ann", "mail-ios")).await?;
+    db.insert(public_token("ios-expired", "ses_a", "usr_ann", "files-ios")).await?;
     db.update(Update::table("refresh_tokens").key([digest("ios-expired")]).set("expires_at", now() - seconds(1))).await?;
-    db.insert(public_token("ios-revoked-old", "ses_b", "usr_ann", "mail-ios").set("revoked_at", now() - hours(25))).await?;
-    db.insert(public_token("ios-revoked-recent", "ses_c", "usr_ann", "mail-ios").set("revoked_at", now() - hours(23))).await?;
-    db.insert(public_token("ios-live", "ses_d", "usr_ann", "mail-ios")).await?;
+    db.insert(public_token("ios-revoked-old", "ses_b", "usr_ann", "files-ios").set("revoked_at", now() - hours(25))).await?;
+    db.insert(public_token("ios-revoked-recent", "ses_c", "usr_ann", "files-ios").set("revoked_at", now() - hours(23))).await?;
+    db.insert(public_token("ios-live", "ses_d", "usr_ann", "files-ios")).await?;
     // Invitations nobody accepted: thirty days after they expire. An
     // accepted one is kept for good.
-    db.insert(new_invite("inv_old", "a@example.com", "mail", "member", "invite-old", -31 * 86_400)).await?;
-    db.insert(new_invite("inv_recent", "b@example.com", "mail", "member", "invite-recent", -29 * 86_400)).await?;
-    db.insert(new_invite("inv_accepted", "c@example.com", "mail", "member", "invite-accepted", 3600)).await?;
+    db.insert(new_invite("inv_old", "a@example.com", "files", "member", "invite-old", -31 * 86_400)).await?;
+    db.insert(new_invite("inv_recent", "b@example.com", "files", "member", "invite-recent", -29 * 86_400)).await?;
+    db.insert(new_invite("inv_accepted", "c@example.com", "files", "member", "invite-accepted", 3600)).await?;
     db.update(accept_invite("invite-accepted", "usr_ann")).await?;
     db.update(Update::table("invites").key(["inv_accepted"]).set("expires_at", now() - days(60))).await?;
     // Rate-limit windows: after a day.
@@ -4608,17 +4675,17 @@ async fn housekeeping_deletes_in_one_pass_what_expired_long_enough_ago() -> DbRe
     }
     // Events: a week after they were delivered or given up. One still
     // waiting is kept however old.
-    db.insert(event("mail", "delivered-old").set("delivered_at", now() - days(8))).await?;
-    db.insert(event("mail", "given-up-old").set("failed_at", now() - days(8))).await?;
-    db.insert(event("mail", "delivered-recent").set("delivered_at", now() - days(6))).await?;
-    db.insert(event("mail", "waiting").set("next_attempt_at", now() - days(30))).await?;
+    db.insert(event("files", "delivered-old").set("delivered_at", now() - days(8))).await?;
+    db.insert(event("files", "given-up-old").set("failed_at", now() - days(8))).await?;
+    db.insert(event("files", "delivered-recent").set("delivered_at", now() - days(6))).await?;
+    db.insert(event("files", "waiting").set("next_attempt_at", now() - days(30))).await?;
     // The log: after as many days as the deployment says.
     db.insert(audit_entry(None, "old", None, json!({})).set("at", now() - days(366))).await?;
     db.insert(audit_entry(None, "recent", None, json!({})).set("at", now() - days(364))).await?;
 
     // While another process is at it, this one skips the pass.
     let other = Client::connect(db.config().clone()).await?;
-    let busy = other.try_lock("auth.housekeeping").await?.expect("nobody is housekeeping yet");
+    let busy = other.try_lock("app.housekeeping").await?.expect("nobody is housekeeping yet");
     assert_eq!(housekeeping(&db, 365).await?, None);
     assert!(db.get("auth_codes", [digest("code-old")]).await?.is_some());
     busy.unlock().await?;
@@ -4645,10 +4712,10 @@ async fn housekeeping_deletes_in_one_pass_what_expired_long_enough_ago() -> DbRe
     Ok(())
 }
 
-/// A migration a later release of auth might carry: a column for a table
-/// that has rows, a new table with an index and a foreign key, an index
-/// for a table that has rows, and a seed row. `broken` adds a statement
-/// that fails, as a mistake in the file would.
+/// A migration a later release of the service might carry: a column for a
+/// table that has rows, a new table with an index and a foreign key, an
+/// index for a table that has rows, and a seed row. `broken` adds a
+/// statement that fails, as a mistake in the file would.
 async fn migration_0003(tx: &Transaction, broken: bool) -> DbResult<()> {
     tx.add_column("users", text("locale").default("en")).await?;
     let notes = TableDef::new("user_notes")
@@ -4667,8 +4734,8 @@ async fn migration_0003(tx: &Transaction, broken: bool) -> DbResult<()> {
     Ok(())
 }
 
-/// One migration as auth's migrator applies it (Q164 with Q163): its
-/// statements and its row in `schema_migrations` are one transaction.
+/// One migration as the migrator applies it: its statements and its row in
+/// `schema_migrations` are one transaction.
 async fn apply_0003(db: &Client, broken: bool) -> DbResult<()> {
     db.transaction(|tx| async move {
         migration_0003(&tx, broken).await?;
@@ -4678,12 +4745,12 @@ async fn apply_0003(db: &Client, broken: bool) -> DbResult<()> {
     .await
 }
 
-/// auth's migrator, which every process runs when it starts (§5): under
-/// a lock that one process holds at a time (Q165), make sure the table
-/// of applied versions is there (Q161), read it (Q162), and apply what
-/// is missing. Answers with the versions it applied.
+/// The migrator, which every process runs when it starts: under a lock that
+/// one process holds at a time, make sure the table of applied versions is
+/// there, read it, and apply what is missing. Answers with the versions it
+/// applied.
 async fn migrate(db: &Client) -> DbResult<Vec<&'static str>> {
-    let lock = db.lock("auth.migrate").await?;
+    let lock = db.lock("app.migrate").await?;
     db.create_table_if_not_exists(schema_migrations()).await?;
     let applied: Vec<String> = db.query(Query::table("schema_migrations").columns(["version"])).await?.column()?;
     let mut ran = Vec::new();
@@ -4695,14 +4762,14 @@ async fn migrate(db: &Client) -> DbResult<Vec<&'static str>> {
     Ok(ran)
 }
 
-// R-S1, R-S8, R-S11, R-X1, R-X2: auth Q161, Q162, Q163, Q164; §4.16, §5,
-// §7.11.
+// R-S1, R-S8, R-S11, R-X1, R-X2: changes to the schema are transactional:
+// they commit with the rows written beside them, or leave no trace.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_migration_commits_with_its_bookkeeping_row_or_leaves_no_trace() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
-    db.insert(new_credential("key_1", "usr_ann", "api_key", "mail", "secret-1", None)).await?;
+    db.insert(new_credential("key_1", "usr_ann", "api_key", "files", "secret-1", None)).await?;
     for version in ["0001_initial", "0002_services"] {
         db.insert(Insert::into("schema_migrations").set("version", version)).await?;
     }
@@ -4744,7 +4811,7 @@ async fn a_migration_commits_with_its_bookkeeping_row_or_leaves_no_trace() -> Db
     );
     // The new index holds the rows that were there before it.
     assert_eq!(
-        db.query(Query::table("credentials").index("credentials_service", KeyRange::eq(["mail"])).columns(["id"])).await?.column::<String>()?,
+        db.query(Query::table("credentials").index("credentials_service", KeyRange::eq(["files"])).columns(["id"])).await?.column::<String>()?,
         ["key_1"]
     );
 
@@ -4770,7 +4837,8 @@ async fn a_migration_commits_with_its_bookkeeping_row_or_leaves_no_trace() -> Db
     Ok(())
 }
 
-// R-S8, R-X5, R-X8: auth Q161, Q162, Q163, Q164, Q165; §3.3, §5.
+// R-S8, R-X5, R-X8: a named lock that is waited for puts the migrations of
+// four processes that start together one after another.
 #[tokio::test(flavor = "multi_thread")]
 async fn processes_that_start_together_apply_a_migration_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4799,7 +4867,9 @@ async fn processes_that_start_together_apply_a_migration_once() -> DbResult<()> 
     Ok(())
 }
 
-// R-X5, R-X8: auth Q165, Q166; §3.3.
+// R-X5, R-X8: named locks, where SQL would take advisory locks: waited for
+// or only tried, held across transactions, and freed when the holder's
+// connection goes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_named_lock_is_waited_for_or_only_tried_and_is_freed_when_its_holder_goes_away() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4808,12 +4878,12 @@ async fn a_named_lock_is_waited_for_or_only_tried_and_is_freed_when_its_holder_g
 
     // Waited for: a second process asks for a lock that is held, and
     // gets it when the holder lets go, not before.
-    let held = db.lock("auth.migrate").await?;
-    assert_eq!(held.name(), "auth.migrate");
+    let held = db.lock("app.migrate").await?;
+    assert_eq!(held.name(), "app.migrate");
     let waiter = {
         let other = other.clone();
         tokio::spawn(async move {
-            let lock = other.lock("auth.migrate").await?;
+            let lock = other.lock("app.migrate").await?;
             other.insert(audit_entry(None, "second", None, json!({}))).await?;
             lock.unlock().await
         })
@@ -4822,8 +4892,8 @@ async fn a_named_lock_is_waited_for_or_only_tried_and_is_freed_when_its_holder_g
     assert!(!waiter.is_finished(), "the second process waits for the lock");
     // Only tried: the answer is no, at once, even to the process that
     // holds it. A lock of another name is free.
-    assert!(db.try_lock("auth.migrate").await?.is_none());
-    let housekeeping = db.try_lock("auth.housekeeping").await?.expect("a lock of another name is free");
+    assert!(db.try_lock("app.migrate").await?.is_none());
+    let housekeeping = db.try_lock("app.housekeeping").await?.expect("a lock of another name is free");
     // A named lock is not the write lock: holding one stops nobody from
     // writing.
     db.insert(audit_entry(None, "first", None, json!({}))).await?;
@@ -4831,32 +4901,32 @@ async fn a_named_lock_is_waited_for_or_only_tried_and_is_freed_when_its_holder_g
     waiter.await.expect("the task ran")?;
     assert_eq!(db.query(Query::table("audit").columns(["action"])).await?.column::<String>()?, ["first", "second"]);
 
-    assert!(other.try_lock("auth.housekeeping").await?.is_none());
+    assert!(other.try_lock("app.housekeeping").await?.is_none());
     housekeeping.unlock().await?;
-    let taken = other.try_lock("auth.housekeeping").await?.expect("the lock is free once unlocked");
+    let taken = other.try_lock("app.housekeeping").await?.expect("the lock is free once unlocked");
 
     // Dropped without being unlocked, as when its process dies: the
     // server frees the lock when it sees the connection gone.
     drop(taken);
-    let next = tokio::time::timeout(Duration::from_secs(10), db.lock("auth.housekeeping")).await.expect("a lock whose holder went away is freed")?;
+    let next = tokio::time::timeout(Duration::from_secs(10), db.lock("app.housekeeping")).await.expect("a lock whose holder went away is freed")?;
     next.unlock().await?;
 
     // The lock belongs to its holder, not to a transaction: it outlasts
     // a commit and a rollback made while it is held.
-    let lock = db.lock("auth.keys").await?;
+    let lock = db.lock("app.keys").await?;
     db.transaction(|tx| async move { tx.insert(audit_entry(None, "third", None, json!({}))).await.map(|_| ()) }).await?;
     let tx = db.begin().await?;
     tx.insert(audit_entry(None, "fourth", None, json!({}))).await?;
     tx.rollback().await?;
-    assert!(other.try_lock("auth.keys").await?.is_none());
+    assert!(other.try_lock("app.keys").await?.is_none());
     lock.unlock().await?;
-    other.try_lock("auth.keys").await?.expect("the lock is free once unlocked").unlock().await?;
+    other.try_lock("app.keys").await?.expect("the lock is free once unlocked").unlock().await?;
     assert_eq!(rows_of(&db, Query::table("audit")).await?, 3);
     Ok(())
 }
 
-/// Adding a passkey (§3.2): the challenge is used up (Q137), the passkey
-/// stored (Q41), the change logged (Q129).
+/// Adding a passkey: the challenge is used up, the passkey stored, the
+/// change logged.
 async fn add_passkey(db: &Client, id: &str, user: &str) -> DbResult<bool> {
     db.transaction(|tx| async move {
         let challenge = Insert::into("throttle").set("key", format!("once:webauthn:{id}")).set("window_start", now()).set("hits", 1);
@@ -4870,7 +4940,8 @@ async fn add_passkey(db: &Client, id: &str, user: &str) -> DbResult<bool> {
     .await
 }
 
-// R-X4, R-X8: auth Q14, Q41, Q44, Q129, Q137; §3.1, §4.15.
+// R-X4, R-X8: once a commit or a lone statement has returned, every
+// connection of the pool and every other process sees what it wrote.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_commit_is_seen_at_once_on_every_pooled_connection() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4886,8 +4957,8 @@ async fn a_commit_is_seen_at_once_on_every_pooled_connection() -> DbResult<()> {
         ping.await.expect("the task ran")?;
     }
 
-    // auth answers a request that added a passkey by reading the passkey
-    // back (Q44), on whichever connection the pool hands it. The commit
+    // The service answers a request that added a passkey by reading the
+    // passkey back, on whichever connection the pool hands it. The commit
     // has returned, so every connection must see the row.
     for round in 0..20 {
         let id = format!("pk_{round:02}");
@@ -4933,7 +5004,8 @@ async fn a_commit_is_seen_at_once_on_every_pooled_connection() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q21, R-X1, R-X2: auth Q140, Q141, Q171; §3.1, §4.14.
+// R-Q21, R-X1, R-X2: what a transaction writes is unseen until it commits
+// and gone if it does not, and a reading transaction sees one moment.
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_is_seen_before_a_commit_and_nothing_is_left_by_a_rollback() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4980,15 +5052,15 @@ async fn nothing_is_seen_before_a_commit_and_nothing_is_left_by_a_rollback() -> 
     assert_eq!(handle.commit().await.unwrap_err().code, ErrorCode::TransactionAborted);
 
     // A reading transaction sees one moment, whatever is committed
-    // meanwhile, and holds up no writer. auth loads its services so:
+    // meanwhile, and holds up no writer. The registry is loaded so:
     // the revision and the rows it counts must belong together.
-    db.insert(new_service("mail", "invite")).await?;
+    db.insert(new_service("files", "invite")).await?;
     let revision = Query::table("services_revision").columns(["revision"]);
     let snapshot = db.begin_read().await?;
     assert_eq!(snapshot.query_one(revision.clone()).await?.get::<i64>("revision")?, 0);
     db.transaction(|tx| async move {
         tx.update(bump_revision()).await?;
-        tx.insert(new_service("docs", "invite")).await?;
+        tx.insert(new_service("chat", "invite")).await?;
         Ok::<_, DbError>(())
     })
     .await?;
@@ -5004,18 +5076,19 @@ async fn nothing_is_seen_before_a_commit_and_nothing_is_left_by_a_rollback() -> 
             Ok::<_, DbError>((revision, names))
         })
         .await?;
-    assert_eq!(loaded, (1, vec!["docs".to_string(), "mail".to_string()]));
+    assert_eq!(loaded, (1, vec!["chat".to_string(), "files".to_string()]));
     Ok(())
 }
 
-// R-O3, R-Q8, R-X7: auth Q168; §3.1, §4.4.
+// R-O3, R-Q8, R-X7: a health check, and the server's clock: one time for a
+// whole transaction, a time of its own for each lone statement.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_clock_is_the_servers_and_stands_still_inside_a_transaction() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     db.insert(person("usr_ann", "ann", None)).await?;
 
-    // Q168: the health check.
+    // The health check.
     db.ping().await?;
 
     // Every statement of a transaction reads the time it began at, in

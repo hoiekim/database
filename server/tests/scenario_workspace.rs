@@ -1,14 +1,15 @@
-//! doc, the wiki: spaces, a tree of pages, typed tables ("bases") kept as
-//! JSON cells, comments, public shares and search. Every statement shape of
-//! `docs/requirements/doc.md` is said here through the client, against
-//! doc's real tables, and what it returns is pinned.
+//! A scenario suite for a document workspace: spaces, a tree of pages,
+//! typed tables ("bases") kept as JSON cells, comments, public shares,
+//! notifications and search. Every shape of statement such a workspace
+//! needs is said here through the client, against a full set of tables,
+//! and what it returns is pinned.
 //!
-//! Three things Postgres did for doc are the app's own work now, and so
-//! this file's: the five SQL functions over a cell are Rust functions that
-//! return an `Expr`; the filter and sort of a base are compiled to an
-//! `Expr` and a list of `Order`s; and where one statement leaned on
-//! data-modifying CTEs or a row lock, a writing transaction groups the
-//! statements instead.
+//! Three things a SQL database does for such an application are the
+//! caller's own work here, and so this file's: the SQL functions over a
+//! cell are Rust functions that return an `Expr`; the filter and sort of a
+//! base are compiled to an `Expr` and a list of `Order`s; and where one
+//! statement would lean on data-modifying CTEs or a row lock, a writing
+//! transaction groups the statements instead.
 
 mod common;
 use common::*;
@@ -69,10 +70,10 @@ fn schema_migrations() -> TableDef {
     TableDef::new("schema_migrations").column(text_col("name")).column(time_col("applied_at").default_now()).primary_key(["name"])
 }
 
-/// doc's 26 tables, parents before children so every foreign key finds
-/// its table. Index names are Postgres' where the app or its error
-/// handling names them; the others are the access paths a planner used to
-/// pick and the app now states.
+/// The workspace's 26 tables, parents before children so every foreign
+/// key finds its table. Indexes behind a constraint carry the names
+/// Postgres gives them, which error handling matches on; the others are
+/// the access paths a planner would pick and a query here states.
 fn tables() -> Vec<TableDef> {
     let users = TableDef::new("users")
         .column(id_col())
@@ -480,8 +481,8 @@ fn tables() -> Vec<TableDef> {
     ]
 }
 
-/// Creates doc's tables. Asking again changes nothing, as at every start
-/// of the app (Q1).
+/// Creates the workspace's tables. Asking again changes nothing, as at
+/// every start of an application.
 async fn schema(db: &Client) -> DbResult<()> {
     for table in tables() {
         db.create_table_if_not_exists(table).await?;
@@ -557,7 +558,8 @@ async fn grant_group(db: &impl Db, space: Uuid, group: Uuid, role: &str) -> DbRe
     db.insert(Insert::into("space_members").set("space_id", space).set("group_id", group).set("role", role).returning(["id"])).await?.one()?.get("id")
 }
 
-/// The app makes these ten-character public ids itself; here a counter.
+/// A page's ten-character public id. An application makes these itself;
+/// here a counter.
 fn slug_id() -> String {
     static NEXT: AtomicU32 = AtomicU32::new(1);
     format!("pg{:08}", NEXT.fetch_add(1, Relaxed))
@@ -605,7 +607,7 @@ async fn wiki(db: &impl Db) -> DbResult<Wiki> {
     Ok(Wiki { ann, bob, space })
 }
 
-// ------------------------------------------------- doc's shared fragments
+// -------------------------------------------------------- shared fragments
 
 /// Whether the grant `sm` reaches the user: it names them, or a group
 /// they are in.
@@ -617,7 +619,7 @@ fn grant_reaches(user: Expr) -> Expr {
     col("sm.user_id").eq(user).or(col("sm.group_id").in_list(list_of(groups)))
 }
 
-/// F3: the user's highest role in a space over direct grants and grants
+/// The user's highest role in a space over direct grants and grants
 /// to their groups: 3 admin, 2 writer, 1 reader, NULL for none.
 fn role_rank(space: Expr, user: Expr) -> Expr {
     let rank = case([(col("sm.role").eq("admin"), val(3)), (col("sm.role").eq("writer"), val(2))], 1);
@@ -630,8 +632,8 @@ fn role_rank(space: Expr, user: Expr) -> Expr {
     )
 }
 
-/// F4: the ids of the spaces a user can read, as a list. Postgres found
-/// the index for each half of the `OR`; here each half is its own read.
+/// The ids of the spaces a user can read, as a list. Postgres finds the
+/// index for each half of the `OR`; here each half is its own read.
 fn readable_spaces(user: Expr) -> Expr {
     let direct = Query::table("space_members")
         .alias("sm")
@@ -645,7 +647,7 @@ fn readable_spaces(user: Expr) -> Expr {
     list_of(direct).list_concat(list_of(through_groups))
 }
 
-/// A member of a JSON object that may be NULL. `json_build_object` wrote
+/// A member of a JSON object that may be NULL. `json_build_object` writes
 /// a JSON null for a NULL argument; said outright, the object is the same
 /// whether or not `Func::JsonObject` does.
 fn json_or_null(value: Expr) -> Expr {
@@ -657,44 +659,44 @@ fn object<const N: usize>(members: [(&str, Expr); N]) -> Expr {
     call(Func::JsonObject, members.into_iter().flat_map(|(name, value)| [val(name), value]))
 }
 
-/// The URL the app serves an uploaded image from, NULL without an image.
+/// The URL an uploaded image is served from, NULL without an image.
 fn image_url(file: Expr) -> Expr {
     concat([val("/api/images/"), file])
 }
 
-/// F5: a page's space as a small object, for a query that joined `spaces`
+/// A page's space as a small object, for a query that joined `spaces`
 /// as `s`.
 fn space_ref() -> Expr {
     object([("id", col("s.id")), ("name", col("s.name")), ("slug", col("s.slug")), ("iconUrl", json_or_null(image_url(col("s.icon"))))])
 }
 
-/// F6: a user as a small object, NULL when the left join found nobody.
+/// A user as a small object, NULL when the left join found nobody.
 fn user_ref(alias: &str) -> Expr {
     let of = |name: &str| col(&format!("{alias}.{name}"));
     let person = object([("id", of("id")), ("name", of("name")), ("avatarUrl", json_or_null(image_url(of("avatar"))))]);
     when(of("id").is_null(), null(), person)
 }
 
-/// F7: sharing is on unless the workspace or the space turned it off.
+/// Sharing is on unless the workspace or the space turned it off.
 fn sharing_enabled(space_settings: Expr) -> Expr {
     let disabled = |settings: Expr| settings.json_text(["sharingDisabled"]).cast(Type::Bool).or_else(false);
     let workspace = scalar(Query::table("workspace").key([1]).select("settings", col("settings")));
     disabled(workspace).not().and(disabled(space_settings).not())
 }
 
-/// F1's subquery: whether the page `p` has a child that is not trashed.
+/// Whether the page `p` has a child that is not trashed.
 fn has_children() -> Expr {
     exists(Query::table("pages").alias("c").index("pages_parent_idx", KeyRange::eq([col("p.id")])).filter(col("c.deleted_at").is_null()))
 }
 
-/// F1: the columns of a tree item, for a query that reads `pages` as `p`.
+/// The columns of a tree item, for a query that reads `pages` as `p`.
 fn tree_columns(pages: Query) -> Query {
     pages
         .columns(["p.id", "p.slug_id", "p.title", "p.icon", "p.parent_id", "p.space_id", "p.position", "p.is_base"])
         .select("has_children", has_children())
 }
 
-/// F2: a page without its document.
+/// A page without its document.
 fn page_columns(pages: Query) -> Query {
     pages
         .columns(["p.id", "p.slug_id", "p.space_id", "p.parent_id", "p.position", "p.title", "p.icon", "p.cover", "p.doc_version"])
@@ -712,12 +714,12 @@ fn readable(user: Uuid) -> Expr {
 
 // ------------------------------------------------ schema and migrations
 
-// R-S1, R-S2, R-S3, R-S4, R-S6, R-S7: doc §1, Q1.
+// R-S1, R-S2, R-S3, R-S4, R-S6, R-S7: the whole schema, declared twice and read back.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_schema_holds_every_table_index_and_foreign_key() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    // Q1 runs at every start of the app, on a database that has it all.
+    // The schema is declared at every start, on a database that has it all.
     schema(&db).await?;
 
     let tables = db.describe().await?;
@@ -750,8 +752,8 @@ async fn the_schema_holds_every_table_index_and_foreign_key() -> DbResult<()> {
         IndexKind::Ordered => panic!("the search index is a full-text one"),
     }
 
-    // §1.28: 50 foreign keys, none that refuses a delete, two of them
-    // pointing at their own table.
+    // 50 foreign keys, none that refuses a delete, two of them pointing
+    // at their own table.
     let acting = |action: OnDelete| tables.iter().flat_map(|t| &t.foreign_keys).filter(|fk| fk.on_delete == action).count();
     assert_eq!((acting(OnDelete::Cascade), acting(OnDelete::SetNull), acting(OnDelete::Restrict)), (30, 20, 0));
     for tree in ["pages", "comments"] {
@@ -764,7 +766,7 @@ async fn the_schema_holds_every_table_index_and_foreign_key() -> DbResult<()> {
     Ok(())
 }
 
-// R-S1, R-S8, R-S11, R-X1, R-X2, R-X5: doc Q1-Q6, T1, §5.
+// R-S1, R-S8, R-S11, R-X1, R-X2, R-X5: a migration step under a named lock, in one transaction with its bookkeeping row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_migration_and_its_bookkeeping_row_commit_together_or_not_at_all() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -772,18 +774,18 @@ async fn a_migration_and_its_bookkeeping_row_commit_together_or_not_at_all() -> 
     let space = new_space(&db, "docs").await?;
     let page = new_page(&db, space, None, "a0", "Before the migration").await?;
     new_page(&db, space, None, "a1", "Before the migration").await?;
-    // Q2: what has been applied so far.
+    // What has been applied so far.
     assert!(db.query(Query::table("schema_migrations").columns(["name"])).await?.is_empty());
 
-    // T1. Postgres made migrators queue on an advisory lock inside the
+    // Postgres makes migrators queue on an advisory lock inside the
     // transaction; here a named lock is held around it, so a second copy
-    // of the app starting now waits its turn.
-    let turn = db.lock("doc.migrate").await?;
-    assert!(db.try_lock("doc.migrate").await?.is_none());
+    // of the application starting now waits its turn.
+    let turn = db.lock("app.migrate").await?;
+    assert!(db.try_lock("app.migrate").await?.is_none());
     let tx = db.begin().await?;
-    // Q3, inside the lock: someone else may have applied it meanwhile.
+    // Inside the lock: someone else may have applied it meanwhile.
     assert!(tx.get("schema_migrations", ["006_stars"]).await?.is_none());
-    // Q5: the step's schema changes: a column and an index on a table
+    // The step's schema changes: a column and an index on a table
     // that has rows, and a new table.
     tx.add_column("pages", ColumnDef::new("stars", Type::Int).default(0)).await?;
     tx.create_index("pages", IndexDef::new("pages_stars_idx").on(["space_id"]).on_desc("stars").on(["id"])).await?;
@@ -796,7 +798,7 @@ async fn a_migration_and_its_bookkeeping_row_commit_together_or_not_at_all() -> 
             .foreign_key(["user_id"], "users", OnDelete::Cascade),
     )
     .await?;
-    // Q4.
+    // The bookkeeping row, in the same transaction.
     tx.insert(Insert::into("schema_migrations").set("name", "006_stars")).await?;
     // Nobody else sees a half-applied step.
     assert!(db.describe_table("page_stars").await?.is_none());
@@ -816,7 +818,7 @@ async fn a_migration_and_its_bookkeeping_row_commit_together_or_not_at_all() -> 
     assert!(!applied.is_null("applied_at")?);
 
     // The copy that waited takes its turn, re-checks, and has nothing to do.
-    let turn = db.try_lock("doc.migrate").await?.expect("the lock is free again");
+    let turn = db.try_lock("app.migrate").await?.expect("the lock is free again");
     assert!(db.get("schema_migrations", ["006_stars"]).await?.is_some());
 
     // A step that fails half way leaves nothing behind: not its table,
@@ -841,23 +843,23 @@ async fn a_migration_and_its_bookkeeping_row_commit_together_or_not_at_all() -> 
 
 // --------------------------------------------------------------- workspace
 
-/// T2, T3: the first person to arrive becomes the owner and gets a
-/// workspace around them. Postgres needed an advisory lock so that two
-/// first sign-ins could not both find the table empty; the writing
-/// transaction is that lock.
+/// The first person to arrive becomes the owner and gets a workspace
+/// around them. Postgres needs an advisory lock so that two first
+/// sign-ins cannot both find the table empty; the writing transaction is
+/// that lock.
 async fn first_run_setup(db: &Client, email: &str, workspace: &str) -> DbResult<Option<Uuid>> {
     db.transaction(|tx| async move {
-        // Q19.
+        // Is anybody here yet?
         if !tx.query(Query::table("users").limit(1).columns(["id"])).await?.is_empty() {
             return Ok(None);
         }
-        // Q25.
+        // The owner.
         let owner: Uuid = tx
             .insert(Insert::into("users").set("email", email).set("name", "Owner").set("role", "owner").returning(["id"]))
             .await?
             .one()?
             .get("id")?;
-        // Q9: the singleton row, made or renamed.
+        // The singleton row, made or renamed.
         tx.insert(
             Insert::into("workspace")
                 .set("id", 1)
@@ -867,7 +869,7 @@ async fn first_run_setup(db: &Client, email: &str, workspace: &str) -> DbResult<
                 .update("updated_at", now()),
         )
         .await?;
-        // Q50, Q56.
+        // The default group, with the owner in it.
         let everyone = Insert::into("groups")
             .set("name", "Everyone")
             .set("description", "Every member of the workspace")
@@ -875,7 +877,8 @@ async fn first_run_setup(db: &Client, email: &str, workspace: &str) -> DbResult<
             .set("created_by", owner);
         let everyone: Uuid = tx.insert(everyone.returning(["id"])).await?.one()?.get("id")?;
         tx.insert(Insert::into("group_members").set("group_id", everyone).set("user_id", owner)).await?;
-        // Q68, Q75, Q10.
+        // A first space, the owner's grant in it, and the workspace's
+        // pointer to it as the default.
         let general: Uuid = tx
             .insert(Insert::into("spaces").set("name", "General").set("slug", "general").set("created_by", owner).returning(["id"]))
             .await?
@@ -888,7 +891,7 @@ async fn first_run_setup(db: &Client, email: &str, workspace: &str) -> DbResult<
     .await
 }
 
-// R-W4, R-X1, R-X2, R-X3: doc Q6, Q9, Q10, Q19, Q25, Q50, Q56, Q68, Q75, T2, T3.
+// R-W4, R-X1, R-X2, R-X3: first-run setup in one writing transaction, raced by two first sign-ins.
 #[tokio::test(flavor = "multi_thread")]
 async fn first_run_setup_happens_once_however_many_start_it() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -920,7 +923,7 @@ async fn first_run_setup_happens_once_however_many_start_it() -> DbResult<()> {
         db.query_one(Query::table("spaces").alias("s").key([general.get::<Uuid>("id")?]).select("rank", role_rank(col("s.id"), val(owner)))).await?;
     assert_eq!(rank.get::<i64>("rank")?, 3);
 
-    // Q9 again renames the one row instead of adding a second.
+    // The same upsert again renames the one row instead of adding a second.
     let renamed = db
         .insert(
             Insert::into("workspace")
@@ -938,8 +941,8 @@ async fn first_run_setup_happens_once_however_many_start_it() -> DbResult<()> {
     Ok(())
 }
 
-/// Q11's parameters: `None` keeps a column; for the description, which
-/// can be cleared, `Some(None)` writes NULL.
+/// A patch of the workspace row: `None` keeps a column; for the
+/// description, which can be cleared, `Some(None)` writes NULL.
 struct WorkspacePatch<'a> {
     name: Option<&'a str>,
     description: Option<Option<&'a str>>,
@@ -957,7 +960,7 @@ fn patch_workspace(patch: WorkspacePatch) -> Update {
         .set("updated_at", now())
 }
 
-// R-Q13, R-S7, R-T7, R-W6, R-W11: doc Q8, Q11, Q13, F7.
+// R-Q13, R-S7, R-T7, R-W6, R-W11: the one workspace row, patched column by column with a shallow merge of its settings.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_workspace_patch_keeps_what_is_absent_and_clears_what_is_null() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -980,7 +983,7 @@ async fn a_workspace_patch_keeps_what_is_absent_and_clears_what_is_null() -> DbR
         settings: settings.clone(),
     }))
     .await?;
-    // Q8, whole and projected.
+    // The row read back, whole here and projected below.
     let row = db.query_one(Query::table("workspace").key([1])).await?;
     assert_eq!(row.get::<String>("name")?, "My workspace");
     assert_eq!(row.get::<Option<String>>("description")?.as_deref(), Some("Docs"));
@@ -1016,13 +1019,13 @@ async fn a_workspace_patch_keeps_what_is_absent_and_clears_what_is_null() -> DbR
     let read = db.query_one(read).await?;
     assert_eq!((read.get::<bool>("off")?, read.get::<i64>("days")?, read.get::<Option<bool>>("unset")?), (false, 7, None));
 
-    // Q13.
+    // Clearing the logo.
     assert_eq!(db.update(Update::table("workspace").key([1]).set("logo", null()).set("updated_at", now())).await?.affected(), 1);
     assert!(db.query_one(Query::table("workspace").key([1]).columns(["logo"])).await?.is_null("logo")?);
     Ok(())
 }
 
-// R-W6, R-W7, R-X3: doc Q12, Q31, Q142.
+// R-W6, R-W7, R-X3: an update that returns the value it replaced, alone and raced.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_swap_returns_the_value_it_replaced() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1030,7 +1033,7 @@ async fn a_swap_returns_the_value_it_replaced() -> DbResult<()> {
     let w = wiki(&db).await?;
     db.insert(Insert::into("workspace").set("name", "Acme")).await?;
 
-    // Q12. Postgres joined the table to itself to return the old value;
+    // Postgres joins the table to itself to return the old value;
     // `old(..)` reads it.
     let swap_logo = |logo: &str| {
         Update::table("workspace").key([1]).set("logo", logo).set("updated_at", now()).returning(["logo"]).returning_expr("previous", old("logo"))
@@ -1040,14 +1043,14 @@ async fn a_swap_returns_the_value_it_replaced() -> DbResult<()> {
     let second = db.update(swap_logo("b.png")).await?.one()?;
     assert_eq!(second.get::<Option<String>>("previous")?.as_deref(), Some("a.png"));
 
-    // Q31, and nobody there to swap for.
+    // The same for a user's avatar, and nobody there to swap for.
     let swap_avatar =
         |user: Uuid| Update::table("users").key([user]).set("avatar", "new.png").set("updated_at", now()).returning_expr("previous", old("avatar"));
     assert!(db.update(swap_avatar(w.ann)).await?.one()?.is_null("previous")?);
     let nobody = db.update(swap_avatar(uuid(404))).await?;
     assert_eq!((nobody.affected(), nobody.len()), (0, 0));
 
-    // Q142: two uploads replace one file's object at the same moment.
+    // Two uploads replace one file's object at the same moment.
     // Each learns the key it superseded, so each can remove that object:
     // one replaced the original, the other replaced the first one's.
     let page = new_page(&db, w.space, None, "a0", "Files").await?;
@@ -1075,19 +1078,19 @@ const USER_COLUMNS: [&str; 16] = [
     "created_at", "updated_at", "auth_sub", "email_from_provider",
 ];
 
-/// Q17: a user by email whatever its case; with single sign-on in use,
+/// A user by email whatever its case; with single sign-on in use,
 /// only an account that is not linked to the identity provider.
 fn user_by_email(email: &str, sso_off: bool) -> Query {
     Query::table("users").index("users_email_key", KeyRange::eq([email.to_lowercase()])).filter(val(sso_off).or(col("auth_sub").is_null()))
 }
 
-// R-Q1, R-Q3, R-Q6, R-S5, R-T2, R-W1: doc Q14-Q20, Q25.
+// R-Q1, R-Q3, R-Q6, R-S5, R-T2, R-W1: inserting users and finding them by key, by several keys and through unique indexes.
 #[tokio::test(flavor = "multi_thread")]
 async fn users_are_found_by_id_by_case_folded_email_and_by_provider_subject() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
 
-    // Q25: `RETURNING *` is every column by name; the row comes back with
+    // `RETURNING *` is every column by name; the row comes back with
     // the defaults the database filled in.
     let ann = Insert::into("users").set("email", "Ann@Example.com").set("name", "Ann").set("password_hash", "$argon2id$ann").set("role", "owner");
     let ann = db.insert(ann.returning(USER_COLUMNS)).await?;
@@ -1105,7 +1108,7 @@ async fn users_are_found_by_id_by_case_folded_email_and_by_provider_subject() ->
     assert_eq!((bob.get::<String>("role")?, bob.get::<String>("name")?), ("member".to_string(), String::new()));
     assert_ne!(ann_id, bob_id);
 
-    // Q14: by primary key, whole or in part. A uuid is the same value in
+    // By primary key, whole or in part. A uuid is the same value in
     // either letter case, and comes back in lower case.
     let row = db.get("users", [ann_id]).await?.expect("ann");
     assert_eq!(row.get::<String>("email")?, "Ann@Example.com");
@@ -1115,29 +1118,29 @@ async fn users_are_found_by_id_by_case_folded_email_and_by_provider_subject() ->
     assert_eq!(row.get::<Uuid>("id")?.to_string(), upper.to_lowercase());
     assert!(db.query_opt(Query::table("users").key([ann_id]).filter(col("deactivated_at").is_null()).columns(["email", "name"])).await?.is_some());
 
-    // Q15: several by id, in the order asked; an id nobody has is left out.
+    // Several by id, in the order asked; an id nobody has is left out.
     let people = db.query(Query::table("users").keys([[bob_id], [uuid(404)], [ann_id]]).columns(["id", "name", "avatar"])).await?;
     assert_eq!(ids(&people), [bob_id, ann_id]);
 
-    // Q16.
+    // By the identity provider's subject.
     let by_subject = db.query_one(Query::table("users").index("users_auth_sub_key", KeyRange::eq(["sub-bob"])).columns(["id"])).await?;
     assert_eq!(by_subject.get::<Uuid>("id")?, bob_id);
     assert!(db.query_opt(Query::table("users").index("users_auth_sub_key", KeyRange::eq(["sub-nobody"]))).await?.is_none());
 
-    // Q17.
+    // By email in any letter case, with and without single sign-on.
     assert_eq!(db.query_one(user_by_email("ANN@example.com", false)).await?.get::<Uuid>("id")?, ann_id);
     assert!(db.query_opt(user_by_email("bob@example.com", false)).await?.is_none());
     assert_eq!(db.query_one(user_by_email("bob@example.com", true)).await?.get::<Uuid>("id")?, bob_id);
     let active = user_by_email("ann@example.com", true).filter(col("deactivated_at").is_null()).columns(["id", "email", "name"]);
     assert_eq!(db.query_one(active).await?.get::<String>("name")?, "Ann");
 
-    // Q18: is the address taken, by anyone, or by anyone else?
+    // Is the address taken, by anyone, or by anyone else?
     let taken_by_other =
         |email: &str, me: Uuid| Query::table("users").index("users_email_key", KeyRange::eq([email])).filter(col("id").ne(me)).columns(["id"]);
     assert!(db.query_opt(taken_by_other("ann@example.com", ann_id)).await?.is_none());
     assert!(db.query_opt(taken_by_other("ann@example.com", bob_id)).await?.is_some());
 
-    // Q19, Q20.
+    // Is there any user at all, and which of these addresses are known?
     assert!(!db.query(Query::table("users").limit(1).columns(["id"])).await?.is_empty());
     let asked = ["bob@example.com", "nobody@example.com", "ann@example.com"];
     let known = db
@@ -1147,7 +1150,7 @@ async fn users_are_found_by_id_by_case_folded_email_and_by_provider_subject() ->
     Ok(())
 }
 
-// R-S3, R-T9, R-W7, R-W11, R-X2: doc Q25, Q32, Q33, §3.4.
+// R-S3, R-T9, R-W7, R-W11, R-X2: unique violations that name their index, and two transactions updating the same rows in opposite order.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_duplicate_email_or_subject_names_the_index_it_broke() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1161,7 +1164,7 @@ async fn a_duplicate_email_or_subject_names_the_index_it_broke() -> DbResult<()>
     assert!(taken.violates("users_email_key"));
     assert_eq!(taken.table.as_deref(), Some("users"));
 
-    // Q32: link an account to a provider subject only while it has none.
+    // Link an account to a provider subject only while it has none.
     // A row back means linked; no row, somebody's already; a violation of
     // the subject's index, that another sign-in of the same person won.
     let link = |email: &str, subject: &str| {
@@ -1176,8 +1179,8 @@ async fn a_duplicate_email_or_subject_names_the_index_it_broke() -> DbResult<()>
     assert_eq!(raced.code, ErrorCode::UniqueViolation);
     assert!(raced.violates("users_auth_sub_key"));
 
-    // Q33: the provider's claims, email included. When the address is
-    // someone else's the whole statement fails, and the app says it again
+    // The provider's claims, email included. When the address is someone
+    // else's the whole statement fails, and the caller says it again
     // without the email.
     let claims = |email: Option<&str>| {
         let user = Update::table("users").key([bob]).set("role", "admin").set("name", "Robert").set("email", coalesce([val(email), col("email")]));
@@ -1194,9 +1197,9 @@ async fn a_duplicate_email_or_subject_names_the_index_it_broke() -> DbResult<()>
     );
 
     // Two sign-ins of one person each update the same two users in
-    // opposite order. In Postgres that could deadlock (40P01) and the app
-    // retried three times; writing transactions run one after the other,
-    // so both commit and the later one's values stand on both rows.
+    // opposite order. In Postgres that can deadlock (40P01) and the caller
+    // has to retry; writing transactions run one after the other, so both
+    // commit and the later one's values stand on both rows.
     let touch = |first: Uuid, second: Uuid, locale: &'static str| {
         let db = db.clone();
         async move {
@@ -1217,14 +1220,14 @@ async fn a_duplicate_email_or_subject_names_the_index_it_broke() -> DbResult<()>
     Ok(())
 }
 
-/// Q21's predicate: no needle, or the needle somewhere in the name or the
-/// address. The app lower-cases and escapes the needle.
+/// The member list's predicate: no needle, or the needle somewhere in the
+/// name or the address. The caller lower-cases and escapes the needle.
 fn member_matches(needle: &str) -> Expr {
     let pattern = format!("%{}%", like_escape(&needle.to_lowercase()));
     val(needle.is_empty()).or(col("name").lower().like(pattern.clone())).or(col("email").lower().like(pattern))
 }
 
-// R-Q5, R-Q7, R-Q11: doc Q21-Q24.
+// R-Q5, R-Q7, R-Q11: a filtered, ordered, paged list with its total, and conditional counts.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_member_list_filters_orders_and_counts() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1241,7 +1244,7 @@ async fn the_member_list_filters_orders_and_counts() -> DbResult<()> {
     }
     db.update(Update::table("users").index("users_email_key", KeyRange::eq(["carlx@x.test"])).set("deactivated_at", now())).await?;
 
-    // Q21: the active first, then by name without regard to case, then by
+    // The active first, then by name without regard to case, then by
     // id; one page of it, and the count of all of it (`count(*) OVER ()`).
     let list = |needle: &str| {
         Query::table("users")
@@ -1262,12 +1265,12 @@ async fn the_member_list_filters_orders_and_counts() -> DbResult<()> {
     // `_` in the needle is a character, not a wildcard: Carlx1 does not match.
     assert_eq!(names(&db.query(list("l_1")).await?), ["Carl_1"]);
 
-    // Q22: past the last page the rows are none and the total still stands.
+    // Past the last page the rows are none and the total still stands.
     let beyond = db.query(list("bob").limit(2).offset(10).with_total()).await?;
     assert_eq!((beyond.len(), beyond.total()), (0, Some(3)));
     assert_eq!(rows_in(&db, Query::table("users").filter(member_matches("bob"))).await?, 3);
 
-    // Q23: suggestions. Names that start with the needle come first: a
+    // Suggestions. Names that start with the needle come first: a
     // sort key that is a condition.
     let suggest = Query::table("users")
         .filter(col("deactivated_at").is_null())
@@ -1278,7 +1281,7 @@ async fn the_member_list_filters_orders_and_counts() -> DbResult<()> {
         .limit(5);
     assert_eq!(names(&db.query(suggest).await?), ["Bob", "bobby", "Abby Bobson"]);
 
-    // Q24.
+    // How many owners there are, and how many of them are active.
     let owners = Query::table("users")
         .select("active", count().filter(col("role").eq("owner").and(col("deactivated_at").is_null())))
         .select("all", count().filter(col("role").eq("owner")));
@@ -1287,7 +1290,7 @@ async fn the_member_list_filters_orders_and_counts() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q8, R-Q13, R-W6: doc Q26-Q30.
+// R-Q8, R-Q13, R-W6: a profile patch that merges JSON preferences, and timestamps set by the database's clock.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_profile_patch_merges_preferences_and_drops_nulled_keys() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1296,7 +1299,7 @@ async fn a_profile_patch_merges_preferences_and_drops_nulled_keys() -> DbResult<
     db.update(Update::table("users").key([ann]).set("preferences", json!({"theme": "dark", "fullWidth": true})).set("timezone", "Europe/Paris"))
         .await?;
 
-    // Q30: a null in the patch removes the preference; the rest merge.
+    // A null in the patch removes the preference; the rest merge.
     // The locale is given, the time zone is not.
     let prefs = json!({"theme": null, "editorWidth": 720});
     let patch = Update::table("users")
@@ -1315,14 +1318,14 @@ async fn a_profile_patch_merges_preferences_and_drops_nulled_keys() -> DbResult<
     // Stored as Postgres' jsonb would return it: shorter keys first.
     assert_eq!(row.get::<Json>("preferences")?.to_string(), r#"{"fullWidth":true,"editorWidth":720}"#);
 
-    // Q26, Q27.
+    // A sign-in stamps its moment; a new password replaces the hash.
     db.update(Update::table("users").key([ann]).set("last_login_at", now())).await?;
     db.update(Update::table("users").key([ann]).set("password_hash", "$argon2id$new").set("updated_at", now())).await?;
     let row = db.get("users", [ann]).await?.expect("ann");
     assert_eq!(row.get::<String>("password_hash")?, "$argon2id$new");
     assert!(row.get::<Timestamp>("last_login_at")? >= row.get::<Timestamp>("created_at")?);
 
-    // Q29: deactivating twice keeps the first moment; reactivating clears it.
+    // Deactivating twice keeps the first moment; reactivating clears it.
     let deactivate = || {
         Update::table("users")
             .key([ann])
@@ -1339,7 +1342,7 @@ async fn a_profile_patch_merges_preferences_and_drops_nulled_keys() -> DbResult<
     Ok(())
 }
 
-// R-S6, R-W10: doc Q34, §4.8.
+// R-S6, R-W10: deleting a user cascades through what they owned and sets their authorship to NULL.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_user_removes_what_was_theirs_and_blanks_authorship() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1447,7 +1450,7 @@ async fn deleting_a_user_removes_what_was_theirs_and_blanks_authorship() -> DbRe
         .one()?
         .get("id")?;
 
-    // Q34: one statement, and the foreign keys do the rest.
+    // One statement, and the foreign keys do the rest.
     assert_eq!(db.delete(Delete::from("users").key([bob])).await?.affected(), 1);
 
     for (table, by) in [
@@ -1496,8 +1499,8 @@ async fn deleting_a_user_removes_what_was_theirs_and_blanks_authorship() -> DbRe
 
 // ----------------------------------------------------- sessions and tokens
 
-/// Q35's join: a session with its user, while the session has not expired
-/// by the database's clock and the user has not been deactivated.
+/// A session with its user, while the session has not expired by the
+/// database's clock and the user has not been deactivated.
 fn live_session(sessions: Query) -> Query {
     sessions
         .alias("s")
@@ -1511,7 +1514,7 @@ fn live_session(sessions: Query) -> Query {
         .select("role", col("u.role"))
 }
 
-// R-Q1, R-Q6, R-Q8, R-Q9, R-T4, R-W1, R-W6: doc Q35-Q40.
+// R-Q1, R-Q6, R-Q8, R-Q9, R-T4, R-W1, R-W6: sessions found by token hash and joined to their user, with expiry by the database's clock.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_resolves_to_its_user_while_both_are_valid() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1519,7 +1522,7 @@ async fn a_session_resolves_to_its_user_while_both_are_valid() -> DbResult<()> {
     let ann = new_user(&db, "ann").await?;
     let bob = new_user(&db, "bob").await?;
 
-    // Q37. The app computes the expiry and sends it as text.
+    // Signing in. The caller computes the expiry and sends it as text.
     let sign_in = |user: Uuid, hash: &str, expires: Expr| {
         let session = Insert::into("sessions")
             .set("user_id", user)
@@ -1535,7 +1538,7 @@ async fn a_session_resolves_to_its_user_while_both_are_valid() -> DbResult<()> {
     let again = db.insert(sign_in(bob, "hash-bob", now() + days(30))).await.unwrap_err();
     assert!(again.violates("sessions_token_hash_key"));
 
-    // Q35, on every request: one read by the unique hash, one by key.
+    // On every request: one read by the unique hash, one by key.
     let by_token = |hash: &str| live_session(Query::table("sessions").index("sessions_token_hash_key", KeyRange::eq([hash])));
     let found = db.query_one(by_token("hash-current")).await?;
     assert_eq!(
@@ -1545,15 +1548,15 @@ async fn a_session_resolves_to_its_user_while_both_are_valid() -> DbResult<()> {
     assert!(db.query_opt(by_token("hash-expired")).await?.is_none());
     assert!(db.query_opt(by_token("hash-unknown")).await?.is_none());
 
-    // Q36: the same for a batch of sessions.
+    // The same for a batch of sessions.
     let batch = live_session(Query::table("sessions").keys([[bobs], [expired], [current]]));
     assert_eq!(column::<Uuid>(&db.query(batch.clone()).await?, "session_id"), [bobs, current]);
     db.update(Update::table("users").key([bob]).set("deactivated_at", now())).await?;
     assert_eq!(column::<Uuid>(&db.query(batch).await?, "session_id"), [current]);
     assert!(db.query_opt(by_token("hash-bob")).await?.is_none());
 
-    // Q38: the expiry slides; Q39: a refresh token is replaced only when
-    // a new one is given.
+    // The expiry slides; a refresh token is replaced only when a new one
+    // is given.
     db.update(Update::table("sessions").key([current]).set("last_seen_at", now()).set("expires_at", "2099-02-01T00:00:00Z")).await?;
     let recheck = |token: Option<&str>| {
         Update::table("sessions")
@@ -1569,7 +1572,7 @@ async fn a_session_resolves_to_its_user_while_both_are_valid() -> DbResult<()> {
     assert_eq!(row.get::<String>("auth_refresh_token")?, "refresh-1");
     assert!(row.get::<Timestamp>("last_seen_at")? >= row.get::<Timestamp>("created_at")?);
 
-    // Q40: a user's live sessions, the most recently used first.
+    // A user's live sessions, the most recently used first.
     let older: Uuid = db.insert(sign_in(ann, "hash-older", now() + days(1)).set("last_seen_at", now() - hours(2))).await?.one()?.get("id")?;
     let mine = Query::table("sessions")
         .index("sessions_user_idx", KeyRange::eq([ann]))
@@ -1580,7 +1583,7 @@ async fn a_session_resolves_to_its_user_while_both_are_valid() -> DbResult<()> {
     Ok(())
 }
 
-// R-S4, R-W7, R-W10: doc Q41-Q44.
+// R-S4, R-W7, R-W10: deletes by key, through a partial index with the ids returned, and by a filter on time.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_end_by_key_by_user_by_provider_session_and_by_expiry() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1606,22 +1609,22 @@ async fn sessions_end_by_key_by_user_by_provider_session_and_by_expiry() -> DbRe
     }
     let left = || async { Ok::<_, DbError>(ids(&db.query(Query::table("sessions").columns(["id"])).await?)) };
 
-    // Q41: by id; and by id only if it is this user's.
+    // By id; and by id only if it is this user's.
     assert_eq!(db.delete(Delete::from("sessions").key([sessions[0]]).filter(col("user_id").eq(bob))).await?.affected(), 0);
     assert_eq!(db.delete(Delete::from("sessions").key([sessions[0]]).filter(col("user_id").eq(ann))).await?.affected(), 1);
     assert_eq!(db.delete(Delete::from("sessions").key([sessions[0]])).await?.affected(), 0);
 
-    // Q43: every session of one sign-in at the provider, through the index
+    // Every session of one sign-in at the provider, through the index
     // that holds only sessions with one; the ids come back so their
     // sockets can be closed.
     let ended = db.delete(Delete::from("sessions").index("sessions_auth_sid_idx", KeyRange::eq(["sid-1"])).returning(["id"])).await?;
     assert_eq!(sorted(ids(&ended)), [uuid(2), uuid(3)]);
 
-    // Q44: the hourly purge.
+    // The hourly purge.
     assert_eq!(db.delete(Delete::from("sessions").filter(col("expires_at").lt(now()))).await?.affected(), 1);
     assert_eq!(left().await?, [uuid(4), uuid(5)]);
 
-    // Q42: all of a user's but the one in use; then all of them.
+    // All of a user's but the one in use; then all of them.
     let keep: Uuid = db
         .insert(
             Insert::into("sessions")
@@ -1641,7 +1644,7 @@ async fn sessions_end_by_key_by_user_by_provider_session_and_by_expiry() -> DbRe
     Ok(())
 }
 
-/// Q47: spends a password-reset token. The delete is the proof: a row
+/// Spends a password-reset token. The delete is the proof: a row
 /// back means the token was valid and is now gone.
 async fn consume_reset_token(db: &impl Db, hash: &str, sso_off: bool) -> DbResult<Option<Uuid>> {
     let valid = Query::table("user_tokens")
@@ -1658,14 +1661,14 @@ async fn consume_reset_token(db: &impl Db, hash: &str, sso_off: bool) -> DbResul
     spent.opt().map(|row| row.get("user_id")).transpose()
 }
 
-// R-Q8, R-W7, R-W8, R-X3: doc Q45-Q48.
+// R-Q8, R-W7, R-W8, R-X3: a delete over a join that returns its row to exactly one of two racing requests.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reset_token_is_consumed_exactly_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     let ann = new_user(&db, "ann").await?;
     let bob = new_user(&db, "bob").await?;
-    // Q45: the database's clock sets the expiry.
+    // The database's clock sets the expiry.
     let issue = |user: Uuid, hash: &str, minutes_left: i64| {
         Insert::into("user_tokens")
             .set("user_id", user)
@@ -1695,7 +1698,7 @@ async fn a_reset_token_is_consumed_exactly_once() -> DbResult<()> {
     db.update(Update::table("users").key([bob]).set("deactivated_at", now())).await?;
     assert_eq!(consume_reset_token(&db, "reset-bob-2", true).await?, None);
 
-    // Q48, Q46.
+    // The purge of expired tokens, then the rest of one user's.
     assert_eq!(db.delete(Delete::from("user_tokens").filter(col("expires_at").lt(now()))).await?.affected(), 1);
     let of_bob = Delete::from("user_tokens").index("user_tokens_user_idx", KeyRange::eq([bob])).filter(col("purpose").eq("password-reset"));
     assert_eq!(db.delete(of_bob).await?.affected(), 1);
@@ -1705,13 +1708,13 @@ async fn a_reset_token_is_consumed_exactly_once() -> DbResult<()> {
 
 // --------------------------------------------------- groups and invitations
 
-/// Q49: a group with the number of its members.
+/// A group with the number of its members.
 fn groups_with_counts() -> Query {
     let members = Query::table("group_members").alias("gm").range(KeyRange::eq([col("g.id")])).select("n", count());
     Query::table("groups").alias("g").columns(["g.id", "g.name", "g.description", "g.is_default"]).select("member_count", scalar(members))
 }
 
-// R-Q9, R-Q10, R-Q11, R-S3, R-W11: doc Q49-Q52, Q54-Q56, Q58.
+// R-Q9, R-Q10, R-Q11, R-S3, R-W11: groups with a counted subquery, a case-insensitive unique name, and members joined to their accounts.
 #[tokio::test(flavor = "multi_thread")]
 async fn groups_list_with_member_counts_and_refuse_a_taken_name() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1720,7 +1723,7 @@ async fn groups_list_with_member_counts_and_refuse_a_taken_name() -> DbResult<()
     let bob = new_user(&db, "Bob").await?;
     let cat = new_user(&db, "cat").await?;
 
-    // Q50.
+    // Creating groups; a name is taken whatever its case.
     let everyone: Uuid = db
         .insert(
             Insert::into("groups")
@@ -1742,21 +1745,21 @@ async fn groups_list_with_member_counts_and_refuse_a_taken_name() -> DbResult<()
     let taken = db.insert(Insert::into("groups").set("name", "DESIGN").returning(["id"])).await.unwrap_err();
     assert!(taken.is_unique_violation() && taken.violates("groups_name_key"));
 
-    // Q56.
+    // Members join; nobody is in a group twice.
     for (group, user) in [(everyone, ann), (everyone, bob), (everyone, cat), (design, cat), (design, bob)] {
         join_group(&db, group, user).await?;
     }
     let twice = db.insert(Insert::into("group_members").set("group_id", design).set("user_id", bob)).await.unwrap_err();
     assert!(twice.violates(PRIMARY));
 
-    // Q49: the default group first, then by name whatever its case.
+    // The default group first, then by name whatever its case.
     let all = db.query(groups_with_counts().order_by(col("g.is_default").desc()).order_by(col("g.name").lower())).await?;
     assert_eq!(column::<String>(&all, "name"), ["Everyone", "Admins", "design"]);
     assert_eq!(column::<i64>(&all, "member_count"), [3, 0, 2]);
     let one = db.query_one(groups_with_counts().key([design])).await?;
     assert_eq!((one.get::<i64>("member_count")?, one.get::<bool>("is_default")?, one.is_null("description")?), (2, false, true));
 
-    // Q51: a rename onto another group's name fails and changes nothing.
+    // A rename onto another group's name fails and changes nothing.
     let rename = |name: Option<&str>, description: Option<Option<&str>>| {
         let group = Update::table("groups").key([design]).set("name", coalesce([val(name), col("name")]));
         group.set("description", when(val(description.is_some()), val(description.flatten()), col("description"))).set("updated_at", now())
@@ -1769,13 +1772,13 @@ async fn groups_list_with_member_counts_and_refuse_a_taken_name() -> DbResult<()
     // Its own name in another case is no conflict with itself.
     db.update(rename(Some("Design"), None)).await?;
 
-    // Q54: the members of one group, and of several.
+    // The members of one group, and of several.
     let members = db.query(Query::table("group_members").range(KeyRange::eq([design])).columns(["user_id"])).await?;
     assert_eq!(sorted(column::<Uuid>(&members, "user_id")), sorted(vec![bob, cat]));
     let of_both = db.query(Query::table("group_members").keys([[admins], [design]]).columns(["user_id"])).await?;
     assert_eq!(of_both.len(), 2);
 
-    // Q55: a page of members with their accounts, by name.
+    // A page of members with their accounts, by name.
     let page = Query::table("group_members")
         .alias("gm")
         .range(KeyRange::eq([everyone]))
@@ -1786,7 +1789,7 @@ async fn groups_list_with_member_counts_and_refuse_a_taken_name() -> DbResult<()
     assert_eq!(column::<String>(&db.query(page.clone().limit(2)).await?, "name"), ["ann", "Bob"]);
     assert_eq!(column::<String>(&db.query(page.limit(2).offset(2)).await?, "name"), ["cat"]);
 
-    // Q58, Q52.
+    // A member leaves, once; deleting a group takes its memberships.
     assert_eq!(db.delete(Delete::from("group_members").key([design, bob])).await?.affected(), 1);
     assert_eq!(db.delete(Delete::from("group_members").key([design, bob])).await?.affected(), 0);
     assert_eq!(db.delete(Delete::from("groups").key([everyone])).await?.affected(), 1);
@@ -1794,7 +1797,7 @@ async fn groups_list_with_member_counts_and_refuse_a_taken_name() -> DbResult<()
     Ok(())
 }
 
-// R-Q6, R-W3, R-W5: doc Q53, Q57.
+// R-Q6, R-W3, R-W5: inserts fed by a query, skipping the rows that conflict.
 #[tokio::test(flavor = "multi_thread")]
 async fn members_join_groups_from_a_query_that_skips_who_is_already_in() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1808,7 +1811,7 @@ async fn members_join_groups_from_a_query_that_skips_who_is_already_in() -> DbRe
     let sales = new_group(&db, "sales").await?;
     join_group(&db, design, ann).await?;
 
-    // Q57: add several users to a group. Reading the users first keeps
+    // Add several users to a group. Reading the users first keeps
     // only ids that exist, so no foreign key can fail; who is in already
     // is skipped and not counted.
     let add = |group: Uuid, users: &[Uuid]| {
@@ -1819,13 +1822,13 @@ async fn members_join_groups_from_a_query_that_skips_who_is_already_in() -> DbRe
     assert_eq!(db.insert(add(design, &[ann, bob])).await?.affected(), 0);
     assert_eq!(rows_in(&db, Query::table("group_members").range(KeyRange::eq([design]))).await?, 2);
 
-    // Q53: of the groups an invitation names, the ones that exist and are
+    // Of the groups an invitation names, the ones that exist and are
     // not a default group.
     let invited = db.query(Query::table("groups").keys([[sales], [everyone], [uuid(404)]]).filter(col("is_default").not()).columns(["id"])).await?;
     assert_eq!(ids(&invited), [sales]);
 
-    // Q57's other forms: a new user joins the default groups, alone or
-    // together with the groups they were invited to.
+    // The same insert fed otherwise: a new user joins the default groups,
+    // alone or together with the groups they were invited to.
     let join = |user: Uuid, also: &[Uuid]| {
         let groups = Query::table("groups")
             .filter(col("is_default").eq(true).or(col("id").in_list(uuids(also))))
@@ -1840,7 +1843,7 @@ async fn members_join_groups_from_a_query_that_skips_who_is_already_in() -> DbRe
     Ok(())
 }
 
-/// Q61: invites an address, or replaces every field of the invitation it
+/// Invites an address, or replaces every field of the invitation it
 /// already has. The address is unique whatever its case.
 fn invite(email: &str, role: &str, groups: &[Uuid], token_hash: &str, inviter: Uuid) -> Insert {
     Insert::into("invitations")
@@ -1855,7 +1858,7 @@ fn invite(email: &str, role: &str, groups: &[Uuid], token_hash: &str, inviter: U
         .returning(["id"])
 }
 
-// R-Q8, R-Q9, R-T7, R-W4, R-W7, R-X3: doc Q59-Q63, T4.
+// R-Q8, R-Q9, R-T7, R-W4, R-W7, R-X3: an upsert on a case-folded unique index, and a delete that hands its row to one of two racing transactions.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invitation_is_replaced_by_email_and_claimed_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1869,7 +1872,7 @@ async fn an_invitation_is_replaced_by_email_and_claimed_once() -> DbResult<()> {
     db.update(Update::table("invitations").key([first]).set("created_at", now() - days(20))).await?;
     let other: Uuid = db.insert(invite("other@example.com", "member", &[], "hash-o", bob)).await?.one()?.get("id")?;
 
-    // Q59: an invitation is good for fourteen days from when it was sent.
+    // An invitation is good for fourteen days from when it was sent.
     let pending = |id: Uuid| {
         Query::table("invitations")
             .key([id])
@@ -1878,7 +1881,7 @@ async fn an_invitation_is_replaced_by_email_and_claimed_once() -> DbResult<()> {
     };
     assert!(db.query_opt(pending(first)).await?.is_none());
 
-    // Q61: inviting the address again, in another case, is the same
+    // Inviting the address again, in another case, is the same
     // invitation with new terms, sent now.
     let again = db.insert(invite("new@example.COM", "admin", &[sales, design], "hash-2", bob)).await?;
     assert_eq!(again.affected(), 1);
@@ -1894,13 +1897,13 @@ async fn an_invitation_is_replaced_by_email_and_claimed_once() -> DbResult<()> {
     let bad_role = db.insert(invite("x@example.com", "owner", &[], "hash-x", ann)).await.unwrap_err();
     assert_eq!(bad_role.code, ErrorCode::CheckViolation);
 
-    // Q62: rotating the token; no row back means there is no such
+    // Rotating the token; no row back means there is no such
     // invitation any more.
     let rotate = |id: Uuid| Update::table("invitations").key([id]).set("token_hash", "hash-3").set("created_at", now()).returning(["id", "email"]);
     assert_eq!(db.update(rotate(first)).await?.one()?.get::<String>("email")?, "New@Example.com");
     assert!(db.update(rotate(uuid(404))).await?.is_empty());
 
-    // Q60: the list, newest first, with who invited; the inviter may have
+    // The list, newest first, with who invited; the inviter may have
     // been deleted since.
     db.update(Update::table("invitations").key([other]).set("created_at", now() - hours(1))).await?;
     db.delete(Delete::from("users").key([bob])).await?;
@@ -1916,8 +1919,8 @@ async fn an_invitation_is_replaced_by_email_and_claimed_once() -> DbResult<()> {
     assert_eq!(column::<Option<String>>(&list, "inviter_name"), [None, None]);
     db.update(Update::table("invitations").key([other]).set("invited_by", ann)).await?;
 
-    // Q63 in T4: accepting deletes the invitation, and only the request
-    // that got the row back goes on to create the account.
+    // Accepting deletes the invitation, and only the request that got the
+    // row back goes on to create the account.
     let accept = |id: Uuid| {
         let db = db.clone();
         async move {
@@ -1957,7 +1960,7 @@ async fn an_invitation_is_replaced_by_email_and_claimed_once() -> DbResult<()> {
 
 // ------------------------------------------------------------------ spaces
 
-/// Q64: a space with the caller's role in it and its number of grants.
+/// A space with the caller's role in it and its number of grants.
 fn spaces_for(user: Uuid) -> Query {
     let members = Query::table("space_members").alias("sm").index("space_members_space_idx", KeyRange::eq([col("s.id")])).select("n", count());
     Query::table("spaces")
@@ -1967,7 +1970,7 @@ fn spaces_for(user: Uuid) -> Query {
         .select("member_count", scalar(members))
 }
 
-// R-Q3, R-Q10, R-Q11, R-S6: doc Q52, Q64-Q66, F3, F4, §4.8.
+// R-Q3, R-Q10, R-Q11, R-S6: correlated subqueries for a role and a count, and a cascade that changes who can read what.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_space_carries_the_callers_highest_role_and_its_member_count() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1995,7 +1998,7 @@ async fn a_space_carries_the_callers_highest_role_and_its_member_count() -> DbRe
     assert_eq!(column::<Option<i64>>(&all, "rank"), [Some(2), Some(3), None]);
     assert_eq!(column::<i64>(&all, "member_count"), [2, 2, 1]);
 
-    // The spaces a member sees: Postgres filtered a derived table on the
+    // The spaces a member sees: SQL filters a derived table on the
     // computed column; here the filter says the same expression.
     let mine = |user: Uuid| by_name(spaces_for(user).filter(role_rank(col("s.id"), val(user)).is_not_null()));
     assert_eq!(column::<String>(&db.query(mine(bob)).await?, "name"), ["Alpha", "beta"]);
@@ -2007,7 +2010,7 @@ async fn a_space_carries_the_callers_highest_role_and_its_member_count() -> DbRe
     let by_slug = db.query_one(spaces_for(ann).index("spaces_slug_key", KeyRange::eq(["alpha"]))).await?;
     assert_eq!((by_slug.get::<Uuid>("id")?, by_slug.get::<i64>("rank")?), (alpha, 3));
 
-    // Q65: a missing space is no row; a space without a role for the
+    // A missing space is no row; a space without a role for the
     // caller is a row with no rank.
     let rank_in = |space: Uuid, user: Uuid| {
         Query::table("spaces").alias("s").key([space]).select("id", col("s.id")).select("rank", role_rank(col("s.id"), val(user)))
@@ -2016,7 +2019,7 @@ async fn a_space_carries_the_callers_highest_role_and_its_member_count() -> DbRe
     assert!(db.query_one(rank_in(gamma, bob)).await?.is_null("rank")?);
     assert_eq!(db.query_one(rank_in(beta, bob)).await?.get::<i64>("rank")?, 3);
 
-    // Q66: every space a user can read, each once.
+    // Every space a user can read, each once.
     let can_read =
         |user: Uuid| Query::table("spaces").alias("s").filter(col("s.id").in_list(readable_spaces(val(user)))).select("space_id", col("s.id"));
     let spaces_of = |rows: Rows| sorted(column::<Uuid>(&rows, "space_id"));
@@ -2024,7 +2027,7 @@ async fn a_space_carries_the_callers_highest_role_and_its_member_count() -> DbRe
     assert_eq!(spaces_of(db.query(can_read(ann)).await?), sorted(vec![alpha, gamma]));
     assert!(db.query(can_read(cat)).await?.is_empty());
 
-    // Q52: deleting the group takes its memberships and its grants with
+    // Deleting the group takes its memberships and its grants with
     // it, which silently changes who can read what.
     assert_eq!(db.delete(Delete::from("groups").key([eng])).await?.affected(), 1);
     assert_eq!(rows_in(&db, Query::table("group_members")).await?, 0);
@@ -2034,7 +2037,7 @@ async fn a_space_carries_the_callers_highest_role_and_its_member_count() -> DbRe
     Ok(())
 }
 
-// R-S3, R-W11, R-X1: doc Q67-Q70, Q148, T6, T7, F7.
+// R-S3, R-W11, R-X1: a space and its first grant in one transaction, a unique slug, and a setting that drops rows when it changes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_taken_slug_fails_the_whole_space_creation() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2042,7 +2045,7 @@ async fn a_taken_slug_fails_the_whole_space_creation() -> DbResult<()> {
     let ann = new_user(&db, "ann").await?;
     db.insert(Insert::into("workspace").set("name", "Acme")).await?;
 
-    // T6: the space and its creator's grant, or neither.
+    // The space and its creator's grant, or neither.
     let create = |name: &'static str, slug: &'static str| {
         let db = db.clone();
         async move {
@@ -2073,7 +2076,7 @@ async fn a_taken_slug_fails_the_whole_space_creation() -> DbResult<()> {
     assert_eq!(rows_in(&db, Query::table("spaces")).await?, 2);
     assert_eq!(rows_in(&db, Query::table("space_members")).await?, 2);
 
-    // Q69: a patch that takes another space's slug changes nothing.
+    // A patch that takes another space's slug changes nothing.
     let patch = |space: Uuid, slug: Option<&str>, settings: Json| {
         let update =
             Update::table("spaces").key([space]).set("name", coalesce([null(), col("name")])).set("slug", coalesce([val(slug), col("slug")]));
@@ -2087,7 +2090,7 @@ async fn a_taken_slug_fails_the_whole_space_creation() -> DbResult<()> {
     let row = db.get("spaces", [wiki]).await?.expect("the space");
     assert_eq!((row.get::<String>("slug")?, row.get::<Json>("settings")?, row.is_null("description")?), ("wiki".to_string(), json!({}), true));
 
-    // Q70.
+    // Setting the icon and clearing it.
     db.update(Update::table("spaces").key([docs]).set("icon", "icon.png").set("updated_at", now())).await?;
     db.update(Update::table("spaces").key([docs]).set("icon", null()).set("updated_at", now())).await?;
 
@@ -2096,13 +2099,13 @@ async fn a_taken_slug_fails_the_whole_space_creation() -> DbResult<()> {
     new_share(&db, in_docs, "docs-key", false).await?;
     new_share(&db, in_wiki, "wiki-key", false).await?;
 
-    // Q67, F7: sharing is on where neither the workspace nor the space
+    // Sharing is on where neither the workspace nor the space
     // turned it off.
     let enabled = |space: Uuid| Query::table("spaces").alias("s").key([space]).select("ok", sharing_enabled(col("s.settings")));
     assert!(db.query_one(enabled(wiki)).await?.get::<bool>("ok")?);
 
-    // T7: turning sharing off in a space drops the space's public links
-    // in the same transaction (Q69, then Q148 by subquery).
+    // Turning sharing off in a space drops the space's public links in
+    // the same transaction: the patch, then a delete by subquery.
     db.transaction(|tx| async move {
         tx.update(patch(wiki, None, json!({"sharingDisabled": true}))).await?;
         let pages = Query::table("pages").index("pages_tree_idx", KeyRange::eq([wiki])).select("id", col("id"));
@@ -2125,7 +2128,7 @@ async fn a_taken_slug_fails_the_whole_space_creation() -> DbResult<()> {
     Ok(())
 }
 
-/// Q76: gives users a role in a space; those who have one get the new
+/// Gives users a role in a space; those who have one get the new
 /// one. The conflict target is the unique index over user grants only.
 fn add_users(space: Uuid, users: &[Uuid], role: &str, by: Uuid) -> Insert {
     let rows = Query::table("users")
@@ -2155,7 +2158,7 @@ fn add_groups(space: Uuid, groups: &[Uuid], role: &str, by: Uuid) -> Insert {
         .update("role", excluded("role"))
 }
 
-// R-Q9, R-Q13, R-S3, R-S7, R-W3, R-W4: doc Q72-Q76, T8.
+// R-Q9, R-Q13, R-S3, R-S7, R-W3, R-W4: upserts fed by a query onto partial unique indexes, checks, and a list of nested objects.
 #[tokio::test(flavor = "multi_thread")]
 async fn space_members_are_upserted_on_partial_unique_indexes() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2170,7 +2173,7 @@ async fn space_members_are_upserted_on_partial_unique_indexes() -> DbResult<()> 
     let anns_grant: Uuid =
         db.query_one(Query::table("space_members").index("space_members_user_key", KeyRange::eq([space, ann]))).await?.get("id")?;
 
-    // T8: users, then groups, in one transaction. Ann is in already: her
+    // Users, then groups, in one transaction. Ann is in already: her
     // grant keeps its id and who added her, and takes the new role.
     let added = db
         .transaction(|tx| async move {
@@ -2202,7 +2205,7 @@ async fn space_members_are_upserted_on_partial_unique_indexes() -> DbResult<()> 
     let twice = db.insert(Insert::into("space_members").set("space_id", space).set("user_id", bob).set("role", "reader")).await.unwrap_err();
     assert!(twice.violates("space_members_user_key"));
 
-    // Q74: the member list. Groups first, then by the name of the group
+    // The member list. Groups first, then by the name of the group
     // or the user, each as a nested object.
     let member_count = scalar(Query::table("group_members").alias("gm").range(KeyRange::eq([col("g.id")])).select("n", count()));
     let user = object([
@@ -2237,8 +2240,8 @@ async fn space_members_are_upserted_on_partial_unique_indexes() -> DbResult<()> 
     assert!(listed[2].is_null("group")?);
     assert_eq!(listed[3].get::<Json>("user")?["name"], json!("bob"));
 
-    // Q72, Q73: the users a set of grants reaches, directly or through a
-    // group. A UNION in Postgres: two reads here, and a set.
+    // The users a set of grants reaches, directly or through a group. A
+    // UNION in Postgres: two reads here, and a set.
     let grants = ids(&db.query(Query::table("space_members").index("space_members_space_idx", KeyRange::eq([space])).columns(["id"])).await?);
     let direct = Query::table("space_members").keys(grants.iter().map(|id| [*id])).filter(col("user_id").is_not_null()).columns(["user_id"]);
     let through_groups = Query::table("space_members")
@@ -2259,20 +2262,20 @@ enum Guarded {
     NotFound,
 }
 
-/// T9 and T10: changes a grant's role (`Some`) or removes the grant
-/// (`None`), unless the space would be left without an admin. Postgres
-/// locked the one row, which let two admins remove each other at the same
-/// moment; a writing transaction counts with nobody in between.
+/// Changes a grant's role (`Some`) or removes the grant (`None`), unless
+/// the space would be left without an admin. A lock on that one row
+/// would still let two admins remove each other at the same moment; a
+/// writing transaction counts with nobody in between.
 async fn change_grant(db: &Client, space: Uuid, member: Uuid, role: Option<&str>) -> DbResult<Guarded> {
     db.transaction(|tx| async move {
-        // Q77.
+        // The grant, if it is one of this space's.
         let Some(current) =
             tx.query_opt(Query::table("space_members").key([member]).filter(col("space_id").eq(space)).columns(["id", "role"])).await?
         else {
             return Ok(Guarded::NotFound);
         };
         if current.get::<String>("role")? == "admin" && role != Some("admin") {
-            // Q78.
+            // How many admins the space has.
             let admins: i64 = tx
                 .query_one(
                     Query::table("space_members")
@@ -2286,7 +2289,7 @@ async fn change_grant(db: &Client, space: Uuid, member: Uuid, role: Option<&str>
                 return Ok(Guarded::LastAdmin);
             }
         }
-        // Q79.
+        // The change itself.
         match role {
             Some(role) => tx.update(Update::table("space_members").key([member]).set("role", role)).await?,
             None => tx.delete(Delete::from("space_members").key([member])).await?,
@@ -2296,27 +2299,27 @@ async fn change_grant(db: &Client, space: Uuid, member: Uuid, role: Option<&str>
     .await
 }
 
-/// T5: gives a user another workspace role unless that leaves no active
-/// owner. Postgres serialised these with an advisory lock; one writing
+/// Gives a user another workspace role unless that leaves no active
+/// owner. Postgres needs an advisory lock to serialise these; one writing
 /// transaction counts and writes with nobody in between.
 async fn change_role(db: &Client, user: Uuid, role: &str) -> DbResult<bool> {
     db.transaction(|tx| async move {
         let current = tx.query_one(Query::table("users").key([user]).columns(["role", "deactivated_at"])).await?;
         if current.get::<String>("role")? == "owner" && role != "owner" {
-            // Q24.
+            // How many active owners there are.
             let owners = rows_in(&tx, Query::table("users").filter(col("role").eq("owner").and(col("deactivated_at").is_null()))).await?;
             if owners <= 1 {
                 return Ok(false);
             }
         }
-        // Q28.
+        // The new role.
         let changed = tx.update(Update::table("users").key([user]).set("role", role).set("updated_at", now()).returning(USER_COLUMNS)).await?;
         Ok::<_, DbError>(changed.affected() == 1)
     })
     .await
 }
 
-// R-S7, R-W6, R-X1, R-X2, R-X3: doc Q6, Q24, Q28, Q77-Q79, T5, T9, T10.
+// R-S7, R-W6, R-X1, R-X2, R-X3: count-then-write guards that hold when two transactions race.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_last_owner_and_the_last_admin_of_a_space_stay() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2325,7 +2328,7 @@ async fn the_last_owner_and_the_last_admin_of_a_space_stay() -> DbResult<()> {
     let (ann, bob) = (w.ann, w.bob);
     db.update(Update::table("users").filter(col("id").in_list(uuids(&[ann, bob]))).set("role", "owner")).await?;
 
-    // T5: both owners of the workspace step down at once. Whoever goes
+    // Both owners of the workspace step down at once. Whoever goes
     // second finds one owner left, themselves, and stays.
     let demote = |user: Uuid| {
         let db = db.clone();
@@ -2338,14 +2341,14 @@ async fn the_last_owner_and_the_last_admin_of_a_space_stay() -> DbResult<()> {
     let bad = db.update(Update::table("users").key([ann]).set("role", "root")).await.unwrap_err();
     assert_eq!(bad.code, ErrorCode::CheckViolation);
     assert!(bad.violates("users_role_check"));
-    // Q28's other form: by provider subject, nothing returned.
+    // The same update by provider subject, nothing returned.
     db.update(Update::table("users").key([bob]).set("auth_sub", "sub-bob")).await?;
     let by_subject = db
         .update(Update::table("users").index("users_auth_sub_key", KeyRange::eq(["sub-bob"])).set("role", "admin").set("updated_at", now()))
         .await?;
     assert_eq!((by_subject.affected(), by_subject.len()), (1, 0));
 
-    // T9, T10: the same guard on the admins of a space.
+    // The same guard on the admins of a space.
     let anns =
         db.query_one(Query::table("space_members").index("space_members_user_key", KeyRange::eq([w.space, w.ann]))).await?.get::<Uuid>("id")?;
     let bobs = grant(&db, w.space, w.bob, "admin").await?;
@@ -2377,7 +2380,7 @@ async fn the_last_owner_and_the_last_admin_of_a_space_stay() -> DbResult<()> {
     Ok(())
 }
 
-// R-S6, R-W10, R-X1: doc Q71, §4.8.
+// R-S6, R-W10, R-X1: deleting a space cascades through everything under it, after a delete that returns its files' storage keys.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_space_returns_its_file_keys_and_takes_everything_under_it() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2418,9 +2421,9 @@ async fn deleting_a_space_returns_its_file_keys_and_takes_everything_under_it() 
         .await?;
     let kept_file = new_file(&db, kept_page, kept_space, "key-kept").await?;
 
-    // Q71. One statement with two data-modifying CTEs in Postgres. The
-    // files go first and by hand: their foreign keys only set NULL, and
-    // the keys of their objects are needed to remove those.
+    // One statement with two data-modifying CTEs in Postgres. The files
+    // go first and by hand: their foreign keys only set NULL, and the
+    // keys of their objects are needed to remove those.
     let keys = db
         .transaction(|tx| async move {
             let pages = Query::table("pages").index("pages_tree_idx", KeyRange::eq([space])).select("id", col("id"));
@@ -2462,7 +2465,7 @@ async fn deleting_a_space_returns_its_file_keys_and_takes_everything_under_it() 
 
 // ------------------------------------------------- pages: lookups and lists
 
-// R-Q1, R-Q2, R-Q6, R-Q10: doc Q80-Q86, F1, F2, F3.
+// R-Q1, R-Q2, R-Q6, R-Q10: a page by key or unique slug, projected with or without its document, with a correlated role.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_page_loads_by_id_or_slug_with_the_callers_role() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2479,7 +2482,7 @@ async fn a_page_loads_by_id_or_slug_with_the_callers_role() -> DbResult<()> {
     let trashed: Uuid =
         db.insert(page_insert(w.space, Some(child), "a0", "Trashed").set("deleted_at", now()).returning(["id"])).await?.one()?.get("id")?;
 
-    // Q80: the access check behind almost every endpoint. The page, with
+    // The access check behind almost every endpoint. The page, with
     // or without its document, and the caller's role in its space.
     let find = |pages: Query, user: Uuid| {
         page_columns(pages.alias("p")).select("content", col("p.content")).select("rank", role_rank(col("p.space_id"), val(user)))
@@ -2502,40 +2505,39 @@ async fn a_page_loads_by_id_or_slug_with_the_callers_role() -> DbResult<()> {
         page_columns(Query::table("pages").alias("p").key([page])).select("content", null()).select("rank", role_rank(col("p.space_id"), val(w.ann)));
     assert!(db.query_one(light).await?.is_null("content")?);
 
-    // Q81: F1 alone. A page whose only child is in the trash has none.
+    // The tree columns alone. A page whose only child is in the trash has none.
     let item = |id: Uuid| tree_columns(Query::table("pages").alias("p").key([id]));
     assert!(db.query_one(item(page)).await?.get::<bool>("has_children")?);
     assert!(!db.query_one(item(child)).await?.get::<bool>("has_children")?);
 
-    // Q82, Q83: what a collaboration session loads, and its staleness probe.
+    // What a collaboration session loads, and its staleness probe.
     let loaded = db.query_one(Query::table("pages").key([page]).columns(["content", "doc_version", "space_id", "deleted_at"])).await?;
     assert_eq!((loaded.get::<Uuid>("space_id")?, loaded.is_null("deleted_at")?), (w.space, true));
     assert_eq!(db.query_one(Query::table("pages").key([page]).columns(["doc_version"])).await?.get::<i64>("doc_version")?, 0);
 
-    // Q84: a parent must be a live page of the same space.
+    // A parent must be a live page of the same space.
     let parent_ok =
         |id: Uuid, space: Uuid| Query::table("pages").key([id]).filter(col("space_id").eq(space).and(col("deleted_at").is_null())).columns(["id"]);
     assert!(db.query_opt(parent_ok(page, w.space)).await?.is_some());
     assert!(db.query_opt(parent_ok(trashed, w.space)).await?.is_none());
     assert!(db.query_opt(parent_ok(page, uuid(404))).await?.is_none());
 
-    // Q85: what a public share shows, never a trashed page.
+    // What a public share shows, never a trashed page.
     let public = |pages: Query| {
         tree_columns(pages.alias("p").filter(col("p.deleted_at").is_null())).columns(["p.cover", "p.content", "p.created_at", "p.updated_at"])
     };
     assert!(db.query_opt(public(Query::table("pages").index("pages_slug_id_key", KeyRange::eq(["welcome001"])))).await?.is_some());
     assert!(db.query_opt(public(Query::table("pages").key([trashed]))).await?.is_none());
 
-    // Q86: an export reads documents in batches.
+    // An export reads documents in batches.
     let batch = db.query(Query::table("pages").keys([[child], [page]]).columns(["id", "content"])).await?;
     assert_eq!(ids(&batch), [child, page]);
     assert!(batch.first().expect("the child").is_null("content")?);
     Ok(())
 }
 
-/// The sibling predicate S (Q95-Q97): live pages of a space under one
-/// parent, or the roots when there is none, leaving out a page that is
-/// being moved.
+/// The sibling predicate: live pages of a space under one parent, or the
+/// roots when there is none, leaving out a page that is being moved.
 fn sibling(space: Uuid, parent: Option<Uuid>, moving: Option<Uuid>) -> Expr {
     all([
         col("p.space_id").eq(space),
@@ -2550,12 +2552,12 @@ fn siblings(space: Uuid, parent: Option<Uuid>, moving: Option<Uuid>) -> Query {
     Query::table("pages").alias("p").index("pages_tree_idx", KeyRange::eq([space])).filter(sibling(space, parent, moving))
 }
 
-/// Q87: the children of a node, or the roots, in sibling order.
+/// The children of a node, or the roots, in sibling order.
 fn children(space: Uuid, parent: Option<Uuid>) -> Query {
     tree_columns(siblings(space, parent, None)).order_by(col("p.position")).order_by(col("p.id"))
 }
 
-// R-Q2, R-Q4, R-Q11, R-T9: doc Q87, Q90, Q95-Q97, §4.9.
+// R-Q2, R-Q4, R-Q11, R-T9: text ordered by its bytes, `IS NOT DISTINCT FROM` on a nullable parent, and `min`/`max` over siblings.
 #[tokio::test(flavor = "multi_thread")]
 async fn siblings_are_ordered_by_the_bytes_of_their_position_keys() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2578,7 +2580,7 @@ async fn siblings_are_ordered_by_the_bytes_of_their_position_keys() -> DbResult<
     new_page(&db, space, Some(b), "A", "B capital A").await?;
     db.insert(page_insert(space, Some(d), "a0", "D trashed").set("deleted_at", now())).await?;
 
-    // Q87: `IS NOT DISTINCT FROM` lets one query serve the roots, whose
+    // `IS NOT DISTINCT FROM` lets one query serve the roots, whose
     // parent is NULL, and the children of a page.
     let roots = db.query(children(space, None)).await?;
     assert_eq!(titles(&roots), ["B", "D", "C", "A"]);
@@ -2590,7 +2592,7 @@ async fn siblings_are_ordered_by_the_bytes_of_their_position_keys() -> DbResult<
     let first_two = Query::table("pages").index("pages_parent_idx", KeyRange::eq([b])).filter(col("deleted_at").is_null()).limit(2);
     assert_eq!(titles(&db.query(first_two).await?), ["B one", "B capital A"]);
 
-    // Q90: a whole space for an export.
+    // A whole space for an export.
     let exported = Query::table("pages")
         .index("pages_tree_idx", KeyRange::eq([space]))
         .filter(col("deleted_at").is_null())
@@ -2599,7 +2601,7 @@ async fn siblings_are_ordered_by_the_bytes_of_their_position_keys() -> DbResult<
     let exported = db.query(exported.columns(["id", "slug_id", "parent_id", "title", "is_base"])).await?;
     assert_eq!(titles(&exported), ["B one", "B capital A", "B", "D", "B small a", "C", "A"]);
 
-    // Q95, Q96: the last and the first key among siblings; none in an
+    // The last and the first key among siblings; none in an
     // empty place, which is still one row.
     let edge = |query: Query, of: fn(Expr) -> Expr| query.select("position", of(col("p.position")));
     let last = db.query_one(edge(siblings(space, None, None), max)).await?;
@@ -2614,7 +2616,7 @@ async fn siblings_are_ordered_by_the_bytes_of_their_position_keys() -> DbResult<
     let without_c = db.query_one(edge(siblings(space, None, Some(uuid(1))), max)).await?;
     assert_eq!(without_c.get::<String>("position")?, "a0");
 
-    // Q97: the key of a given sibling, then the next key after it.
+    // The key of a given sibling, then the next key after it.
     let position_of =
         |id: Uuid, parent: Option<Uuid>| Query::table("pages").alias("p").key([id]).filter(sibling(space, parent, None)).columns(["p.position"]);
     let after_b: String = db.query_one(position_of(b, None)).await?.get("position")?;
@@ -2622,12 +2624,12 @@ async fn siblings_are_ordered_by_the_bytes_of_their_position_keys() -> DbResult<
     assert_eq!(next.get::<String>("position")?, "Zz");
     let after_last = db.query_one(edge(siblings(space, None, None).filter(col("p.position").gt("a0")), min)).await?;
     assert!(after_last.is_null("position")?);
-    // A page that is not a sibling there is no row: the app answers 404.
+    // A page that is not a sibling there is no row: a 404 for the caller.
     assert!(db.query_opt(position_of(b, Some(d))).await?.is_none());
     Ok(())
 }
 
-// R-Q4, R-Q5, R-Q7, R-Q9, R-Q10, R-S4: doc Q88, Q91-Q94, F4, F5.
+// R-Q4, R-Q5, R-Q7, R-Q9, R-Q10, R-S4: a paged listing off a partial descending index, joined, scoped by a subquery and filtered by pattern.
 #[tokio::test(flavor = "multi_thread")]
 async fn recent_pages_come_from_readable_spaces_newest_first() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2653,9 +2655,9 @@ async fn recent_pages_come_from_readable_spaces_newest_first() -> DbResult<()> {
     db.insert(page(5, private, "Roadblocks", "2026-03-04T10:00:00Z", ann, Some(bob))).await?;
     db.insert(page(6, shared, "Shared notes", "2026-03-05T10:00:00Z", ann, Some(bob))).await?;
 
-    // Q88. The index over live pages is already newest first with the id
-    // as tie-break, so the page is cut without a sort. The optional
-    // filters are `$x IS NULL OR col = $x`, as the app wrote them.
+    // The index over live pages is already newest first with the id as
+    // tie-break, so the page is cut without a sort. The optional filters
+    // are `$x IS NULL OR col = $x`, as SQL would write them.
     let recent = |user: Uuid, space: Option<Uuid>, creator: Option<Uuid>| {
         let pages = Query::table("pages")
             .alias("p")
@@ -2683,7 +2685,7 @@ async fn recent_pages_come_from_readable_spaces_newest_first() -> DbResult<()> {
     assert_eq!(numbers(&db.query(recent(ann, Some(w.space), Some(ann)).limit(10)).await?), [4, 1]);
     assert_eq!(numbers(&db.query(recent(bob, None, None).limit(10)).await?), [5]);
 
-    // Q91: page titles that hold the needle, those that start with it first.
+    // Page titles that hold the needle, those that start with it first.
     let suggest = |user: Uuid, needle: &str| {
         let title = || col("p.title").or_else("").lower();
         let pages = Query::table("pages")
@@ -2700,7 +2702,7 @@ async fn recent_pages_come_from_readable_spaces_newest_first() -> DbResult<()> {
     assert_eq!(numbers(&db.query(suggest(ann, "road")).await?), [3, 1, 4]);
     assert!(db.query(suggest(ann, "roadblock")).await?.is_empty());
 
-    // Q92: the pages some cells point at, as far as the user can read them.
+    // The pages some cells point at, as far as the user can read them.
     let resolve = |pages: Query, user: Uuid| {
         pages
             .alias("p")
@@ -2713,11 +2715,11 @@ async fn recent_pages_come_from_readable_spaces_newest_first() -> DbResult<()> {
     let resolved = db.query(resolve(Query::table("pages").keys(asked.map(|id| [id])), ann)).await?;
     assert_eq!(numbers(&resolved), [1, 6]);
     assert_eq!(column::<String>(&resolved, "space_slug"), ["docs", "shared"]);
-    // Q93: the same by public slug id.
+    // The same by public slug id.
     let by_slug = Query::table("pages").index_ranges("pages_slug_id_key", ["slug-6", "slug-5", "slug-3"].map(|slug| KeyRange::eq([slug])));
     assert_eq!(numbers(&db.query(resolve(by_slug, ann)).await?), [6, 3]);
 
-    // Q94: what a notification mail says, with a value from another table.
+    // What a notification email says, with a value from another table.
     let mail = Query::table("pages")
         .alias("p")
         .key([uuid(1)])
@@ -2733,7 +2735,7 @@ async fn recent_pages_come_from_readable_spaces_newest_first() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q9, R-S4, R-T3: doc Q89.
+// R-Q9, R-S4, R-T3: a self left join off a partial index, comparing timestamps to the microsecond.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_trash_lists_the_root_of_each_trashed_subtree() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2756,7 +2758,7 @@ async fn the_trash_lists_the_root_of_each_trashed_subtree() -> DbResult<()> {
     let elsewhere = new_space(&db, "elsewhere").await?;
     db.insert(page_insert(elsewhere, None, "a0", "Another space's trash").set("deleted_at", t3)).await?;
 
-    // Q89: a trashed page is listed unless its parent went at the very
+    // A trashed page is listed unless its parent went at the very
     // same instant. The index holds only trashed pages, by space.
     let trash = Query::table("pages")
         .alias("p")
@@ -2796,12 +2798,12 @@ async fn tree(db: &impl Db, space: Uuid) -> DbResult<Tree> {
     Ok(Tree { root, a, b, c, x })
 }
 
-/// Q98's chain: a page and the pages above it.
+/// A page and the pages above it.
 fn chain(page: Uuid) -> Query {
     Query::table("pages").alias("p").ancestors([[page]], "parent_id")
 }
 
-// R-Q19: doc Q98, Q101.
+// R-Q19: a walk up the tree, with its depth, a stop condition and a depth guard.
 #[tokio::test(flavor = "multi_thread")]
 async fn breadcrumbs_run_from_the_root_down_to_the_page() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2814,20 +2816,20 @@ async fn breadcrumbs_run_from_the_root_down_to_the_page() -> DbResult<()> {
     assert_eq!(ids(&climb), [t.c, t.b, t.a, t.root]);
     assert_eq!(column::<i64>(&climb, "depth"), [0, 1, 2, 3]);
 
-    // Q98: breadcrumbs are the same rows, root first.
+    // Breadcrumbs are the same rows, root first.
     let crumbs = db.query(tree_columns(chain(t.c)).order_by(Expr::Depth.desc())).await?;
     assert_eq!(titles(&crumbs), ["root", "a", "b", "c"]);
     assert_eq!(column::<bool>(&crumbs, "has_children"), [true, true, true, false]);
     assert_eq!(titles(&db.query(tree_columns(chain(t.x)).order_by(Expr::Depth.desc())).await?), ["x"]);
     assert!(db.query(chain(uuid(404))).await?.is_empty());
 
-    // Q101: the breadcrumbs of a public share end at the shared page;
+    // The breadcrumbs of a public share end at the shared page;
     // what is above it is never read.
     let public = |page: Uuid, shared: Uuid| tree_columns(chain(page).stop_at(col("p.id").eq(shared))).order_by(Expr::Depth.desc());
     assert_eq!(titles(&db.query(public(t.c, t.a)).await?), ["a", "b", "c"]);
     assert_eq!(titles(&db.query(public(t.a, t.a)).await?), ["a"]);
 
-    // The depth guard Postgres' recursive query carried.
+    // The depth guard a recursive query in Postgres carries.
     assert_eq!(titles(&db.query(tree_columns(chain(t.c).max_depth(1))).await?), ["c", "b"]);
     Ok(())
 }
@@ -2839,17 +2841,17 @@ enum Moved {
     IntoItself,
 }
 
-/// A position key after `last`. The app computes a key between two
-/// neighbours; the tests only append.
+/// A position key after `last`. An application computes a key between
+/// two neighbours; the tests only append.
 fn key_after(last: Option<String>) -> String {
     last.map_or("a0".to_string(), |key| format!("{key}V"))
 }
 
-/// T13: moves a page under another parent of its space, at the end.
+/// Moves a page under another parent of its space, at the end.
 async fn move_page(db: &Client, page: Uuid, space: Uuid, parent: Option<Uuid>) -> DbResult<Moved> {
     db.transaction(|tx| async move {
         if let Some(parent) = parent {
-            // Q84.
+            // The parent must be a live page of the same space.
             if tx
                 .query_opt(Query::table("pages").key([parent]).filter(col("space_id").eq(space).and(col("deleted_at").is_null())).columns(["id"]))
                 .await?
@@ -2857,24 +2859,24 @@ async fn move_page(db: &Client, page: Uuid, space: Uuid, parent: Option<Uuid>) -
             {
                 return Ok(Moved::NoSuchParent);
             }
-            // Q99: the new parent may not be the page or anything under
+            // The new parent may not be the page or anything under
             // it; that is, the page may not be among the parent's ancestors.
             if !tx.query(chain(parent).filter(col("p.id").eq(page)).columns(["p.id"])).await?.is_empty() {
                 return Ok(Moved::IntoItself);
             }
         }
-        // Q95.
+        // The last key among the new siblings.
         let last: Option<String> =
             tx.query_one(siblings(space, parent, Some(page)).select("position", max(col("p.position")))).await?.get("position")?;
         let position = key_after(last);
-        // Q112. A move is not an edit: `updated_at` stays.
+        // A move is not an edit: `updated_at` stays.
         tx.update(Update::table("pages").key([page]).set("parent_id", parent).set("position", position.as_str())).await?;
         Ok::<_, DbError>(Moved::To(position))
     })
     .await
 }
 
-// R-Q19, R-W6, R-X1: doc Q84, Q95, Q99, Q112, T13.
+// R-Q19, R-W6, R-X1: a move checked against the new parent's ancestors, in one transaction.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_page_cannot_move_into_its_own_subtree() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2908,7 +2910,7 @@ async fn a_page_cannot_move_into_its_own_subtree() -> DbResult<()> {
     Ok(())
 }
 
-/// Q100: whether the public share of `shared` exposes `page`: the page is
+/// Whether the public share of `shared` exposes `page`: the page is
 /// live and `shared` is the page or above it. The walk stops at the
 /// shared page, so nothing outside the share is read.
 fn exposed_by(page: Uuid, shared: Uuid) -> Query {
@@ -2917,7 +2919,7 @@ fn exposed_by(page: Uuid, shared: Uuid) -> Query {
     Query::table("pages").alias("start").key([page]).filter(col("start.deleted_at").is_null()).select("allowed", exists(up_to_share))
 }
 
-/// Q102: the nearest page above `page` that is shared with its children.
+/// The nearest page above `page` that is shared with its children.
 fn inherited_share(page: Uuid) -> Query {
     let shared = chain(page)
         .join(Query::table("shares").alias("sh").index("shares_page_id_key", KeyRange::eq([col("p.id")])).filter(col("sh.include_children").eq(true)))
@@ -2930,7 +2932,7 @@ fn inherited_share(page: Uuid) -> Query {
         .select("share_created_at", col("sh.created_at"))
 }
 
-// R-Q9, R-Q13, R-Q19: doc Q100, Q102, Q144-Q146, F7.
+// R-Q9, R-Q13, R-Q19: walks up the tree that stop at a shared page or join each step to a share, and settings read from JSON.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_public_share_exposes_its_page_and_what_is_under_it() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2946,7 +2948,7 @@ async fn a_public_share_exposes_its_page_and_what_is_under_it() -> DbResult<()> 
         }
     };
 
-    // Q100, on every public page view and file download.
+    // Asked on every public page view and file download.
     assert!(allowed(t.c, t.a).await?);
     assert!(allowed(t.a, t.a).await?);
     assert!(!allowed(t.root, t.a).await?);
@@ -2956,7 +2958,7 @@ async fn a_public_share_exposes_its_page_and_what_is_under_it() -> DbResult<()> 
     let walked = db.query(chain(t.c).stop_at(col("p.id").eq(t.a)).columns(["p.title"])).await?;
     assert_eq!(titles(&walked), ["c", "b", "a"]);
 
-    // Q102: `c` is public through the nearest page above it that shares
+    // `c` is public through the nearest page above it that shares
     // its children. Its own share does not count, nor one without children.
     let root_share = new_share(&db, t.root, "root-key", true).await?;
     let a_share = new_share(&db, t.a, "a-key", true).await?;
@@ -2971,7 +2973,7 @@ async fn a_public_share_exposes_its_page_and_what_is_under_it() -> DbResult<()> 
     assert!(db.query_opt(inherited_share(t.root)).await?.is_none());
     assert!(db.query_opt(inherited_share(t.x)).await?.is_none());
 
-    // Q144: a page's own share with the page it shares.
+    // A page's own share with the page it shares.
     let with_page = |shares: Query| {
         shares
             .alias("sh")
@@ -2987,7 +2989,7 @@ async fn a_public_share_exposes_its_page_and_what_is_under_it() -> DbResult<()> 
         ("b-key".to_string(), "b".to_string(), false)
     );
 
-    // Q145: the public entry point. A key opens its page while the page
+    // The public entry point. A key opens its page while the page
     // is live and sharing is on in the workspace and in the space.
     let open = |key: &str| {
         with_page(Query::table("shares").index("shares_key_key", KeyRange::eq([key])))
@@ -3005,7 +3007,7 @@ async fn a_public_share_exposes_its_page_and_what_is_under_it() -> DbResult<()> 
     db.update(Update::table("workspace").key([1]).set("settings", json!({}))).await?;
     assert!(db.query_opt(open("a-key")).await?.is_some());
 
-    // Q146: the shares of a space, newest first, without trashed pages.
+    // The shares of a space, newest first, without trashed pages.
     db.update(Update::table("shares").index("shares_key_key", KeyRange::eq(["root-key"])).set("created_at", now() - hours(3))).await?;
     db.update(Update::table("shares").index("shares_key_key", KeyRange::eq(["a-key"])).set("created_at", now() - hours(2))).await?;
     db.update(Update::table("shares").index("shares_key_key", KeyRange::eq(["b-key"])).set("created_at", now() - hours(1))).await?;
@@ -3022,12 +3024,12 @@ async fn a_public_share_exposes_its_page_and_what_is_under_it() -> DbResult<()> 
     Ok(())
 }
 
-/// A page and everything under it, trashed or not (Q103's subtree).
+/// A page and everything under it, trashed or not.
 fn subtree(root: Uuid) -> Query {
     Query::table("pages").descendants([[root]], "parent_id", "pages_parent_idx")
 }
 
-// R-Q4, R-Q11, R-Q19: doc Q103, Q104.
+// R-Q4, R-Q11, R-Q19: a walk down the tree, breadth first, pruned at trashed pages, with aggregates over the walk.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_subtree_reads_breadth_first_in_sibling_order() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3046,7 +3048,7 @@ async fn a_live_subtree_reads_breadth_first_in_sibling_order() -> DbResult<()> {
     db.insert(page(22, Some(21), "0")).await?;
     db.insert(page(99, None, "a1")).await?;
 
-    // Q103: the ids of a subtree, trashed or not.
+    // The ids of a subtree, trashed or not.
     let everything = db.query(subtree(uuid(1)).columns(["id"])).await?;
     assert_eq!(sorted(numbers(&everything)), [1, 10, 11, 12, 20, 21, 22, 30, 31]);
     // The walk is breadth first, and each page's children come in sibling
@@ -3055,10 +3057,9 @@ async fn a_live_subtree_reads_breadth_first_in_sibling_order() -> DbResult<()> {
     let shape = db.query_one(subtree(uuid(1)).select("pages", count()).select("deepest", max(Expr::Depth))).await?;
     assert_eq!((shape.get::<i64>("pages")?, shape.get::<i64>("deepest")?), (9, 3));
 
-    // Q104: what a public share shows under its page. Trashed pages are
-    // skipped with everything under them, live or not (31 is live); the
-    // order is Postgres': depth, parent, sibling position, id; at most
-    // 5000 rows.
+    // What a public share shows under its page. Trashed pages are skipped
+    // with everything under them, live or not (31 is live); the order is
+    // depth, parent, sibling position, id; at most 5000 rows.
     let live = || subtree(uuid(1)).alias("p").prune(col("p.deleted_at").is_null());
     let shared = tree_columns(live().filter(Expr::Depth.gt(0))).select("depth", Expr::Depth);
     let shared = shared.order_by(Expr::Depth).order_by(col("p.parent_id")).order_by(col("p.position")).order_by(col("p.id")).limit(5000);
@@ -3088,7 +3089,7 @@ async fn a_live_subtree_reads_breadth_first_in_sibling_order() -> DbResult<()> {
     Ok(())
 }
 
-/// Q106: moves a live page and everything live under it to the trash and
+/// Moves a live page and everything live under it to the trash and
 /// drops the public links of all of them. Every row gets the same
 /// `deleted_at`, because `now()` is the transaction's one instant; restore
 /// and the trash list key on that equality. Returns how many pages went.
@@ -3105,7 +3106,7 @@ async fn trash(db: &Client, page: Uuid, by: Uuid) -> DbResult<u64> {
     .await
 }
 
-// R-Q8, R-Q19, R-T3, R-W13, R-X1, R-X7: doc Q106, §4.4.
+// R-Q8, R-Q19, R-T3, R-W13, R-X1, R-X7: an update over a pruned walk, stamped with the transaction's one instant.
 #[tokio::test(flavor = "multi_thread")]
 async fn trashing_a_subtree_stamps_one_instant_and_drops_its_shares() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3161,11 +3162,12 @@ async fn trashing_a_subtree_stamps_one_instant_and_drops_its_shares() -> DbResul
     Ok(())
 }
 
-/// T15: takes a page out of the trash together with exactly the pages
+/// Takes a page out of the trash together with exactly the pages
 /// under it that went there in the same operation.
 async fn restore(db: &Client, page: Uuid) -> DbResult<u64> {
     db.transaction(|tx| async move {
-        // Q116. Postgres locked the page's row and not its parent's.
+        // The page and its parent's state. Postgres would lock the page's
+        // row here, and not its parent's.
         let found = Query::table("pages")
             .alias("p")
             .key([page])
@@ -3180,14 +3182,14 @@ async fn restore(db: &Client, page: Uuid) -> DbResult<u64> {
             return Ok(0);
         };
         // A page whose parent stays in the trash comes back as a root, at
-        // the end (Q95, Q112).
+        // the end.
         if !found.is_null("parent_deleted_at")? {
             let space: Uuid = found.get("space_id")?;
             let last: Option<String> =
                 tx.query_one(siblings(space, None, Some(page)).select("position", max(col("p.position")))).await?.get("position")?;
             tx.update(Update::table("pages").key([page]).set("parent_id", null()).set("position", key_after(last))).await?;
         }
-        // Q107: the walk follows only pages stamped at the same instant.
+        // The walk follows only pages stamped at the same instant.
         let together = subtree(page).prune(col("deleted_at").is_not_distinct_from(stamp));
         let restored = tx.update(Update::rows(together).set("deleted_at", null()).set("deleted_by", null())).await?;
         Ok::<_, DbError>(restored.affected())
@@ -3195,7 +3197,7 @@ async fn restore(db: &Client, page: Uuid) -> DbResult<u64> {
     .await
 }
 
-// R-Q19, R-T3, R-W13, R-X1: doc Q95, Q107, Q112, Q116, T15.
+// R-Q19, R-T3, R-W13, R-X1: an update over a walk that follows only rows with an equal timestamp.
 #[tokio::test(flavor = "multi_thread")]
 async fn restoring_brings_back_exactly_what_was_trashed_together() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3247,11 +3249,11 @@ async fn restoring_brings_back_exactly_what_was_trashed_together() -> DbResult<(
     Ok(())
 }
 
-/// Q108: removes whole subtrees for good. In Postgres one statement
-/// returned the storage keys of the removed files and the ids of the
-/// removed pages as one result; here the two deletes of one transaction
-/// return one kind each. Files go by hand because their foreign key only
-/// sets NULL and their objects have to be removed too.
+/// Removes whole subtrees for good. In Postgres one statement returns the
+/// storage keys of the removed files and the ids of the removed pages as
+/// one result; here the two deletes of one transaction return one kind
+/// each. Files go by hand because their foreign key only sets NULL and
+/// their objects have to be removed too.
 async fn delete_subtrees(tx: &Transaction, roots: &[Uuid]) -> DbResult<(Vec<String>, Vec<Uuid>)> {
     if roots.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -3263,7 +3265,7 @@ async fn delete_subtrees(tx: &Transaction, roots: &[Uuid]) -> DbResult<(Vec<Stri
     Ok((keys, removed))
 }
 
-// R-Q8, R-Q19, R-S6, R-W10, R-W13, R-X1: doc Q8, Q108, §4.8.
+// R-Q8, R-Q19, R-S6, R-W10, R-W13, R-X1: deletes over a walk from several roots, returning what they removed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_permanent_delete_returns_file_keys_and_page_ids() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3303,7 +3305,7 @@ async fn a_permanent_delete_returns_file_keys_and_page_ids() -> DbResult<()> {
 
     let (keys, pages) = db
         .transaction(|tx| async move {
-            // Q8: the retention is a workspace setting, 30 days unless set.
+            // The retention is a workspace setting, 30 days unless set.
             let keep =
                 Query::table("workspace").key([1]).select("days", col("settings").json_text(["trashRetentionDays"]).cast(Type::Int).or_else(30));
             let keep: i64 = tx.query_one(keep).await?.get("days")?;
@@ -3323,14 +3325,14 @@ async fn a_permanent_delete_returns_file_keys_and_page_ids() -> DbResult<()> {
     Ok(())
 }
 
-/// T14: moves a page with everything under it into another space, as its
-/// last root. One statement in Postgres (Q109): the files follow, the
-/// public links go if the target space does not allow sharing, and each
-/// page row is rewritten by its place: only the moved page itself loses
-/// its parent and takes a new position.
+/// Moves a page with everything under it into another space, as its last
+/// root. One statement in Postgres: the files follow, the public links go
+/// if the target space does not allow sharing, and each page row is
+/// rewritten by its place: only the moved page itself loses its parent
+/// and takes a new position.
 async fn move_to_space(db: &Client, page: Uuid, target: Uuid) -> DbResult<u64> {
     db.transaction(|tx| async move {
-        // Q95.
+        // The last key among the target space's roots.
         let last: Option<String> =
             tx.query_one(siblings(target, None, Some(page)).select("position", max(col("p.position")))).await?.get("position")?;
         let position = key_after(last);
@@ -3348,7 +3350,7 @@ async fn move_to_space(db: &Client, page: Uuid, target: Uuid) -> DbResult<u64> {
     .await
 }
 
-// R-Q13, R-Q19, R-W6, R-W13, R-X1: doc Q95, Q109, T14.
+// R-Q13, R-Q19, R-W6, R-W13, R-X1: an update over a walk whose values depend on the row, with the dependent writes in the same transaction.
 #[tokio::test(flavor = "multi_thread")]
 async fn moving_a_subtree_to_another_space_rewrites_each_row_by_its_place() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3395,7 +3397,7 @@ async fn moving_a_subtree_to_another_space_rewrites_each_row_by_its_place() -> D
     Ok(())
 }
 
-// R-Q19, R-S6, R-W2, R-W11: doc Q117, §4.6.
+// R-Q19, R-S6, R-W2, R-W11: one insert of 2000 rows that reference each other, all or nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_thousand_pages_are_inserted_by_one_statement_or_none() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3426,10 +3428,10 @@ async fn two_thousand_pages_are_inserted_by_one_statement_or_none() -> DbResult<
         ]
     };
 
-    // "Duplicate page" copies up to 2000 pages at once. Postgres took the
-    // rows as one JSON parameter and expanded it (`jsonb_to_recordset`);
-    // here they are the statement's rows. The app chooses the ids, so a
-    // row can name its parent in the same statement, and sends parents
+    // "Duplicate page" copies up to 2000 pages at once. Postgres takes the
+    // rows as one JSON parameter and expands it (`jsonb_to_recordset`);
+    // here they are the statement's rows. The caller chooses the ids, so
+    // a row can name its parent in the same statement, and sends parents
     // first: page n hangs under page (n - 1) / 3.
     let mut pages = Insert::into("pages").columns(columns);
     for n in 0..2000 {
@@ -3474,13 +3476,13 @@ async fn two_thousand_pages_are_inserted_by_one_statement_or_none() -> DbResult<
     Ok(())
 }
 
-/// A column mapped through pairs of (old id, new id): the join against
-/// the id map that "duplicate" passed to Postgres as a JSON parameter.
+/// A column mapped through pairs of (old id, new id): in SQL, a join
+/// against an id map passed as a JSON parameter.
 fn remap(column: Expr, map: &[(Uuid, Uuid)]) -> Expr {
     case(map.iter().map(|(old, new)| (column.clone().eq(*old), val(*new))), null())
 }
 
-// R-Q6, R-Q12, R-Q13, R-W2, R-W3, R-W5, R-W6: doc Q125, Q129, Q139, Q154, Q170, Q176, Q186, Q187, T17.
+// R-Q6, R-Q12, R-Q13, R-W2, R-W3, R-W5, R-W6: copying a base with inserts fed by queries, remapped ids, rewritten JSON cells and one row per list element.
 #[tokio::test(flavor = "multi_thread")]
 async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3537,8 +3539,8 @@ async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
     .await?;
     db.insert(Insert::into("synced_blocks").set("page_id", notes).set("block_id", "blk1").set("content", json!({"type": "callout"}))).await?;
 
-    // T17, after the pages themselves were copied (Q117): the copies of
-    // the base and of its child page, and the copy of the file.
+    // The pages themselves were copied first: here are the copies of the
+    // base and of its child page, and the id of the file's copy.
     let (new_base, new_notes, new_file_id) = (uuid(1), uuid(2), uuid(3));
     db.insert(page_insert(space, None, "a2", "Tasks (copy)").set("id", new_base).set("is_base", true)).await?;
     db.insert(page_insert(space, Some(new_base), "a0", "Notes").set("id", new_notes)).await?;
@@ -3546,7 +3548,7 @@ async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
     let olds = || page_map.iter().map(|(old, _)| KeyRange::eq([*old]));
 
     db.transaction(|tx| async move {
-        // Q170: the properties of every copied base, under the new page ids.
+        // The properties of every copied base, under the new page ids.
         let properties = Query::table("base_properties")
             .alias("bp")
             .keys(page_map.iter().map(|(old, _)| [*old]))
@@ -3561,7 +3563,7 @@ async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
             .await?;
         assert_eq!(copied.affected(), 2);
 
-        // Q186: the rows keep when they were made; the copier is their
+        // The rows keep when they were made; the copier is their
         // last editor.
         let rows =
             Query::table("base_rows").alias("br").index_ranges("base_rows_order_idx", olds()).select("page_id", remap(col("br.page_id"), &page_map));
@@ -3579,13 +3581,13 @@ async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
             .await?;
         assert_eq!(copied.affected(), 2);
 
-        // Q176.
+        // The views, with the copier as their creator.
         let views =
             Query::table("base_views").alias("bv").index_ranges("base_views_page_idx", olds()).select("page_id", remap(col("bv.page_id"), &page_map));
         let views = views.columns(["bv.name", "bv.type", "bv.config", "bv.position"]).select("creator_id", val(ann));
         tx.insert(Insert::into("base_views").columns(["page_id", "name", "type", "config", "position", "creator_id"]).from_query(views)).await?;
 
-        // Q139: the copied files, their bytes already copied in storage.
+        // The copied files, their bytes already copied in storage.
         let files = Insert::into("files").columns(["id", "purpose", "page_id", "space_id", "uploader_id", "name", "mime", "size", "storage_key"]);
         tx.insert(files.values([
             val(new_file_id),
@@ -3600,10 +3602,10 @@ async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
         ]))
         .await?;
 
-        // Q187: the copied rows whose cells mention a copied file. Postgres
-        // matched a regular expression against the JSON text; an id has
-        // nothing a `like` would read as a wildcard. The app rewrites the
-        // cells and writes them back, each row its own value, at once.
+        // The copied rows whose cells mention a copied file. SQL would
+        // match a regular expression against the JSON text; an id has
+        // nothing a `like` would read as a wildcard. The caller rewrites
+        // the cells and writes them back, each row its own value, at once.
         let mentions = any([col("cells").cast(Type::Text).like(format!("%{old_file}%"))]);
         let found = tx
             .query(Query::table("base_rows").index("base_rows_order_idx", KeyRange::eq([new_base])).filter(mentions).columns(["id", "cells"]))
@@ -3618,7 +3620,7 @@ async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
         let written = tx.update(Update::rows(Query::table("base_rows").keys(rewritten.iter().map(|(id, _)| [*id]))).set("cells", cells)).await?;
         assert_eq!(written.affected(), 1);
 
-        // Q125: the links of the copies, to the pages that exist among
+        // The links of the copies, to the pages that exist among
         // the ones their documents name.
         let named = [target, uuid(404)];
         let existing = ids(&tx.query(Query::table("pages").keys(named.map(|id| [id])).columns(["id"])).await?);
@@ -3628,7 +3630,7 @@ async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
         }
         assert_eq!(tx.insert(links.on_conflict_do_nothing()).await?.affected(), 1);
 
-        // Q129.
+        // The synced blocks of the copies.
         let blocks = Insert::into("synced_blocks").columns(["page_id", "block_id", "content"]).values([
             val(new_notes),
             val("blk1"),
@@ -3636,8 +3638,8 @@ async fn duplicating_a_base_copies_its_data_under_new_ids() -> DbResult<()> {
         ]);
         tx.insert(blocks.on_conflict_do_nothing()).await?;
 
-        // Q154: the copier watches every copy. Postgres unnested an array
-        // of page ids; `each` repeats the user's row once per id.
+        // The copier watches every copy. Postgres unnests an array of page
+        // ids; `each` repeats the user's row once per id.
         let watching = Query::table("users")
             .alias("u")
             .key([ann])
@@ -3726,13 +3728,13 @@ enum Saved {
     Gone,
 }
 
-/// Q123, Q124, Q127, Q128: rebuilds what is derived from a document: its
-/// links to other pages, and the blocks other pages show a copy of.
+/// Rebuilds what is derived from a document: its links to other pages,
+/// and the blocks other pages show a copy of.
 async fn index_page_content(tx: &Transaction, save: &Save) -> DbResult<()> {
     let page = save.page;
     tx.delete(Delete::rows(Query::table("page_links").range(KeyRange::eq([page])))).await?;
     // Only pages that exist become links, and never the page itself.
-    // Postgres found an index for each half of `id = ANY(..) OR slug_id =
+    // Postgres finds an index for each half of `id = ANY(..) OR slug_id =
     // ANY(..)`; here each half is a read by its key.
     let link = |targets: Query| {
         let rows = targets.filter(col("id").ne(page)).select("source_id", val(page)).select("target_id", col("id"));
@@ -3762,7 +3764,7 @@ async fn index_page_content(tx: &Transaction, save: &Save) -> DbResult<()> {
     Ok(())
 }
 
-/// Q120: copies the page into its history, unless a version was taken in
+/// Copies the page into its history, unless a version was taken in
 /// the last five minutes (the last minute, while the page itself is
 /// younger than five), and unless the latest version already holds this
 /// very document. Returns how many versions were added: one or none.
@@ -3784,13 +3786,13 @@ async fn snapshot(tx: &Transaction, page: Uuid) -> DbResult<u64> {
     Ok(taken.affected())
 }
 
-/// T16, the save of a page's document: all of it, or nothing.
+/// The save of a page's document: all of it, or nothing.
 async fn save_page(db: &Client, save: Save) -> DbResult<Saved> {
     let tx = db.begin().await?;
-    // Q114. Postgres locked the page's row (`FOR UPDATE`) so that the
-    // version read here could not change before the write. A writing
-    // transaction is alone: a second save waits at `begin`, then reads
-    // what the first one committed.
+    // Postgres locks the page's row (`FOR UPDATE`) so that the version
+    // read here cannot change before the write. A writing transaction is
+    // alone: a second save waits at `begin`, then reads what the first
+    // one committed.
     let Some(stored) = tx.query_opt(Query::table("pages").key([save.page]).columns(["content", "space_id", "deleted_at", "doc_version"])).await?
     else {
         tx.rollback().await?;
@@ -3802,7 +3804,7 @@ async fn save_page(db: &Client, save: Save) -> DbResult<Saved> {
         return Ok(Saved::Conflict);
     }
     let version = stored + save.steps;
-    // Q115: the whole document and its text are replaced; the editor is
+    // The whole document and its text are replaced; the editor is
     // kept when the save has none; the contributors are a set union.
     let page = Update::table("pages")
         .key([save.page])
@@ -3819,26 +3821,26 @@ async fn save_page(db: &Client, save: Save) -> DbResult<Saved> {
     Ok(Saved::Stored(version))
 }
 
-/// A search has to name the key prefix of its index; doc's has none.
+/// A search has to name the key prefix of its index; this one has none.
 fn no_prefix() -> [Expr; 0] {
     []
 }
 
-/// T12: creates a page under a live page of its space, or as a root,
+/// Creates a page under a live page of its space, or as a root,
 /// after the last sibling there, and indexes what its document links to.
 /// `None` when the parent is not a live page of the space.
 async fn create_page(db: &Client, space: Uuid, parent: Option<Uuid>, title: &str, links: Vec<Uuid>, by: Uuid) -> DbResult<Option<Uuid>> {
     db.transaction(|tx| async move {
         if let Some(parent) = parent {
-            // Q84.
+            // The parent must be a live page of the space.
             let live = Query::table("pages").key([parent]).filter(col("space_id").eq(space).and(col("deleted_at").is_null())).columns(["id"]);
             if tx.query_opt(live).await?.is_none() {
                 return Ok(None);
             }
         }
-        // Q95.
+        // The last key among the siblings.
         let last: Option<String> = tx.query_one(siblings(space, parent, None).select("position", max(col("p.position")))).await?.get("position")?;
-        // Q110. The app makes the public slug, the database the id.
+        // The caller makes the public slug, the database the id.
         let content = json!({"type": "doc", "content": [{"type": "heading", "text": title}]});
         let page = Insert::into("pages")
             .set("slug_id", slug_id())
@@ -3854,7 +3856,7 @@ async fn create_page(db: &Client, space: Uuid, parent: Option<Uuid>, title: &str
             .set("last_editor_id", by)
             .set("contributor_ids", uuids(&[by]));
         let page: Uuid = tx.insert(page.returning(["id"])).await?.one()?.get("id")?;
-        // Q123, Q124, Q127, Q128.
+        // What is derived from the document.
         let mut derived = Save::new(page, 0, content, title);
         derived.link_ids = links;
         index_page_content(&tx, &derived).await?;
@@ -3863,19 +3865,19 @@ async fn create_page(db: &Client, space: Uuid, parent: Option<Uuid>, title: &str
     .await
 }
 
-/// T18: creates a base: a page flagged as one, seeded with its first
+/// Creates a base: a page flagged as one, seeded with its first
 /// columns, an empty row and a table view. All of it or none.
 async fn create_base(db: &Client, space: Uuid, title: &str, columns: &[&str], by: Uuid) -> DbResult<Uuid> {
     db.transaction(|tx| async move {
         let last: Option<String> = tx.query_one(siblings(space, None, None).select("position", max(col("p.position")))).await?.get("position")?;
-        // Q110's other form.
+        // The page, flagged as a base.
         let page = page_insert(space, None, &key_after(last), title)
             .set("creator_id", by)
             .set("last_editor_id", by)
             .set("contributor_ids", uuids(&[by]))
             .set("is_base", true);
         let page: Uuid = tx.insert(page.returning(["id"])).await?.one()?.get("id")?;
-        // Q169: three or four columns, one statement each.
+        // Three or four columns, one statement each.
         for (n, name) in columns.iter().enumerate() {
             let column = Insert::into("base_properties")
                 .set("page_id", page)
@@ -3885,7 +3887,7 @@ async fn create_base(db: &Client, space: Uuid, title: &str, columns: &[&str], by
                 .set("options", json!({}));
             tx.insert(column.set("is_primary", n == 0).set("position", format!("a{n}"))).await?;
         }
-        // Q181, Q175.
+        // An empty row and a table view.
         tx.insert(Insert::into("base_rows").set("page_id", page).set("position", "a0").set("creator_id", by).set("last_editor_id", by)).await?;
         tx.insert(
             Insert::into("base_views").set("page_id", page).set("name", "Table").set("type", "table").set("position", "a0").set("creator_id", by),
@@ -3896,7 +3898,7 @@ async fn create_base(db: &Client, space: Uuid, title: &str, columns: &[&str], by
     .await
 }
 
-// R-S5, R-S6, R-W1, R-W6, R-W11, R-X1: doc Q81, Q84, Q95, Q110, Q111, Q123, Q124, Q169, Q175, Q181, T12, T18.
+// R-S5, R-S6, R-W1, R-W6, R-W11, R-X1: a page or a base created with its dependent rows in one transaction, and the violations a bad row raises.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_page_goes_after_its_last_sibling_with_its_links_or_not_at_all() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3909,7 +3911,7 @@ async fn a_new_page_goes_after_its_last_sibling_with_its_links_or_not_at_all() -
         async move { rows_in(&db, Query::table("pages").filter(col("title").eq(title))).await }
     };
 
-    // T12.
+    // Two roots and a child, with links to pages that may not exist.
     let first = create_page(&db, w.space, None, "First", vec![], w.ann).await?.expect("a root");
     let second = create_page(&db, w.space, None, "Second", vec![first, foreign, uuid(404)], w.bob).await?.expect("a root");
     let child = create_page(&db, w.space, Some(first), "Child", vec![second], w.ann).await?.expect("a child");
@@ -3917,7 +3919,7 @@ async fn a_new_page_goes_after_its_last_sibling_with_its_links_or_not_at_all() -
     assert!(create_page(&db, w.space, Some(foreign), "Lost", vec![first], w.ann).await?.is_none());
     assert_eq!(titled("Lost").await?, 0);
 
-    // Q81: the page is read back after every write, to answer with.
+    // The page is read back after every write, to answer with.
     let read = || page_columns(Query::table("pages").alias("p").key([second])).select("content", col("p.content"));
     let row = db.query_one(read()).await?;
     assert_eq!(
@@ -3937,8 +3939,8 @@ async fn a_new_page_goes_after_its_last_sibling_with_its_links_or_not_at_all() -
     let links = db.query(Query::table("page_links").range(KeyRange::eq([second])).columns(["target_id"])).await?;
     assert_eq!(sorted(column::<Uuid>(&links, "target_id")), sorted(vec![first, foreign]));
 
-    // What the app does not handle, and answers 500 for: a slug that
-    // exists, a space that is gone, a page without a position.
+    // What only the database stops: a slug that exists, a space that is
+    // gone, a page without a position.
     let slug: String = row.get("slug_id")?;
     let clash = db.insert(page_with_slug(&slug, w.space, None, "zz", "Clash")).await.unwrap_err();
     assert!(clash.is_unique_violation() && clash.violates("pages_slug_id_key"));
@@ -3947,7 +3949,7 @@ async fn a_new_page_goes_after_its_last_sibling_with_its_links_or_not_at_all() -
     assert_eq!(unplaced.code, ErrorCode::NotNullViolation);
     assert!(unplaced.violates("position"));
 
-    // Q111: a patch of the page's metadata. Each of the three is changed
+    // A patch of the page's metadata. Each of the three is changed
     // only if given, and given as nothing it is cleared.
     let patch = |title: Option<Option<&str>>, icon: Option<Option<&str>>, cover: Option<Option<&str>>| {
         let given = |value: Option<Option<&str>>, column: &str| when(val(value.is_some()), val(value.flatten()), col(column));
@@ -3974,7 +3976,7 @@ async fn a_new_page_goes_after_its_last_sibling_with_its_links_or_not_at_all() -
     // The page is found by its new title at once.
     assert_eq!(ids(&db.query(Query::table("pages").search("pages_search_idx", no_prefix(), "renamed").columns(["id"])).await?), [second]);
 
-    // T18: a base arrives whole.
+    // A base arrives whole.
     let base = create_base(&db, w.space, "Tasks", &["Name", "Status", "Due"], w.ann).await?;
     let row = db.get("pages", [base]).await?.expect("the base");
     assert_eq!((row.get::<bool>("is_base")?, row.get::<String>("position")?), (true, "a0VV".to_string()));
@@ -3997,7 +3999,7 @@ async fn a_new_page_goes_after_its_last_sibling_with_its_links_or_not_at_all() -
     Ok(())
 }
 
-// R-Q13, R-Q14, R-Q17, R-T6, R-W3, R-W4, R-W5, R-X1: doc Q114, Q115, Q123, Q124, Q127, Q128, T16.
+// R-Q13, R-Q14, R-Q17, R-T6, R-W3, R-W4, R-W5, R-X1: a save that replaces a document, its links, its blocks and its search entry in one transaction.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_save_replaces_the_document_and_rebuilds_what_derives_from_it() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4085,7 +4087,7 @@ async fn a_save_replaces_the_document_and_rebuilds_what_derives_from_it() -> DbR
     Ok(())
 }
 
-// R-W7, R-X1, R-X2, R-X3, R-X4: doc Q83, Q114, T16, §3.3, §3.5.
+// R-W7, R-X1, R-X2, R-X3, R-X4: a version check inside a writing transaction, raced, and a writer that waits while readers do not.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_save_changes_nothing_and_of_two_at_once_one_wins() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4119,8 +4121,8 @@ async fn a_stale_save_changes_nothing_and_of_two_at_once_one_wins() -> DbResult<
     assert_eq!(rows_in(&db, Query::table("page_versions")).await?, 0);
     assert_eq!(save_page(&db, Save::new(uuid(404), 0, json!({}), "")).await?, Saved::Gone);
 
-    // Two copies of the app save from version 5 at the same moment. The
-    // second waits for the first, reads version 6, and is refused.
+    // Two sessions save from version 5 at the same moment. The second
+    // waits for the first, reads version 6, and is refused.
     let attempt = |words: &'static str| {
         let db = db.clone();
         async move { save_page(&db, Save::new(page, 5, json!({"words": words}), words)).await }
@@ -4128,7 +4130,7 @@ async fn a_stale_save_changes_nothing_and_of_two_at_once_one_wins() -> DbResult<
     let (a, b) = race(attempt("first"), attempt("second")).await;
     assert_eq!(sorted(vec![a?, b?]), [Saved::Stored(6), Saved::Conflict]);
 
-    // Q83: what any copy reads next is the winner's commit, whole.
+    // What anyone reads next is the winner's commit, whole.
     assert_eq!(db.query_one(Query::table("pages").key([page]).columns(["doc_version"])).await?.get::<i64>("doc_version")?, 6);
     let row = db.get("pages", [page]).await?.expect("the page");
     let words: String = row.get("text_content")?;
@@ -4138,10 +4140,10 @@ async fn a_stale_save_changes_nothing_and_of_two_at_once_one_wins() -> DbResult<
     assert_eq!(column::<Json>(&versions, "content"), [json!({"words": words})]);
     assert_eq!(rows_in(&db, Query::table("page_links").range(KeyRange::eq([page]))).await?, 0);
 
-    // The app's own suite holds the page's row lock from a second
-    // connection and expects a save to wait, not to fail, and then to go
-    // on from what the holder committed. Here another writer holds the
-    // database, and the save waits at `begin`.
+    // Under row locks, a save that finds the page's row held by another
+    // connection waits, does not fail, and then goes on from what the
+    // holder committed. Here another writer holds the database, and the
+    // save waits at `begin`.
     let holder = db.begin().await?;
     holder.update(Update::table("pages").key([page]).set("title", "Held")).await?;
     let waiting = tokio::spawn({
@@ -4159,7 +4161,7 @@ async fn a_stale_save_changes_nothing_and_of_two_at_once_one_wins() -> DbResult<
     Ok(())
 }
 
-// R-Q8, R-Q10, R-S4, R-T6, R-W3: doc Q120-Q122.
+// R-Q8, R-Q10, R-S4, R-T6, R-W3: an insert from a query guarded by `NOT EXISTS` over a time window and by JSON equality.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_is_taken_only_when_none_is_recent_and_the_document_changed() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4207,7 +4209,7 @@ async fn a_snapshot_is_taken_only_when_none_is_recent_and_the_document_changed()
     assert_eq!(save(5, json!({"n": 5})).await?, Saved::Stored(6));
     assert_eq!(versions().await?, 3);
 
-    // Q121: the history, newest first, without the documents.
+    // The history, newest first, without the documents.
     let history = Query::table("page_versions")
         .alias("v")
         .index("page_versions_page_idx", KeyRange::eq([page]))
@@ -4218,7 +4220,7 @@ async fn a_snapshot_is_taken_only_when_none_is_recent_and_the_document_changed()
     assert!(taken[0] > taken[1] && taken[1] > taken[2], "{taken:?}");
     assert_eq!(history.columns(), ["id", "title", "created_at", "editor_id"]);
 
-    // Q122: one version, whole. It holds the page as the save left it.
+    // One version, whole. It holds the page as the save left it.
     let newest = db.query_one(Query::table("page_versions").key([ids(&history)[0]])).await?;
     assert_eq!(
         (newest.get::<Uuid>("page_id")?, newest.get::<String>("title")?, newest.get::<String>("icon")?),
@@ -4233,7 +4235,7 @@ async fn a_snapshot_is_taken_only_when_none_is_recent_and_the_document_changed()
     Ok(())
 }
 
-// R-Q8, R-Q10, R-W3, R-W5: doc Q153, Q155, Q156, Q162, Q163.
+// R-Q8, R-Q10, R-W3, R-W5: recipients found with `NOT EXISTS` over a time window, and an insert from a query that checks access as it writes.
 #[tokio::test(flavor = "multi_thread")]
 async fn watchers_of_an_edited_page_are_told_once_per_window() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4253,7 +4255,7 @@ async fn watchers_of_an_edited_page_are_told_once_per_window() -> DbResult<()> {
     grant(&db, space, zed, "reader").await?;
     db.update(Update::table("users").key([zed]).set("deactivated_at", now())).await?;
 
-    // Q153: after a save its editors watch the page. Only users that
+    // After a save its editors watch the page. Only users that
     // exist are added, and who watches already is skipped.
     let watch = |users: &[Uuid]| {
         let rows = Query::table("users").keys(users.iter().map(|id| [*id])).select("user_id", col("id")).select("page_id", val(page));
@@ -4263,7 +4265,7 @@ async fn watchers_of_an_edited_page_are_told_once_per_window() -> DbResult<()> {
     assert_eq!(db.insert(watch(&[ann, cat, dan, eve, zed])).await?.affected(), 3);
     db.insert(Insert::into("watchers").set("user_id", bob).set("space_id", space)).await?;
     db.insert(Insert::into("watchers").set("user_id", cat).set("space_id", space)).await?;
-    // Q155.
+    // Who watches the page.
     let watching = db.query(Query::table("watchers").index("watchers_page_idx", KeyRange::eq([page])).select("id", col("user_id"))).await?;
     assert_eq!(sorted(ids(&watching)), sorted(vec![ann, cat, dan, eve, zed]));
 
@@ -4274,7 +4276,7 @@ async fn watchers_of_an_edited_page_are_told_once_per_window() -> DbResult<()> {
     db.insert(told(eve, hours(8))).await?;
     db.insert(Insert::into("notifications").set("user_id", bob).set("kind", "comment.created").set("page_id", page)).await?;
 
-    // Q156: who to tell about the edit. Watchers of the page or of its
+    // Who to tell about the edit. Watchers of the page or of its
     // space, each once; not the editors themselves; not anyone told about
     // this page in the last seven hours.
     let recently_told = || {
@@ -4287,7 +4289,7 @@ async fn watchers_of_an_edited_page_are_told_once_per_window() -> DbResult<()> {
     assert_eq!(to_tell.len(), 4);
     assert_eq!(sorted(to_tell.clone()), sorted(vec![bob, cat, eve, zed]));
 
-    // Q162: one notification for each of them who is active and can read
+    // One notification for each of them who is active and can read
     // the page's space, checked inside the insert; the rows come back.
     let notify = |recipients: &[Uuid]| {
         let can_read = Query::table("space_members")
@@ -4310,7 +4312,7 @@ async fn watchers_of_an_edited_page_are_told_once_per_window() -> DbResult<()> {
     let inserted = db.insert(notify(&to_tell)).await?;
     assert_eq!(inserted.affected(), 2);
     assert_eq!(sorted(column::<Uuid>(&inserted, "user_id")), sorted(vec![bob, cat]));
-    // The statement's last join in Postgres: where to push and mail.
+    // The statement's last join in Postgres: where to push and email.
     let recipients = db
         .query(Query::table("users").keys(column::<Uuid>(&inserted, "user_id").into_iter().map(|id| [id])).columns(["id", "email", "preferences"]))
         .await?;
@@ -4318,7 +4320,7 @@ async fn watchers_of_an_edited_page_are_told_once_per_window() -> DbResult<()> {
     let stored = db.get("notifications", [ids(&inserted)[0]]).await?.expect("the notification");
     assert_eq!((stored.get::<Json>("data")?, stored.is_null("read_at")?, stored.is_null("comment_id")?), (json!({}), true, true));
 
-    // Q163.
+    // Stamping the ones that were emailed.
     let mailed =
         db.update(Update::rows(Query::table("notifications").keys(ids(&inserted).into_iter().map(|id| [id]))).set("emailed_at", now())).await?;
     assert_eq!(mailed.affected(), 2);
@@ -4337,8 +4339,8 @@ async fn watchers_of_an_edited_page_are_told_once_per_window() -> DbResult<()> {
 
 // ------------------------------------------------------------------ search
 
-/// What the app makes of a search box's text before it asks (§4.2):
-/// lower case, the words in it, and the text as a `like` pattern.
+/// What the caller makes of a search box's text before it asks: lower
+/// case, the words in it, and the text as a `like` pattern.
 struct Needle {
     raw: String,
     words: Vec<String>,
@@ -4369,7 +4371,7 @@ fn snippet(word: &str) -> Expr {
     text.clone().substr(greatest([val(1), text.lower().strpos(word) - 100]), 400)
 }
 
-/// What Q118 returns for a page, whichever branch found it.
+/// What a search returns for a page, whichever branch found it.
 fn search_columns(pages: Query, needle: &Needle, rank: Expr) -> Query {
     let word = needle.words.first().unwrap_or(&needle.raw);
     tree_columns(pages)
@@ -4380,9 +4382,9 @@ fn search_columns(pages: Query, needle: &Needle, rank: Expr) -> Query {
         .select("rank", rank)
 }
 
-/// Q118's first branch: pages whose title or text holds every word of
-/// the needle, each as the start of a word. In order: a title that is
-/// exactly the needle, then rank, then the latest edit.
+/// The first branch of a search: pages whose title or text holds every
+/// word of the needle, each as the start of a word. In order: a title
+/// that is exactly the needle, then rank, then the latest edit.
 fn full_text_hits(needle: &Needle, scope: Expr) -> Query {
     let pages = Query::table("pages")
         .alias("p")
@@ -4398,8 +4400,8 @@ fn full_text_hits(needle: &Needle, scope: Expr) -> Query {
         .order_by(col("p.id"))
 }
 
-/// Q118's second branch: the needle anywhere in the title. No index
-/// serves it, in Postgres either: it reads every live page.
+/// The second branch of a search: the needle anywhere in the title. No
+/// index serves it, in Postgres either: it reads every live page.
 fn title_hits(needle: &Needle, scope: Expr) -> Query {
     let pages = Query::table("pages")
         .alias("p")
@@ -4432,9 +4434,9 @@ fn hits(rows: Rows) -> DbResult<Vec<Hit>> {
         .collect()
 }
 
-/// Q118 whole. In Postgres one statement said "matches the words OR has
-/// the text in its title"; a search reads only what its index finds, so
-/// the two branches are two reads of one moment, merged here: a page
+/// The whole search. In Postgres one statement says "matches the words OR
+/// has the text in its title"; a search reads only what its index finds,
+/// so the two branches are two reads of one moment, merged here: a page
 /// found only by its title ranks zero.
 async fn search(db: &Client, text: &str, scope: Expr) -> DbResult<Vec<Hit>> {
     let needle = needle(text);
@@ -4457,7 +4459,7 @@ fn hit_numbers(found: &[Hit]) -> Vec<u128> {
     found.iter().map(|hit| u128::from_be_bytes(hit.id.0)).collect()
 }
 
-/// Q119: when Q118 found nothing, the needle anywhere in the text of a
+/// When the search found nothing: the needle anywhere in the text of a
 /// page, whatever its case; the latest edits first, twenty at most. The
 /// index over live pages is in that order already.
 fn fallback_hits(text: &str, scope: Expr, limit: u64) -> Query {
@@ -4499,7 +4501,7 @@ async fn library(db: &Client) -> DbResult<Library> {
     Ok(Library { ann: w.ann, bob: w.bob, space: w.space, hidden })
 }
 
-// R-Q17: doc Q118, §4.2.
+// R-Q17: full-text matching: every word required, prefixes on request, no stemming, and an index that follows updates.
 #[tokio::test(flavor = "multi_thread")]
 async fn search_requires_every_word_as_a_prefix_and_does_not_stem() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4517,7 +4519,7 @@ async fn search_requires_every_word_as_a_prefix_and_does_not_stem() -> DbResult<
     // A word matches in the title or in the text, whatever its case.
     assert_eq!(found("roadmap", false).await?, [1, 2, 3, 4]);
     assert_eq!(found("ROADMAP", false).await?, [1, 2, 3, 4]);
-    // Whole words only, unless the query asks for prefixes, as doc does.
+    // Whole words only, unless the query asks for prefixes.
     assert!(found("road", false).await?.is_empty());
     assert_eq!(found("road", true).await?, [1, 2, 3, 4]);
     // Every word is required; they may be in different fields, in any order.
@@ -4551,7 +4553,7 @@ async fn search_requires_every_word_as_a_prefix_and_does_not_stem() -> DbResult<
     Ok(())
 }
 
-// R-Q5, R-Q15, R-Q17, R-Q21: doc Q118, §4.2.
+// R-Q5, R-Q15, R-Q17, R-Q21: search results ordered by an exact title, then rank, then recency, with a snippet cut by the database.
 #[tokio::test(flavor = "multi_thread")]
 async fn search_puts_an_exact_title_first_then_rank_then_recency() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4591,7 +4593,7 @@ async fn search_puts_an_exact_title_first_then_rank_then_recency() -> DbResult<(
     Ok(())
 }
 
-// R-Q7, R-Q17, R-Q21: doc Q118, §4.2.
+// R-Q7, R-Q17, R-Q21: a full-text read and a `like` scan of one moment, merged by the caller.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_title_substring_joins_the_results_at_rank_zero() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4632,7 +4634,7 @@ async fn a_title_substring_joins_the_results_at_rank_zero() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q4, R-Q7, R-Q15, R-Q16: doc Q119, §4.2.
+// R-Q4, R-Q7, R-Q15, R-Q16: a case-insensitive substring scan in index order, and string functions that count characters.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_fallback_scan_finds_text_inside_words_and_the_snippet_counts_characters() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4650,7 +4652,7 @@ async fn the_fallback_scan_finds_text_inside_words_and_the_snippet_counts_charac
     let long = format!("{} Needle in a haystack.{}", "é".repeat(150), " tail".repeat(100));
     db.insert(page(13, "Long", &long)).await?;
 
-    // Neither branch of Q118 finds text that starts inside a word.
+    // Neither branch of the search finds text that starts inside a word.
     assert!(search(&db, "oadmap in det", scope()).await?.is_empty());
     let found = db.query(fallback_hits("OADMAP in Det", scope(), 50)).await?;
     assert_eq!(numbers(&found), [2]);
@@ -4692,7 +4694,7 @@ async fn the_fallback_scan_finds_text_inside_words_and_the_snippet_counts_charac
     Ok(())
 }
 
-// R-Q10, R-Q17, R-Q19: doc Q105, Q118, F4, §4.2.
+// R-Q10, R-Q17, R-Q19: a search scoped by a subquery of readable spaces, or by a walk of the tree.
 #[tokio::test(flavor = "multi_thread")]
 async fn search_stays_inside_readable_spaces_or_a_shared_subtree() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4715,7 +4717,7 @@ async fn search_stays_inside_readable_spaces_or_a_shared_subtree() -> DbResult<(
     assert_eq!(hit_numbers(&search(&db, "roadmap", scope(lib.bob, None)).await?), [7]);
 
     // Title-only search: the words are looked for in the title alone,
-    // computed per row as Postgres did, and the snippet is the title.
+    // computed per row as Postgres does, and the snippet is the title.
     let titled = |text: &str, scope: Expr| {
         let needle = needle(text);
         let words = || [lower_title(), val(needle.words.join(" ")), val("simple"), val(true)];
@@ -4740,7 +4742,7 @@ async fn search_stays_inside_readable_spaces_or_a_shared_subtree() -> DbResult<(
     assert!(rank[1] > rank[2] && rank[2] > 0.0, "{rank:?}");
     assert_eq!(numbers(&db.query(titled("road", scope(lib.ann, Some(lib.space)))).await?), [2, 1]);
 
-    // Q105: a public share searches its page, or its page and the live
+    // A public share searches its page, or its page and the live
     // pages under it: a walk of the tree as the scope of a search.
     let shared = uuid(2);
     let child = |n: u128, parent: u128, title: &str| {
@@ -4762,7 +4764,7 @@ async fn search_stays_inside_readable_spaces_or_a_shared_subtree() -> DbResult<(
 
 // --------------------------------------- comments, files, shares, labels
 
-/// Q131: comments with their author and their resolver as small objects.
+/// Comments with their author and their resolver as small objects.
 fn comments_with_people(comments: Query) -> Query {
     comments
         .alias("c")
@@ -4775,7 +4777,7 @@ fn comments_with_people(comments: Query) -> Query {
         .select("resolver", user_ref("r"))
 }
 
-// R-Q9, R-Q13, R-S6, R-W6, R-W11: doc Q131-Q137, F6, §4.8.
+// R-Q9, R-Q13, R-S6, R-W6, R-W11: a thread read in index order with two left joins, and a self-referencing cascade.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_comment_thread_reads_with_its_people_and_falls_with_its_first_comment() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4787,7 +4789,7 @@ async fn a_comment_thread_reads_with_its_people_and_falls_with_its_first_comment
     let other_page = new_page(&db, w.space, None, "a1", "Quiet").await?;
     let (first, second, third) = (ts("2026-03-01T09:00:00Z"), ts("2026-03-01T10:00:00Z"), ts("2026-03-01T11:00:00Z"));
 
-    // Q134.
+    // Writing comments: two threads, one of them with replies.
     let comment = |n: u128, parent: Option<u128>, author: Option<Uuid>, at: Timestamp| {
         let body = json!({"type": "doc", "content": [{"type": "text", "text": format!("comment {n}")}]});
         let comment = Insert::into("comments")
@@ -4806,7 +4808,7 @@ async fn a_comment_thread_reads_with_its_people_and_falls_with_its_first_comment
     assert_eq!(no_body.code, ErrorCode::NotNullViolation);
     assert!(no_body.violates("body"));
 
-    // Q131: the thread of a page, oldest first; the index is in that order.
+    // The thread of a page, oldest first; the index is in that order.
     let thread = db.query(comments_with_people(Query::table("comments").index("comments_page_idx", KeyRange::eq([page])))).await?;
     assert_eq!(numbers(&thread), [11, 12, 13, 14]);
     assert_eq!(column::<Option<Uuid>>(&thread, "parent_id"), [None, None, Some(uuid(11)), Some(uuid(11))]);
@@ -4819,12 +4821,12 @@ async fn a_comment_thread_reads_with_its_people_and_falls_with_its_first_comment
     let one = db.query_one(comments_with_people(Query::table("comments").key([uuid(13)]))).await?;
     assert_eq!((one.get::<bool>("anchored")?, one.is_null("quote")?), (false, true));
 
-    // Q132: a comment of this page, and what it replies to.
+    // A comment of this page, and what it replies to.
     let of_page = |id: Uuid, page: Uuid| Query::table("comments").key([id]).filter(col("page_id").eq(page)).columns(["id", "parent_id"]);
     assert_eq!(db.query_one(of_page(uuid(13), page)).await?.get::<Uuid>("parent_id")?, uuid(11));
     assert!(db.query_opt(of_page(uuid(13), other_page)).await?.is_none());
 
-    // Q133: everyone who wrote in a thread, each once.
+    // Everyone who wrote in a thread, each once.
     let in_thread = |root: Uuid| {
         let thread =
             Query::table("comments").index("comments_page_idx", KeyRange::eq([page])).filter(col("id").eq(root).or(col("parent_id").eq(root)));
@@ -4833,7 +4835,7 @@ async fn a_comment_thread_reads_with_its_people_and_falls_with_its_first_comment
     assert_eq!(sorted(ids(&db.query(in_thread(uuid(11))).await?)), sorted(vec![ann, bob]));
     assert!(db.query(in_thread(uuid(12))).await?.is_empty());
 
-    // Q135.
+    // Editing a comment stamps the edit and keeps when it was written.
     db.update(
         Update::table("comments")
             .key([uuid(13)])
@@ -4846,7 +4848,7 @@ async fn a_comment_thread_reads_with_its_people_and_falls_with_its_first_comment
     assert_eq!(edited.get::<Json>("body")?, json!({"type": "doc", "edited": true}));
     assert!(edited.get::<Timestamp>("edited_at")? > third && edited.get::<Timestamp>("created_at")? == second);
 
-    // Q136: resolving keeps the first moment and names the latest
+    // Resolving keeps the first moment and names the latest
     // resolver; unresolving clears both.
     let resolve = |by: Uuid| {
         Update::table("comments")
@@ -4864,7 +4866,7 @@ async fn a_comment_thread_reads_with_its_people_and_falls_with_its_first_comment
     db.update(Update::table("comments").key([uuid(11)]).set("resolved_at", null()).set("resolved_by", null()).set("updated_at", now())).await?;
     assert!(db.get("comments", [uuid(11)]).await?.expect("the comment").is_null("resolved_at")?);
 
-    // Q137: deleting a comment takes its replies, and the notifications
+    // Deleting a comment takes its replies, and the notifications
     // about any of them.
     for about in [11, 13, 12] {
         db.insert(Insert::into("notifications").set("user_id", ann).set("kind", "comment.reply").set("page_id", page).set("comment_id", uuid(about)))
@@ -4877,7 +4879,7 @@ async fn a_comment_thread_reads_with_its_people_and_falls_with_its_first_comment
     Ok(())
 }
 
-// R-Q2, R-Q6, R-S6, R-S7, R-W10, R-W11: doc Q138-Q141, Q143, §3.4.
+// R-Q2, R-Q6, R-S6, R-S7, R-W10, R-W11: file rows with a check on their purpose, listed through an index and deleted by an unindexed column.
 #[tokio::test(flavor = "multi_thread")]
 async fn files_are_listed_by_page_and_removed_by_storage_key() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4886,7 +4888,7 @@ async fn files_are_listed_by_page_and_removed_by_storage_key() -> DbResult<()> {
     let page = new_page(&db, w.space, None, "a0", "With files").await?;
     let other = new_page(&db, w.space, None, "a1", "With one file").await?;
 
-    // Q138: a page's file under an id the app chose, and an image under
+    // A page's file under an id the caller chose, and an image under
     // one the database made.
     let upload = |n: u128, page: Uuid, name: &str, key: &str, at: &str| {
         let file =
@@ -4917,7 +4919,7 @@ async fn files_are_listed_by_page_and_removed_by_storage_key() -> DbResult<()> {
     let orphan = db.insert(upload(9, uuid(404), "x.pdf", "key-9", "2026-03-05T00:00:00Z")).await.unwrap_err();
     assert_eq!(orphan.code, ErrorCode::ForeignKeyViolation);
 
-    // Q140: on every download, one file by id, if it is a page's file;
+    // On every download, one file by id, if it is a page's file;
     // and for a replacement, if it is also in this space.
     let page_file = |id: Uuid| {
         Query::table("files")
@@ -4929,7 +4931,7 @@ async fn files_are_listed_by_page_and_removed_by_storage_key() -> DbResult<()> {
     assert!(db.query_opt(page_file(image.get::<Uuid>("id")?)).await?.is_none());
     assert!(db.query_opt(page_file(uuid(1)).filter(col("space_id").eq(uuid(404)))).await?.is_none());
 
-    // Q141: a page's files, newest first; and the files of several pages.
+    // A page's files, newest first; and the files of several pages.
     let of_page = Query::table("files")
         .index("files_page_idx", KeyRange::eq([page]))
         .filter(col("purpose").eq("page"))
@@ -4939,19 +4941,19 @@ async fn files_are_listed_by_page_and_removed_by_storage_key() -> DbResult<()> {
     let of_pages = Query::table("files").index_ranges("files_page_idx", [other, page].map(|id| KeyRange::eq([id]))).filter(col("purpose").eq("page"));
     assert_eq!(sorted(numbers(&db.query(of_pages.columns(["id", "page_id", "name", "mime", "size", "storage_key"])).await?)), [1, 2, 3, 4]);
 
-    // Deleting a page keeps its files' rows, detached: the app removes
+    // Deleting a page keeps its files' rows, detached: the caller removes
     // them itself, to learn the keys of their objects.
     db.delete(Delete::from("pages").key([other])).await?;
     assert!(db.get("files", [uuid(4)]).await?.expect("the file").is_null("page_id")?);
 
-    // Q143: by storage key, which is neither unique nor indexed.
+    // Removing by storage key, which is neither unique nor indexed.
     assert_eq!(db.delete(Delete::from("files").filter(col("storage_key").eq("key-2"))).await?.affected(), 2);
     assert_eq!(db.delete(Delete::from("files").filter(col("storage_key").eq("key-2"))).await?.affected(), 0);
     assert_eq!(rows_in(&db, Query::table("files")).await?, 3);
     Ok(())
 }
 
-/// Q147: shares a page, or changes the flags of its share: only the ones
+/// Shares a page, or changes the flags of its share: only the ones
 /// given. The same values are bound twice in Postgres, once to insert and
 /// once as nullable overrides.
 fn share_page(key: &str, page: Uuid, include_children: Option<bool>, search_indexing: Option<bool>, by: Uuid) -> Insert {
@@ -4968,7 +4970,7 @@ fn share_page(key: &str, page: Uuid, include_children: Option<bool>, search_inde
         .returning(["id", "key", "include_children", "search_indexing", "created_by"])
 }
 
-// R-S3, R-W4, R-W10, R-W11: doc Q147, Q148.
+// R-S3, R-W4, R-W10, R-W11: an upsert whose update keeps what was not given, and a second unique index it does not cover.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_share_is_created_or_patched_by_one_upsert() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5000,14 +5002,14 @@ async fn a_share_is_created_or_patched_by_one_upsert() -> DbResult<()> {
     assert!(taken.violates("shares_key_key"));
     db.insert(share_page("key-other", other, None, None, w.ann)).await?;
 
-    // Q148.
+    // Unsharing, once.
     assert_eq!(db.delete(Delete::from("shares").index("shares_page_id_key", KeyRange::eq([page]))).await?.affected(), 1);
     assert_eq!(db.delete(Delete::from("shares").index("shares_page_id_key", KeyRange::eq([page]))).await?.affected(), 0);
     assert_eq!(column::<String>(&db.query(Query::table("shares").columns(["key"])).await?, "key"), ["key-other"]);
     Ok(())
 }
 
-// R-Q9, R-Q10, R-S3, R-S7, R-W5, R-W10: doc Q64, Q149-Q152.
+// R-Q9, R-Q10, R-S3, R-S7, R-W5, R-W10: idempotent inserts on partial unique indexes, and lists joined through them.
 #[tokio::test(flavor = "multi_thread")]
 async fn favorites_and_watches_are_added_once_and_listed_in_the_order_added() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5021,7 +5023,7 @@ async fn favorites_and_watches_are_added_once_and_listed_in_the_order_added() ->
     db.insert(page(3, space, "In the trash").set("deleted_at", now())).await?;
     db.insert(page(4, hidden, "Out of reach")).await?;
 
-    // Q150: adding is idempotent. The conflict target is the unique index
+    // Adding is idempotent. The conflict target is the unique index
     // over the rows that name a page, or the one over those naming a space.
     let favor_page = |user: Uuid, n: u128, at: &str| {
         Insert::into("favorites")
@@ -5049,7 +5051,7 @@ async fn favorites_and_watches_are_added_once_and_listed_in_the_order_added() ->
     let neither = db.insert(Insert::into("favorites").set("user_id", bob)).await.unwrap_err();
     assert!(neither.violates("favorites_check"));
 
-    // Q149: favourite pages in the order they were added, as far as the
+    // Favourite pages in the order they were added, as far as the
     // user can still read them.
     let pages = Query::table("favorites")
         .alias("f")
@@ -5060,8 +5062,8 @@ async fn favorites_and_watches_are_added_once_and_listed_in_the_order_added() ->
     let pages = db.query(tree_columns(pages).select("space", space_ref())).await?;
     assert_eq!(titles(&pages), ["Second made", "First made"]);
 
-    // Q64 joined to favourites: favourite spaces with the caller's role,
-    // without the ones the caller has no role in.
+    // Favourite spaces with the caller's role, without the ones the
+    // caller has no role in.
     let spaces = Query::table("favorites")
         .alias("f")
         .index("favorites_space_key", KeyRange::eq([ann]))
@@ -5073,13 +5075,13 @@ async fn favorites_and_watches_are_added_once_and_listed_in_the_order_added() ->
     let spaces = db.query(spaces).await?;
     assert_eq!((column::<String>(&spaces, "name"), column::<i64>(&spaces, "rank")), (vec!["docs".to_string()], vec![3]));
 
-    // Q151: removing, by the pair that identifies it.
+    // Removing, by the pair that identifies it.
     assert_eq!(db.delete(Delete::from("favorites").index("favorites_page_key", KeyRange::eq([ann, uuid(2)]))).await?.affected(), 1);
     assert_eq!(db.delete(Delete::from("favorites").index("favorites_page_key", KeyRange::eq([ann, uuid(2)]))).await?.affected(), 0);
     assert_eq!(db.delete(Delete::from("favorites").index("favorites_space_key", KeyRange::eq([ann, hidden]))).await?.affected(), 1);
     assert_eq!(rows_in(&db, Query::table("favorites").index("favorites_page_key", KeyRange::eq([bob]))).await?, 1);
 
-    // Watches have the same shape (Q150-Q152).
+    // Watches have the same shape.
     let watch_space =
         |user: Uuid| Insert::into("watchers").set("user_id", user).set("space_id", space).on_conflict_do_nothing_on("watchers_space_key");
     let watch_page =
@@ -5099,11 +5101,11 @@ async fn favorites_and_watches_are_added_once_and_listed_in_the_order_added() ->
     Ok(())
 }
 
-/// T11: puts labels on a page, making the ones that do not exist yet.
+/// Puts labels on a page, making the ones that do not exist yet.
 /// Returns how many labels were made and how many were newly attached.
 async fn add_labels(db: &Client, page: Uuid, names: &[&str]) -> DbResult<(u64, u64)> {
     db.transaction(|tx| async move {
-        // Q158: get-or-create by the unique name.
+        // Get-or-create by the unique name.
         let mut labels = Insert::into("labels").columns(["name"]);
         for name in names {
             labels = labels.values([*name]);
@@ -5120,7 +5122,7 @@ async fn add_labels(db: &Client, page: Uuid, names: &[&str]) -> DbResult<(u64, u
     .await
 }
 
-// R-Q7, R-Q9, R-Q10, R-Q11, R-W5, R-W7, R-X1: doc Q157-Q161, T11.
+// R-Q7, R-Q9, R-Q10, R-Q11, R-W5, R-W7, R-X1: get-or-create in one transaction, a grouped count over joins, and a delete conditional on `NOT EXISTS`.
 #[tokio::test(flavor = "multi_thread")]
 async fn labels_are_made_once_counted_by_readable_pages_and_collected_when_unused() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5143,11 +5145,11 @@ async fn labels_are_made_once_counted_by_readable_pages_and_collected_when_unuse
     assert_eq!(add_labels(&db, uuid(4), &["trash", "rust"]).await?, (1, 2));
     assert_eq!(add_labels(&db, uuid(5), &["hidden", "rust"]).await?, (1, 2));
     db.update(Update::table("pages").key([uuid(4)]).set("deleted_at", now())).await?;
-    // The name is unique as written: the app lower-cases before it asks.
+    // The name is unique as written: lower-casing it is the caller's job.
     assert_eq!(add_labels(&db, uuid(1), &["Rust"]).await?, (1, 1));
     assert_eq!(rows_in(&db, Query::table("labels")).await?, 6);
 
-    // Q157: the labels of a page, by name.
+    // The labels of a page, by name.
     let of_page = |n: u128| {
         let labels =
             Query::table("page_labels").alias("pl").range(KeyRange::eq([uuid(n)])).join(Query::table("labels").alias("l").key([col("pl.label_id")]));
@@ -5156,9 +5158,9 @@ async fn labels_are_made_once_counted_by_readable_pages_and_collected_when_unuse
     assert_eq!(column::<String>(&db.query(of_page(2)).await?, "name"), ["alpha", "docs", "rust"]);
     assert_eq!(column::<String>(&db.query(of_page(1)).await?, "name"), ["Rust", "docs", "rust"]);
 
-    // Q160, doc's one GROUP BY: labels with the number of live pages the
-    // user can read, the most used first. Labels used only in the trash
-    // or out of reach are not listed.
+    // A GROUP BY: labels with the number of live pages the user can read,
+    // the most used first. Labels used only in the trash or out of reach
+    // are not listed.
     let counted = |needle: &str| {
         Query::table("labels")
             .alias("l")
@@ -5180,7 +5182,7 @@ async fn labels_are_made_once_counted_by_readable_pages_and_collected_when_unuse
     assert_eq!(column::<String>(&db.query(counted("R")).await?, "name"), ["Rust"]);
     assert!(db.query(counted("hid")).await?.is_empty());
 
-    // Q161: the pages of a label, latest edit first.
+    // The pages of a label, latest edit first.
     let rust: Uuid = db.query_one(Query::table("labels").index("labels_name_key", KeyRange::eq(["rust"]))).await?.get("id")?;
     let labelled = Query::table("page_labels")
         .alias("pl")
@@ -5192,7 +5194,7 @@ async fn labels_are_made_once_counted_by_readable_pages_and_collected_when_unuse
         .limit(500);
     assert_eq!(numbers(&db.query(tree_columns(labelled).select("space", space_ref())).await?), [3, 2, 1]);
 
-    // Q159: taking a label off a page, then collecting the label if no
+    // Taking a label off a page, then collecting the label if no
     // page has it any more. The second delete is conditional on that.
     let alpha: Uuid = db.query_one(Query::table("labels").index("labels_name_key", KeyRange::eq(["alpha"]))).await?.get("id")?;
     let collect_unused = |label: Uuid| {
@@ -5214,7 +5216,7 @@ async fn labels_are_made_once_counted_by_readable_pages_and_collected_when_unuse
 
 // ------------------------------------------------------------ notifications
 
-/// Q164: a user's inbox, newest first. A page the user can no longer read
+/// A user's inbox, newest first. A page the user can no longer read
 /// shows as NULL instead of hiding the notification: the permission check
 /// is the join's own condition.
 fn inbox(user: Uuid, unread_only: bool) -> Query {
@@ -5241,7 +5243,7 @@ fn inbox(user: Uuid, unread_only: bool) -> Query {
         .select("comment", when(col("c.id").is_null().or(col("p.id").is_null()), null(), comment))
 }
 
-// R-Q4, R-Q5, R-Q9, R-Q10, R-Q11, R-Q13, R-S4: doc Q164, Q165.
+// R-Q4, R-Q5, R-Q9, R-Q10, R-Q11, R-Q13, R-S4: a list in index order with four left joins, paged by offset and by keyset, and a count.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_inbox_pages_by_time_and_blanks_pages_the_user_cannot_read() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5318,7 +5320,7 @@ async fn the_inbox_pages_by_time_and_blanks_pages_the_user_cannot_read() -> DbRe
     assert_eq!(numbers(&db.query(after("2026-03-03T10:00:00Z", 3)).await?), [4, 5]);
     assert!(db.query(after("2026-03-01T10:00:00Z", 5)).await?.is_empty());
 
-    // Q165: the badge, polled by every open client.
+    // The badge, polled by every open client.
     let unread = |user: Uuid| {
         Query::table("notifications").index("notifications_user_idx", KeyRange::eq([user])).filter(col("read_at").is_null()).select("count", count())
     };
@@ -5327,7 +5329,7 @@ async fn the_inbox_pages_by_time_and_blanks_pages_the_user_cannot_read() -> DbRe
     Ok(())
 }
 
-// R-Q6, R-W2, R-W6, R-W7: doc Q163, Q165, Q166.
+// R-Q6, R-W2, R-W6, R-W7: one update over a list of 2000 ids, counting the rows it changed and stamping one instant.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_thousand_notifications_are_marked_read_by_one_statement() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5347,7 +5349,7 @@ async fn two_thousand_notifications_are_marked_read_by_one_statement() -> DbResu
     db.insert(Insert::into("notifications").set("id", uuid(3)).set("user_id", bob).set("kind", "page.mention")).await?;
     let unread = |user: Uuid| Query::table("notifications").index("notifications_user_idx", KeyRange::eq([user])).filter(col("read_at").is_null());
 
-    // Q166: mark these read. The list holds 2000 of ann's, one she has
+    // Mark these read. The list holds 2000 of ann's, one she has
     // read already, one that is bob's and one that does not exist; the
     // count is of the rows that changed.
     let mut listed: Vec<Uuid> = (0..2000).map(|n| uuid(1000 + n)).collect();
@@ -5372,7 +5374,7 @@ async fn two_thousand_notifications_are_marked_read_by_one_statement() -> DbResu
         .await?;
     assert_eq!(stamps.len(), 1);
 
-    // Q166's other form: everything of this user's that is unread.
+    // The same without a list: everything of this user's that is unread.
     assert_eq!(
         db.update(
             Update::table("notifications")
@@ -5386,13 +5388,13 @@ async fn two_thousand_notifications_are_marked_read_by_one_statement() -> DbResu
     );
     assert_eq!(rows_in(&db, unread(ann)).await?, 0);
 
-    // Q163: the ones a mail went out for, by id.
+    // The ones an email went out for, by id.
     let mailed = Update::rows(Query::table("notifications").keys(listed.iter().map(|id| [*id]))).set("emailed_at", now());
     assert_eq!(db.update(mailed).await?.affected(), 2002);
     Ok(())
 }
 
-// R-Q6, R-Q9, R-Q10: doc Q126, Q130, F4.
+// R-Q6, R-Q9, R-Q10: joins from a link table in both directions, and a read of many composite keys, each scoped to what the user can read.
 #[tokio::test(flavor = "multi_thread")]
 async fn backlinks_and_synced_blocks_are_read_only_where_the_user_may() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5413,7 +5415,7 @@ async fn backlinks_and_synced_blocks_are_read_only_where_the_user_may() -> DbRes
         db.insert(Insert::into("page_links").set("source_id", uuid(source)).set("target_id", uuid(target))).await?;
     }
 
-    // Q126: the pages that link here, and the pages this one links to:
+    // The pages that link here, and the pages this one links to:
     // the same statement with the two columns swapped. By title whatever
     // its case, an untitled page first.
     let linked = |links: Query, other_end: &str| {
@@ -5432,10 +5434,10 @@ async fn backlinks_and_synced_blocks_are_read_only_where_the_user_may() -> DbRes
     let outgoing = db.query(linked(Query::table("page_links").range(KeyRange::eq([uuid(2)])), "l.target_id")).await?;
     assert_eq!(numbers(&outgoing), [3, 1]);
 
-    // Q130: up to a hundred (page, block) references of a document, to
-    // show each block's current content. Postgres joined a JSON parameter
-    // to the tables and returned a row per reference, NULL where the user
-    // may not read; here the keys are read in the order asked and what is
+    // Up to a hundred (page, block) references of a document, to show
+    // each block's current content. Postgres joins a JSON parameter to
+    // the tables and returns a row per reference, NULL where the user may
+    // not read; here the keys are read in the order asked and what is
     // missing or out of reach is simply not among the rows.
     for (of, block) in [(2, "b1"), (2, "b2"), (5, "b9"), (4, "b4")] {
         db.insert(Insert::into("synced_blocks").set("page_id", uuid(of)).set("block_id", block).set("content", json!({"block": block}))).await?;
@@ -5467,11 +5469,11 @@ async fn backlinks_and_synced_blocks_are_read_only_where_the_user_may() -> DbRes
 
 // ------------------------------------------- bases: columns, views, rows
 
-/// T25: deletes a view unless it is its base's last. Postgres locked all
+/// Deletes a view unless it is its base's last. Postgres has to lock all
 /// the base's view rows to count them safely; the transaction is alone.
 async fn delete_view(db: &Client, base: Uuid, view: Uuid) -> DbResult<bool> {
     db.transaction(|tx| async move {
-        // Q178.
+        // The base's views, to count them.
         let views = ids(&tx.query(Query::table("base_views").index("base_views_page_idx", KeyRange::eq([base])).columns(["id"])).await?);
         if views.len() <= 1 || !views.contains(&view) {
             return Ok(false);
@@ -5482,7 +5484,7 @@ async fn delete_view(db: &Client, base: Uuid, view: Uuid) -> DbResult<bool> {
     .await
 }
 
-// R-Q4, R-Q11, R-S3, R-S7, R-W1, R-W6, R-W11, R-X3: doc Q113, Q167-Q178, T19, T25, §3.4.
+// R-Q4, R-Q11, R-S3, R-S7, R-W1, R-W6, R-W11, R-X3: a composite key, a unique index on a folded name, ordered lists, a check on a type, and a guarded delete raced.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5491,13 +5493,13 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
     let base = new_page(&db, w.space, None, "a0", "Tasks").await?;
     let other_base = new_page(&db, w.space, None, "a1", "Contacts").await?;
 
-    // T19: a page becomes a base once (Q168 "has it any columns yet?",
-    // Q113), and is seeded with its first columns, row and view.
+    // A page becomes a base once, when it has no columns yet, and is
+    // seeded with its first columns, row and view.
     let has_columns = |page: Uuid| Query::table("base_properties").range(KeyRange::eq([page])).limit(1).columns(["id"]);
     assert!(db.query_opt(has_columns(base)).await?.is_none());
     db.update(Update::table("pages").key([base]).set("is_base", true).set("updated_at", now()).set("last_editor_id", w.ann)).await?;
 
-    // Q169.
+    // The columns, each under an id the caller chose.
     let property = |page: Uuid, id: &str, name: &str, kind: &str, position: &str| {
         Insert::into("base_properties")
             .set("page_id", page)
@@ -5513,7 +5515,7 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
     db.insert(property(other_base, "ptitle", "Name", "text", "a0")).await?;
     assert!(db.query_opt(has_columns(base)).await?.is_some());
 
-    // Q167, at the start of every base endpoint: the columns in order.
+    // At the start of every base endpoint: the columns in order.
     let columns = |page: Uuid| {
         Query::table("base_properties")
             .index("base_properties_order_idx", KeyRange::eq([page]))
@@ -5524,7 +5526,7 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
     assert_eq!(column::<bool>(&listed, "is_primary"), [false, true, false]);
 
     // A name is taken within its base whatever its case and the spaces
-    // around it. The app checks first with its own folding; the index
+    // around it. A caller may check first with its own folding; the index
     // decides.
     for name in ["name", "  NAME ", "Status "] {
         let taken = db.insert(property(base, "pnew", name, "text", "a9")).await.unwrap_err();
@@ -5536,7 +5538,7 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
     // Spaces inside a name are part of it.
     db.insert(property(base, "pnew", "Na me", "text", "a9")).await?;
 
-    // Q171: by the two-part key. A rename onto another column's name
+    // A change by the two-part key. A rename onto another column's name
     // fails and leaves the row as it was.
     let change = |id: &str, name: &str, kind: &str, options: Json, position: &str| {
         Update::table("base_properties")
@@ -5564,11 +5566,11 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
     assert_eq!(column::<String>(&listed, "name"), ["Amount", "State", "Name", "Na me"]);
     assert_eq!(column::<Json>(&listed, "options"), [json!({"format": "euro"}), options, json!({}), json!({})]);
 
-    // Q172.
+    // Deleting a column, by the same key.
     assert_eq!(db.delete(Delete::from("base_properties").key([val(base), val("pnew")])).await?.affected(), 1);
     assert_eq!(rows_in(&db, Query::table("base_properties").range(KeyRange::eq([other_base]))).await?, 1);
 
-    // Q175: views. Q174: the next one goes after the last.
+    // Views. The next one goes after the last.
     db.insert(
         Insert::into("base_views").set("page_id", base).set("name", "Table").set("type", "table").set("position", "a0").set("creator_id", w.ann),
     )
@@ -5604,7 +5606,7 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
     assert_eq!(gallery.code, ErrorCode::CheckViolation);
     assert!(gallery.violates("base_views_type_check"));
 
-    // Q173: the views in order; and one view of this base.
+    // The views in order; and one view of this base.
     let views = db
         .query(Query::table("base_views").index("base_views_page_idx", KeyRange::eq([base])).columns(["id", "name", "type", "config", "position"]))
         .await?;
@@ -5616,7 +5618,7 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
     assert!(db.query_opt(view_of(base, board)).await?.is_some());
     assert!(db.query_opt(view_of(other_base, board)).await?.is_none());
 
-    // Q177.
+    // Changing a view: its name, its configuration, its place.
     let renamed = Update::table("base_views")
         .key([board])
         .set("name", "Kanban")
@@ -5630,7 +5632,7 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
     let views = db.query(Query::table("base_views").index("base_views_page_idx", KeyRange::eq([base])).columns(["name"])).await?;
     assert_eq!(column::<String>(&views, "name"), ["Kanban", "Table", "Calendar"]);
 
-    // T25: a base keeps at least one view. The last two are deleted at
+    // A base keeps at least one view. The last two are deleted at
     // the same moment: one delete goes through.
     assert!(!delete_view(&db, other_base, board).await?);
     assert!(delete_view(&db, base, calendar).await?);
@@ -5647,7 +5649,7 @@ async fn a_base_keeps_its_columns_in_order_unique_by_name_and_at_least_one_view(
 const ROW_COLUMNS: [&str; 7] = ["id", "cells", "position", "creator_id", "last_editor_id", "created_at", "updated_at"];
 
 /// `apply_cell_patch(cells, patch)`, a SQL function in Postgres: a JSON
-/// null in the patch removes the cell, anything else sets it. The app
+/// null in the patch removes the cell, anything else sets it. The caller
 /// knows the patch, so the expression is a merge of what is set followed
 /// by the removal of each cleared key. (Stripping nulls from the merge
 /// would not do: it would also take nulls out of the cells' own values.)
@@ -5664,7 +5666,7 @@ fn apply_cell_patch(cells: Expr, patch: &Json) -> Expr {
     cleared.into_iter().fold(cells.json_merge(Json::Object(set)), |cells, key| call(Func::JsonRemove, [cells, val(key)]))
 }
 
-/// T20: adds a row to a base after a given row, or at the end. The
+/// Adds a row to a base after a given row, or at the end. The
 /// neighbours' keys are the first entries of the order index on either
 /// side: no aggregate, two reads of one entry each.
 async fn add_row(db: &Client, base: Uuid, after: Option<Uuid>, cells: Json, by: Uuid) -> DbResult<Option<Row>> {
@@ -5672,7 +5674,7 @@ async fn add_row(db: &Client, base: Uuid, after: Option<Uuid>, cells: Json, by: 
         let in_order = |range: KeyRange| Query::table("base_rows").index("base_rows_order_idx", range).limit(1).columns(["position"]);
         let position = match after {
             Some(after) => {
-                // Q180: that row's key, and the smallest key above it.
+                // That row's key, and the smallest key above it.
                 let Some(row) = tx.query_opt(Query::table("base_rows").key([after]).filter(col("page_id").eq(base)).columns(["position"])).await?
                 else {
                     return Ok(None);
@@ -5680,7 +5682,7 @@ async fn add_row(db: &Client, base: Uuid, after: Option<Uuid>, cells: Json, by: 
                 let low: String = row.get("position")?;
                 let above = KeyRange::within([base], Bound::excluded([low.as_str()]), Bound::Unbounded);
                 match tx.query_opt(in_order(above)).await? {
-                    // The app computes a key between the two; appending
+                    // A real key is computed between the two; appending
                     // a small digit is enough of that for these keys.
                     Some(next) => {
                         let key = format!("{low}E");
@@ -5690,10 +5692,10 @@ async fn add_row(db: &Client, base: Uuid, after: Option<Uuid>, cells: Json, by: 
                     None => key_after(Some(low)),
                 }
             }
-            // Q180: the largest key of the base.
+            // The largest key of the base.
             None => key_after(tx.query_opt(in_order(KeyRange::eq([base])).reverse()).await?.map(|last| last.get("position")).transpose()?),
         };
-        // Q181.
+        // The row itself.
         let row = Insert::into("base_rows")
             .set("page_id", base)
             .set("cells", cells)
@@ -5705,13 +5707,13 @@ async fn add_row(db: &Client, base: Uuid, after: Option<Uuid>, cells: Json, by: 
     .await
 }
 
-/// T21: changes some cells of a row. Postgres locked the row for the
-/// read-modify-write (Q179 `FOR UPDATE`); here the transaction is alone,
-/// so two editors patching different cells of one row both keep theirs.
+/// Changes some cells of a row. Postgres locks the row for the
+/// read-modify-write (`FOR UPDATE`); here the transaction is alone, so
+/// two editors patching different cells of one row both keep theirs.
 async fn patch_row(db: &Client, base: Uuid, row: Uuid, patch: Json, position: Option<&str>, by: Uuid) -> DbResult<Option<Row>> {
     db.transaction(|tx| async move {
-        // Q179. The app diffs the patch against these cells and
-        // recomputes formulas before it writes.
+        // The row as it is. A caller diffs the patch against these cells
+        // and recomputes formulas before it writes.
         if tx
             .query_opt(
                 Query::table("base_rows")
@@ -5725,7 +5727,7 @@ async fn patch_row(db: &Client, base: Uuid, row: Uuid, patch: Json, position: Op
         {
             return Ok(None);
         }
-        // Q182.
+        // The patch, applied to the cells as they are stored.
         let patched = Update::table("base_rows")
             .key([row])
             .set("cells", apply_cell_patch(col("cells"), &patch))
@@ -5738,7 +5740,7 @@ async fn patch_row(db: &Client, base: Uuid, row: Uuid, patch: Json, position: Op
     .await
 }
 
-// R-Q4, R-Q13, R-W1, R-W6, R-X2, R-X3: doc Q179-Q182, T20, T21, §1.27.
+// R-Q4, R-Q13, R-W1, R-W6, R-X2, R-X3: neighbours read off an ordered index, and a JSON patch applied inside the update so that two at once both hold.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_row_patch_sets_and_removes_cells_and_two_at_once_both_stay() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5746,11 +5748,11 @@ async fn a_row_patch_sets_and_removes_cells_and_two_at_once_both_stay() -> DbRes
     let w = wiki(&db).await?;
     let base = new_page(&db, w.space, None, "a0", "Tasks").await?;
     let other_base = new_page(&db, w.space, None, "a1", "Contacts").await?;
-    // Q181's seeding form: a row with nothing in it.
+    // A seeded row, with nothing in it.
     db.insert(Insert::into("base_rows").set("page_id", other_base).set("position", "zz").set("creator_id", w.ann).set("last_editor_id", w.ann))
         .await?;
 
-    // T20.
+    // Rows added at the end, between two others, and after the last.
     let first = add_row(&db, base, None, json!({"name": "first"}), w.ann).await?.expect("a row");
     let second = add_row(&db, base, None, json!({"name": "second"}), w.ann).await?.expect("a row");
     let (first_id, second_id): (Uuid, Uuid) = (first.get("id")?, second.get("id")?);
@@ -5767,7 +5769,7 @@ async fn a_row_patch_sets_and_removes_cells_and_two_at_once_both_stay() -> DbRes
     assert!(add_row(&db, other_base, Some(first_id), json!({}), w.bob).await?.is_none());
     let order = db.query(Query::table("base_rows").index("base_rows_order_idx", KeyRange::eq([base])).columns(["id", "position"])).await?;
     assert_eq!(column::<String>(&order, "position"), ["a0", "a0E", "a0V", "a0VV"]);
-    // The same neighbours the way Postgres was asked for them.
+    // The same neighbours the way SQL asks for them.
     let edges = Query::table("base_rows")
         .index("base_rows_order_idx", KeyRange::eq([base]))
         .select("last", max(col("position")))
@@ -5775,7 +5777,7 @@ async fn a_row_patch_sets_and_removes_cells_and_two_at_once_both_stay() -> DbRes
     let edges = db.query_one(edges).await?;
     assert_eq!((edges.get::<String>("last")?, edges.get::<String>("next")?), ("a0VV".to_string(), "a0E".to_string()));
 
-    // T21: a null clears a cell, anything else sets it; cells the patch
+    // A null clears a cell, anything else sets it; cells the patch
     // does not name stay, with their own nulls.
     let file = json!([{"id": "f1", "name": "spec.pdf", "thumbnail": null}]);
     db.update(Update::table("base_rows").key([first_id]).set("cells", json!({"name": "first", "count": 2, "files": file}))).await?;
@@ -5809,16 +5811,16 @@ async fn a_row_patch_sets_and_removes_cells_and_two_at_once_both_stay() -> DbRes
     Ok(())
 }
 
-/// Q183: many rows, each with a patch of its own, in one statement.
-/// Postgres joined the table to a JSON object of `{row id: patch}`; here
-/// each row picks its own expression. `updated_at` is left alone: this is
-/// the back-fill of a formula or the conversion of a column, not an edit.
+/// Many rows, each with a patch of its own, in one statement. Postgres
+/// joins the table to a JSON object of `{row id: patch}`; here each row
+/// picks its own expression. `updated_at` is left alone: this is the
+/// back-fill of a formula or the conversion of a column, not an edit.
 fn patch_rows(base: Uuid, patches: &[(Uuid, Json)]) -> Update {
     let cells = case(patches.iter().map(|(id, patch)| (col("id").eq(*id), apply_cell_patch(col("cells"), patch))), col("cells"));
     Update::rows(Query::table("base_rows").keys(patches.iter().map(|(id, _)| [*id])).filter(col("page_id").eq(base))).set("cells", cells)
 }
 
-// R-Q4, R-Q6, R-Q13, R-W2, R-W6, R-W7, R-W10, R-X1: doc Q183-Q185, Q188, T22-T24.
+// R-Q4, R-Q6, R-Q13, R-W2, R-W6, R-W7, R-W10, R-X1: one update with a value per row, a keyset back-fill inside one transaction, and bulk changes that count or return their rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn rows_are_patched_stripped_and_deleted_in_bulk() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5839,7 +5841,7 @@ async fn rows_are_patched_stripped_and_deleted_in_bulk() -> DbResult<()> {
     )
     .await?;
 
-    // Q183.
+    // A patch per row; another base's row and an id nobody has are left out.
     let patches = [
         (uuid(0), json!({"n": null, "label": "zero"})),
         (uuid(1), json!({"label": "one"})),
@@ -5856,8 +5858,8 @@ async fn rows_are_patched_stripped_and_deleted_in_bulk() -> DbResult<()> {
     assert_eq!(cells(5000).await?, json!({"n": 1, "old": "x"}));
     assert_eq!(db.get("base_rows", [uuid(0)]).await?.expect("the row").get::<Timestamp>("updated_at")?, stamp);
 
-    // T22: a new formula column is back-filled over the whole base in one
-    // transaction, in batches of 500 read by keyset (Q188) inside it.
+    // A new formula column is back-filled over the whole base in one
+    // transaction, in batches of 500 read by keyset inside it.
     let batches = db
         .transaction(|tx| async move {
             let mut batches = Vec::new();
@@ -5892,8 +5894,8 @@ async fn rows_are_patched_stripped_and_deleted_in_bulk() -> DbResult<()> {
     );
     assert!(!cells(5000).await?.as_object().expect("an object").contains_key("double"));
 
-    // Q184 in T24: a deleted column's key is taken out of every row that
-    // has it; the count says how many did.
+    // A deleted column's key is taken out of every row that has it; the
+    // count says how many did.
     let strip = Update::table("base_rows")
         .index("base_rows_order_idx", KeyRange::eq([base]))
         .filter(col("cells").json_has_key("old"))
@@ -5903,7 +5905,7 @@ async fn rows_are_patched_stripped_and_deleted_in_bulk() -> DbResult<()> {
     assert_eq!(cells(0).await?, json!({"label": "zero", "double": 0}));
     assert_eq!(cells(5000).await?, json!({"n": 1, "old": "x"}));
 
-    // Q185: deleting some rows returns which of the ids really were rows
+    // Deleting some rows returns which of the ids really were rows
     // of this base.
     let asked = [uuid(3), uuid(5000), uuid(9999), uuid(4)];
     let gone =
@@ -5915,11 +5917,11 @@ async fn rows_are_patched_stripped_and_deleted_in_bulk() -> DbResult<()> {
 
 // --------------------------------------------- bases: the dynamic row query
 
-// The five SQL functions of doc's schema (§1.27) read one cell of a row's
-// `cells` object as the type its column stands for, and give NULL for
-// anything that does not convert. They are expressions the app builds;
-// each takes the property id whose cell it reads, in a query that reads
-// `base_rows` as `r`.
+// The functions below, which a Postgres schema would define in SQL, read
+// one cell of a row's `cells` object as the type its column stands for,
+// and give NULL for anything that does not convert. Here they are
+// expressions the caller builds; each takes the property id whose cell it
+// reads, in a query that reads `base_rows` as `r`.
 
 fn cell(id: &str) -> Expr {
     col("r.cells").json([id])
@@ -5972,7 +5974,7 @@ fn cell_list(id: &str) -> Expr {
     case([(cell_type(id).eq("array"), cell(id)), (cell_type(id).eq("string"), call(Func::JsonArray, [cell(id)]))], null())
 }
 
-/// What kind of value a column of a base holds (§2.25's column kinds).
+/// What kind of value a column of a base holds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
     Text,
@@ -6042,15 +6044,14 @@ fn strings(value: &Json) -> Vec<String> {
 }
 
 /// The day a time filter names, as the half-open range of instants it
-/// covers in the viewer's zone. The app sends the bounds as ISO text.
+/// covers in the viewer's zone. The bounds are sent as ISO text.
 fn day_range(day: &Json, offset_minutes: i64) -> Option<(String, String)> {
     let day = Date::parse(day.as_str()?)?;
     let start = i64::from(day.0) * 86_400_000_000 - offset_minutes * 60_000_000;
     Some((Timestamp(start).to_rfc3339(), Timestamp(start + 86_400_000_000).to_rfc3339()))
 }
 
-/// Compiles the filter and the sorts of a base's view into a query: the
-/// run-time part of `compile_filter` and `compile_sorts`.
+/// Compiles the filter and the sorts of a base's view into a query.
 struct Compiler<'a> {
     props: &'a [Prop],
     /// The viewer's zone, minutes east of UTC.
@@ -6059,10 +6060,10 @@ struct Compiler<'a> {
 
 impl Compiler<'_> {
     fn prop(&self, id: &str) -> Prop {
-        *self.props.iter().find(|prop| prop.id == id).unwrap_or_else(|| panic!("no property {id}: the app answers 400 before any query"))
+        *self.props.iter().find(|prop| prop.id == id).unwrap_or_else(|| panic!("no property {id}: a caller answers 400 before any query"))
     }
 
-    /// `column_expr`: the value of a column in a row.
+    /// The value of a column in a row.
     fn column(&self, prop: Prop) -> Expr {
         match prop.kind {
             Kind::Text => cell_text(prop.id),
@@ -6076,7 +6077,7 @@ impl Compiler<'_> {
         }
     }
 
-    /// `compile_filter`. An empty group is true.
+    /// A filter as one expression. An empty group is true.
     fn filter(&self, filter: &Filter) -> Expr {
         match filter {
             Filter::And(parts) if parts.is_empty() => val(true),
@@ -6087,7 +6088,7 @@ impl Compiler<'_> {
         }
     }
 
-    /// `compile_condition`: one operator on one column.
+    /// One operator on one column.
     fn condition(&self, prop: Prop, op: Op, value: &Json) -> Expr {
         let e = self.column(prop);
         let empty = match prop.kind {
@@ -6117,13 +6118,13 @@ impl Compiler<'_> {
             Op::NotContains => e.ilike(pattern("%", "%")).or_else(false).not(),
             Op::StartsWith => e.ilike(pattern("", "%")),
             Op::EndsWith => e.ilike(pattern("%", "")),
-            // Text compares by its bytes here; Postgres used the
+            // Text compares by its bytes here; Postgres uses the
             // database's collation.
             Op::Gt => e.gt(text),
             Op::Gte => e.ge(text),
             Op::Lt => e.lt(text),
             Op::Lte => e.le(text),
-            // An empty list is decided by the app, not asked.
+            // An empty list is decided by the caller, not asked.
             Op::AnyOf if listed.is_empty() => val(false),
             Op::AnyOf => e.in_list(listed),
             Op::NoneOf if listed.is_empty() => val(true),
@@ -6206,7 +6207,7 @@ impl Compiler<'_> {
         }
     }
 
-    /// `sort_expr`: what a column sorts by.
+    /// What a column sorts by.
     fn sort_key(&self, prop: Prop) -> Expr {
         let e = self.column(prop);
         // A person sorts by their name, read from `users` for each row.
@@ -6221,8 +6222,8 @@ impl Compiler<'_> {
         }
     }
 
-    /// `compile_sorts`: empty cells last whichever way a key runs, and
-    /// the rows' own order to finish.
+    /// The sorts of a view: empty cells last whichever way a key runs,
+    /// and the rows' own order to finish.
     fn sorted(&self, rows: Query, sorts: &[Sort]) -> Query {
         let rows = sorts.iter().fold(rows, |rows, sort| {
             let key = self.sort_key(self.prop(sort.prop));
@@ -6317,7 +6318,7 @@ async fn kept(db: &Client, base: Uuid, prop: &'static str, op: Op, value: Json) 
 /// east of UTC, as a checkbox and as a list.
 type CellCase = (Json, Option<Decimal>, Option<Timestamp>, Option<bool>, Option<Json>);
 
-// R-Q13, R-Q20, R-Q22, R-T4, R-T5: doc §1.27, §2.25.
+// R-Q13, R-Q20, R-Q22, R-T4, R-T5: one JSON cell read as a decimal, a timestamp, a boolean, a list and text, NULL where it does not convert.
 #[tokio::test(flavor = "multi_thread")]
 async fn cells_read_as_numbers_times_flags_and_lists_or_as_nothing() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6393,7 +6394,7 @@ async fn cells_read_as_numbers_times_flags_and_lists_or_as_nothing() -> DbResult
     Ok(())
 }
 
-// R-Q7, R-Q20, R-T9: doc Q188, §2.25 (text).
+// R-Q7, R-Q20, R-T9: filters on a cell as text: equality, patterns, order by bytes, membership and emptiness.
 #[tokio::test(flavor = "multi_thread")]
 async fn text_filters_compare_the_cell_as_text() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6441,7 +6442,7 @@ async fn text_filters_compare_the_cell_as_text() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q20, R-Q22, R-T5, R-T9: doc §2.25 (number, flag).
+// R-Q20, R-Q22, R-T5, R-T9: filters on a cell as an exact decimal and as a boolean.
 #[tokio::test(flavor = "multi_thread")]
 async fn number_and_checkbox_filters_convert_the_cell_first() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6486,7 +6487,7 @@ async fn number_and_checkbox_filters_convert_the_cell_first() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q20, R-T3, R-T4: doc §2.25 (time).
+// R-Q20, R-T3, R-T4: filters on a cell as a timestamp, by day in the viewer's zone.
 #[tokio::test(flavor = "multi_thread")]
 async fn time_filters_are_half_open_ranges_in_the_viewers_zone() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6530,7 +6531,7 @@ async fn time_filters_are_half_open_ranges_in_the_viewers_zone() -> DbResult<()>
     Ok(())
 }
 
-// R-Q13, R-Q20: doc §2.25 (list), §4.6.
+// R-Q13, R-Q20: filters on a cell as a list: membership of one, any or all, and the text of the array.
 #[tokio::test(flavor = "multi_thread")]
 async fn list_filters_test_membership_and_the_text_of_the_array() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6552,7 +6553,7 @@ async fn list_filters_test_membership_and_the_text_of_the_array() -> DbResult<()
     assert_eq!(tags(Op::AllOf, json!([])).await?, [1, 2, 3, 4, 5, 6]);
 
     // "Contains" looks in the text of the array as jsonb prints it, with
-    // a space after each comma: the app's tests pin that rendering.
+    // a space after each comma: a stored filter relies on that rendering.
     assert_eq!(tags(Op::Contains, json!(r#""a", "b""#)).await?, [1]);
     assert!(tags(Op::Contains, json!(r#""a","b""#)).await?.is_empty());
     assert_eq!(tags(Op::Contains, json!("C")).await?, [3, 6]);
@@ -6565,7 +6566,7 @@ async fn list_filters_test_membership_and_the_text_of_the_array() -> DbResult<()
     Ok(())
 }
 
-// R-Q20, R-T9: doc §2.25 (groups).
+// R-Q20, R-T9: filter groups compiled to nested AND and OR, where a NULL condition keeps nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn filter_groups_nest_and_an_empty_group_is_true() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6592,8 +6593,8 @@ async fn filter_groups_nest_and_an_empty_group_is_true() -> DbResult<()> {
     assert_eq!(kept(Filter::Or(vec![])).await?, [1, 2, 3, 4, 5, 6]);
     assert_eq!(kept(Filter::And(vec![Filter::Or(vec![]), is("name", Op::Eq, json!("beta"))])).await?, [2]);
 
-    // Ten groups deep, the depth the app allows, around every kind of
-    // column at once.
+    // Ten groups deep, as deep as a view's filter may go, around every
+    // kind of column at once.
     let every_kind = Filter::And(vec![
         is("name", Op::Contains, json!("a")),
         is("amount", Op::Gte, json!(10)),
@@ -6609,7 +6610,7 @@ async fn filter_groups_nest_and_an_empty_group_is_true() -> DbResult<()> {
     Ok(())
 }
 
-// R-Q10, R-Q14, R-Q20: doc Q189, §2.25 (sorts).
+// R-Q10, R-Q14, R-Q20: sort keys that are expressions and subqueries, each with its direction and its NULLs last.
 #[tokio::test(flavor = "multi_thread")]
 async fn sorts_put_empty_cells_last_in_both_directions() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6667,7 +6668,7 @@ async fn sorts_put_empty_cells_last_in_both_directions() -> DbResult<()> {
     Ok(())
 }
 
-/// Q188: a page of a base's rows in their own order, and the cursor of
+/// A page of a base's rows in their own order, and the cursor of
 /// the next one: the position and id of the last row returned. One row
 /// more than the page is read to learn whether there is a next.
 async fn rows_page(
@@ -6699,7 +6700,7 @@ async fn rows_page(
     Ok((page, next))
 }
 
-// R-Q4, R-Q5, R-Q20, R-Q21, R-T2: doc Q188, Q189.
+// R-Q4, R-Q5, R-Q20, R-Q21, R-T2: keyset pages off an index, offset pages of a sorted list with a total, and two pages read at one moment.
 #[tokio::test(flavor = "multi_thread")]
 async fn unsorted_rows_page_by_keyset_and_sorted_rows_by_offset_with_a_total() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6707,7 +6708,7 @@ async fn unsorted_rows_page_by_keyset_and_sorted_rows_by_offset_with_a_total() -
     let b = base(&db).await?;
     let compiler = Compiler { props: &PROPS, offset_minutes: 0 };
 
-    // Q188, unsorted: pages of two. Rows 4 and 5 share a position, and
+    // Unsorted: pages of two. Rows 4 and 5 share a position, and
     // the cursor falls between them: the id is part of it.
     let (page, cursor) = rows_page(&db, b.page, val(true), None, 2).await?;
     assert_eq!(page, [1, 2]);
@@ -6728,7 +6729,7 @@ async fn unsorted_rows_page_by_keyset_and_sorted_rows_by_offset_with_a_total() -
     // An export walks the whole base in batches.
     assert_eq!(rows_page(&db, b.page, val(true), None, 500).await?, (vec![1, 2, 3, 4, 5, 6], None));
 
-    // Q189, sorted: the sort keys are expressions that may be NULL, so
+    // Sorted: the sort keys are expressions that may be NULL, so
     // the cursor is an offset, and the count of all the rows the filter
     // keeps comes with the page.
     let sorted_page = |filter: Filter, sorts: Vec<Sort>, offset: u64, limit: u64| {
@@ -6765,7 +6766,7 @@ async fn unsorted_rows_page_by_keyset_and_sorted_rows_by_offset_with_a_total() -
 
 // --------------------------------------------------- JSON, and the lease
 
-// R-Q13, R-Q22, R-T6, R-T9: doc §4.6.
+// R-Q13, R-Q22, R-T6, R-T9: JSON stored in a canonical key order, compared by structure, read by path and changed by merge.
 #[tokio::test(flavor = "multi_thread")]
 async fn json_is_stored_in_jsonb_key_order_and_compared_by_structure() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6792,8 +6793,9 @@ async fn json_is_stored_in_jsonb_key_order_and_compared_by_structure() -> DbResu
     let of_row = || Query::table("base_rows").key([row]);
 
     // Stored whole, and returned with each object's keys by length, then
-    // by bytes, at every depth: what doc's responses and ETags were built
-    // on. A document sent back unchanged is still the same document.
+    // by bytes, at every depth: the order of Postgres' jsonb, which a
+    // response or an ETag can rest on. A document sent back unchanged is
+    // still the same document.
     let stored: Json = read(of_row().columns(["cells"])).await?.get("cells")?;
     assert_eq!(stored, cells);
     assert_eq!(stored.to_string(), r#"{"a":{"x":null,"yy":[3,{"k":2,"k2":1}]},"bb":"text","on":true,"é":1.5,"tags":["a","b"],"zeta":1}"#);
@@ -6892,7 +6894,7 @@ async fn json_is_stored_in_jsonb_key_order_and_compared_by_structure() -> DbResu
     assert_eq!(changed.get::<Json>("built")?, json!({"id": row.to_string(), "items": [1, "two", true]}));
 
     // A page's document may be absent: NULL is distinct from every
-    // document and not distinct from NULL (Q120's comparison).
+    // document and not distinct from NULL, which a snapshot relies on.
     let empty = db
         .query_one(
             Query::table("pages")
@@ -6905,9 +6907,9 @@ async fn json_is_stored_in_jsonb_key_order_and_compared_by_structure() -> DbResu
     Ok(())
 }
 
-/// Q190: claims or renews the realtime lease. A row back means "you
-/// lead"; no row, that someone else holds a lease that has not expired by
-/// the database's clock: the one clock every copy of the app shares.
+/// Claims or renews the realtime lease. A row back means "you lead"; no
+/// row, that someone else holds a lease that has not expired by the
+/// database's clock: the one clock every copy of the application shares.
 async fn claim_lease(db: &impl Db, holder: &str, seconds: f64) -> DbResult<bool> {
     let claim = Insert::into("realtime_leader")
         .set("holder", holder)
@@ -6921,19 +6923,19 @@ async fn claim_lease(db: &impl Db, holder: &str, seconds: f64) -> DbResult<bool>
     Ok(!claimed.is_empty())
 }
 
-// R-O3, R-Q8, R-S7, R-W4, R-W7, R-X3, R-X4: doc Q7, Q190, Q191, §4.1.
+// R-O3, R-Q8, R-S7, R-W4, R-W7, R-X3, R-X4: a lease taken by a conditional upsert on the database's clock: raced, renewed, expired and released.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_leader_lease_passes_only_when_released_or_expired() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    // Q7, the health probe; and the clock a lease is judged by.
+    // The health probe; and the clock a lease is judged by.
     db.ping().await?;
     let clock = db.now().await?;
     assert!((clock.micros() - Timestamp::now().micros()).abs() < 60_000_000, "the server's clock is the machine's");
     let holder = || async { db.query_opt(Query::table("realtime_leader").key([1])).await?.map(|row| row.get::<String>("holder")).transpose() };
     let expires = || async { db.query_one(Query::table("realtime_leader").key([1])).await?.get::<Timestamp>("expires_at") };
 
-    // Three copies of the app start at once: one leads.
+    // Three copies of the application start at once: one leads.
     let start = |name: &'static str| {
         let db = db.clone();
         async move { claim_lease(&db, name, 10.0).await }
@@ -6967,7 +6969,7 @@ async fn the_leader_lease_passes_only_when_released_or_expired() -> DbResult<()>
     // The old leader, back up, is a follower now.
     assert!(!claim_lease(&db, leader, 10.0).await?);
 
-    // Q191: a clean shutdown releases the lease, and only its holder's.
+    // A clean shutdown releases the lease, and only its holder's.
     assert_eq!(db.delete(Delete::from("realtime_leader").filter(col("holder").eq(leader))).await?.affected(), 0);
     assert_eq!(db.delete(Delete::from("realtime_leader").filter(col("holder").eq(follower))).await?.affected(), 1);
     assert_eq!(holder().await?, None);

@@ -3,17 +3,18 @@
 A map of the code for whoever changes it next: what each part does, the
 rule it keeps, and why it is built that way and not another. The
 requirements are in `REQUIREMENTS.md`; the client's contract is in
-`CLIENT.md`; running it is in `OPERATIONS.md`.
+`CLIENT.md`; running it is in `OPERATIONS.md`; how it compares with
+Postgres, and why, is in `PERFORMANCE.md`.
 
 ```text
 protocol/   values, expressions, queries, the wire format     (no I/O)
-client/     the typed async client the apps use
+client/     the typed async client applications use
 engine/     storage, transactions, query execution            (no network, no async)
 server/     the network server and the `database` command
 bench/      the same workloads against this and against Postgres
 ```
 
-An app holds a `Client`. A request is a Rust value (`Query`, `Insert`,
+An application holds a `Client`. A request is a Rust value (`Query`, `Insert`,
 `TableDef`, ..) encoded into one frame and sent over TCP. The server
 decodes it and calls the engine, which runs it against one database's
 files and returns rows.
@@ -30,19 +31,20 @@ There is one writer per database at a time. That removes row locks, lock
 ordering, deadlocks, serialization failures and write-write conflict
 detection: a writing transaction reads the latest committed state and
 nothing can change under it. Every `FOR UPDATE`, `FOR SHARE`, `SKIP
-LOCKED` and advisory transaction lock in the four apps reduces to "do it
-in a transaction". The price is that writes do not run in parallel
-within one database. Each app has its own database, the apps' write
-transactions are a handful of statements, and commits from different
-connections share an fsync, so for these workloads the price is small.
+LOCKED` and advisory transaction lock an application takes reduces to
+"do it in a transaction". The price is that writes do not run in
+parallel within one database. Where each application has its own
+database, write transactions are a handful of statements and commits
+from different connections share a sync, the price is usually small;
+`docs/PERFORMANCE.md` shows where it is not, and what could be done.
 
 ## Files
 
-A database named `mail` is three kinds of file in the data directory:
+A database named `shop` is three kinds of file in the data directory:
 
 ```text
-mail.db             pages of 8 KiB
-mail.wal-0000000007 the log of commits since the last checkpoint
+shop.db             pages of 8 KiB
+shop.wal-0000000007 the log of commits since the last checkpoint
 ACCESS              every database's password hash (one file for the server)
 LOCK                held while a server has the directory open
 ```
@@ -127,7 +129,7 @@ front. A row read from disk is kept as bytes and each column is decoded
 when first asked for, so a query that selects two columns of a wide row
 pays for two.
 
-A value too large to share a page with its row (a mail body) is moved to
+A value too large to share a page with its row (a long text) is moved to
 the table's tree of large values, cut into chunks keyed by `(id, chunk
 number)`, and the row keeps the id and the length. `octet_length` reads
 the length; `left` and `substr_bytes` read only the chunks they need. A
@@ -277,8 +279,8 @@ Postgres took 53, and a durable insert 400 µs against 170. So:
 A connection says which database it wants and proves it with that
 database's password (stored as a salted hash; the admin password comes
 from the environment and may do anything). The protocol is not
-encrypted: the server is meant for the private network between the
-stack's containers, like the Postgres it replaces.
+encrypted: the server is meant for a private network, such as the one
+between an application's containers.
 
 Named locks live in the server, per database and name, owned by a
 connection and released when it closes.

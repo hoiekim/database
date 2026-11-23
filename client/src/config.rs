@@ -103,12 +103,12 @@ mod tests {
 
     #[test]
     fn reads_a_url() {
-        let c = Config::from_url("database://mail:s3cr%40t@db:6000?pool=3&statement_timeout=1.5&name=mail-1").unwrap();
-        assert_eq!((c.host.as_str(), c.port, c.database.as_str(), c.password.as_str()), ("db", 6000, "mail", "s3cr@t"));
-        assert_eq!((c.pool_size, c.statement_timeout, c.name.as_str()), (3, Duration::from_millis(1500), "mail-1"));
+        let c = Config::from_url("database://shop:s3cr%40t@db:6000?pool=3&statement_timeout=1.5&name=shop-1").unwrap();
+        assert_eq!((c.host.as_str(), c.port, c.database.as_str(), c.password.as_str()), ("db", 6000, "shop", "s3cr@t"));
+        assert_eq!((c.pool_size, c.statement_timeout, c.name.as_str()), (3, Duration::from_millis(1500), "shop-1"));
 
-        let c = Config::from_url("database://anything:pw@localhost/budget").unwrap();
-        assert_eq!((c.port, c.database.as_str()), (DEFAULT_PORT, "budget"));
+        let c = Config::from_url("database://anything:pw@localhost/blog").unwrap();
+        assert_eq!((c.port, c.database.as_str()), (DEFAULT_PORT, "blog"));
 
         let admin = Config::from_url("database://adminpw@localhost").unwrap();
         assert_eq!((admin.database.as_str(), admin.password.as_str()), ("", "adminpw"));

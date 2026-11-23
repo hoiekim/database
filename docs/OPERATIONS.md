@@ -42,73 +42,78 @@ Every other command connects to the server on `DATABASE_HOST` (default
 `DATABASE_ADMIN_PASSWORD`. Run inside the server's container they need
 nothing else.
 
-## In the stack
+## In a container
 
-The image is built by the `Dockerfile` at the root of this repository. A
-service entry in `stack/services.ts` in place of `postgres`:
+The `Dockerfile` at the root of this repository builds an image whose
+command is `database serve` and whose health check is `database ping`.
+With Docker Compose:
 
-```ts
-{
-  name: "database",
-  image: "hoie/database:latest",
-  memory: "128M",
-  cpus: "0.6",
-  envFile: true,          // DATABASE_ADMIN_PASSWORD
-  compose: {
-    // On the host's loopback only, for an SSH tunnel.
-    ports: ["127.0.0.1:5454:5454"],
-    volumes: ["./.volumes/database:/data"],
-    // The image's own health check is `database ping`.
-  },
-},
+```yaml
+services:
+  database:
+    build: .
+    environment:
+      DATABASE_ADMIN_PASSWORD: ${DATABASE_ADMIN_PASSWORD}
+    volumes:
+      - ./data:/data
+    # On the host's loopback only, if at all.
+    ports:
+      - "127.0.0.1:5454:5454"
+    mem_limit: 128m
+
+  shop:
+    image: example/shop
+    environment:
+      DATABASE_URL: database://shop:${SHOP_DB_PASSWORD}@database:5454
+    depends_on:
+      database:
+        condition: service_healthy
 ```
 
-Apps wait for it as they waited for Postgres
-(`depends_on: { database: { condition: "service_healthy" } }`) and
-connect with a URL:
+An application connects with a URL:
 
 ```text
-database://mail:<password>@database:5454
+database://shop:<password>@database:5454
 ```
 
-`mail` is the database's name; the password is that database's. Options
-go in the query string: `?pool=8&statement_timeout=60&lock_wait=30&connect_timeout=10&name=mail`.
+`shop` is the database's name; the password is that database's. Options
+go in the query string: `?pool=8&statement_timeout=60&lock_wait=30&connect_timeout=10&name=shop`.
 
-Each app gets its own database and password, created once:
+Each application gets its own database and password, created once:
 
 ```sh
-docker compose exec -e DATABASE_PASSWORD=<password> database database create --if-not-exists mail
+docker compose exec -e DATABASE_PASSWORD=<password> database database create --if-not-exists shop
 ```
 
 The protocol is not encrypted and a database's password crosses the
-compose network as it is, as with the Postgres it replaces. Do not
+network as it is. Keep the server on a private network and do not
 publish the port beyond loopback.
 
-A rolling deploy runs two copies of an app against one database for a
-moment. Both work: the server takes any number of connections, writers
-take turns, and the migration lock (`db.lock("mail.migrate")`) keeps the
-two from migrating at once.
+A rolling deploy runs two copies of an application against one database
+for a moment. Both work: the server takes any number of connections,
+writers take turns, and a migration lock (`db.lock("shop.migrate")`)
+keeps the two from migrating at once.
 
 ## Backup
 
 `database dump` writes every database to stdout as one stream: each
 database's name and password hash, each table's definition and rows. It
 reads one moment of each database however long it takes, and holds up no
-writer. It is the `pg_dumpall` of `stack/backup/backup.ts`; the job there
-becomes:
+writer. It takes the place of `pg_dumpall` in a backup job:
 
-```ts
-["database.dump.gz.enc", "docker", ["compose", "exec", "-T", "database", "database", "dump"], [0]],
+```sh
+docker compose exec -T database database dump | gzip | age -r <recipient> > database.dump.gz.age
 ```
 
-The stream is binary (not SQL) and compresses well. Every record in it
-carries a checksum and the stream ends with a count of what it held.
+(or whatever compression, encryption and destination the job already
+uses). The stream is binary, not SQL, and compresses well. Every record
+in it carries a checksum and the stream ends with a count of what it
+held.
 
 ## Restore
 
 ```sh
-bun backup/backup.ts --restore <backup>/database.dump.gz.enc > database.dump
-docker compose exec -T database database restore < database.dump
+age -d -i key.txt database.dump.gz.age | gunzip | docker compose exec -T database database restore
 ```
 
 `restore` refuses to touch a database that already exists, unless given
@@ -116,12 +121,13 @@ docker compose exec -T database database restore < database.dump
 and swaps them in only when the whole stream has been read and checked:
 a dump that is cut short or damaged, or a server that dies half way,
 leaves the server as it was. Passwords come back with the databases, so
-the apps connect as before.
+applications connect as before.
 
 A restore drill, on any machine with Docker:
 
 ```sh
-docker run -d --name drill -e DATABASE_ADMIN_PASSWORD=drill hoie/database
+docker build -t database .
+docker run -d --name drill -e DATABASE_ADMIN_PASSWORD=drill database
 docker exec -i drill database restore < database.dump
 docker exec drill database list
 docker exec drill database check
@@ -175,21 +181,23 @@ rows of many megabytes are common, and raise `DATABASE_CACHE_MB` only if
 `stats` shows many disk reads for the working set.
 
 The largest single request or result is 256 MiB, and it is held in
-memory while it is handled. A mail body of 35 MiB works; a habit of
-selecting every body of a mailbox in one query will be felt.
+memory while it is handled. A text of tens of megabytes works; a habit
+of selecting many such texts in one query will be felt.
 
 ## Migrating from Postgres
 
-There is no tool that reads a Postgres dump: the schemas are defined by
-the apps (in Rust, as `TableDef`s), and the apps' rewrite to this client
-is where the data moves. The shape that works, per app:
+There is no tool that reads a Postgres dump: a schema is defined by the
+application through the client (as `TableDef`s), so the application moves
+its own data. The shape that works:
 
-1. The new app version creates its tables with `create_table_if_not_exists`
-   under its migration lock, as it did with SQL migrations.
-2. A one-off command of the app reads each table from Postgres and
-   inserts the rows through the client, a few hundred per statement
-   inside one transaction per table; `auto_increment` columns take the
-   ids given and continue above them.
-3. `database check`, compare counts, then point the app at the new URL.
+1. The new version of the application creates its tables with
+   `create_table_if_not_exists` under a migration lock, as it did with
+   SQL migrations.
+2. A one-off command reads each table from Postgres and inserts the rows
+   through the client, a few hundred per statement inside one
+   transaction per table; `auto_increment` columns take the ids given
+   and continue above them.
+3. `database check`, compare counts, then point the application at the
+   new URL.
 
 Type mapping and SQL-to-API equivalents are in `CLIENT.md`.

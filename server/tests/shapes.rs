@@ -1,5 +1,5 @@
-//! Shapes of request that more than one app's suite asked for, tested
-//! once here: a query of no table, a whole row returned from a write, a
+//! Shapes of request that more than one scenario needs, tested once
+//! here: a query of no table, a whole row returned from a write, a
 //! missing value given as a key, a JSON array read as a list of text.
 
 mod common;

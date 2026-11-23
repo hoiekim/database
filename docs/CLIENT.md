@@ -1,14 +1,15 @@
 # Using the client
 
-`database-client` is how an app talks to the server. There is no SQL: a
-table, a query and a write are Rust values the app builds, and the server
-carries them out as written. This file is the contract: what each piece
-means, and how the things the apps did in SQL are said here.
+`database-client` is how an application talks to the server. There is no
+SQL: a table, a query and a write are Rust values the application builds,
+and the server carries them out as written. This file is the contract:
+what each piece means, and how the things usually said in SQL are said
+here.
 
 ```rust
 use database_client::*;
 
-let db = Client::connect_url("database://mail:secret@database:5454").await?;
+let db = Client::connect_url("database://shop:secret@database:5454").await?;
 ```
 
 A `Client` is a handle on a pool of connections (8 by default, `?pool=n`
@@ -350,8 +351,8 @@ transaction rolls it back.
 ## Named locks
 
 ```rust
-let guard = db.lock("mail.migrate").await?;      // waits
-if let Some(guard) = db.try_lock("mail.maintenance").await? { .. }
+let guard = db.lock("shop.migrate").await?;      // waits
+if let Some(guard) = db.try_lock("shop.maintenance").await? { .. }
 guard.unlock().await?;
 ```
 
@@ -373,8 +374,8 @@ dropped or the process dies. It occupies one pooled connection.
 | `SELECT EXISTS(..)`, `SELECT now()` | `Query::row().select(..)` |
 | `RETURNING *` | `.returning_all()` |
 | `jsonb_array_elements_text(a)` | `col("a").json_texts()`, a list: `in_list`, `each` |
-| `a OR b` over two different indexes | two queries (in `db.read(..)` for one moment), merged by the app |
-| `UNION` | two queries, merged by the app |
+| `a OR b` over two different indexes | two queries (in `db.read(..)` for one moment), merged by the caller |
+| `UNION` | two queries, merged by the caller |
 | `SELECT count(*) FILTER (WHERE ..)` | `count().filter(..)` |
 | `SELECT ... FOR UPDATE` then `UPDATE` | the same two statements in `db.transaction(..)` |
 | `UPDATE .. WHERE id IN (SELECT .. ORDER BY .. LIMIT n FOR UPDATE SKIP LOCKED) RETURNING` | `Update::rows(Query::table(..).index(..).filter(..).limit(n)).set(..).returning(..)` |
@@ -389,8 +390,8 @@ dropped or the process dies. It occupies one pooled connection.
 ## Not here
 
 Things Postgres has that this does not, so that nobody goes looking:
-regular expressions (`like`, `try_cast` and the text functions cover what
-the apps matched); collations (text orders by bytes); `UNION`; window
+regular expressions (`like`, `try_cast` and the text functions cover the
+common matches); collations (text orders by bytes); `UNION`; window
 functions other than `with_total`; adding a foreign key or a check to a
 table that exists (declare them at creation); changing a column's type;
 cancelling another connection's statement (each request has its own

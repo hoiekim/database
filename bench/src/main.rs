@@ -8,11 +8,11 @@
 //!
 //! Each server runs as its own process on its own empty directory under
 //! `BENCH_DIR` (default: the system's temporary directory), with commits
-//! synced to disk. Postgres is started with the settings the stack gives
+//! synced to disk. Postgres is started as a small deployment would run
 //! it (`shared_buffers=64MB`), as the user `postgres` when the benchmark
-//! runs as root. The workloads are the apps' hot paths: a session lookup,
-//! a durable insert, a rate-limit upsert, a mailbox page, a flag update,
-//! a small transaction, a filtered count, a search.
+//! runs as root. The workloads are hot paths common to web applications:
+//! a session lookup, a durable insert, a rate-limit upsert, a mailbox
+//! page, a flag update, a small transaction, a filtered count, a search.
 //!
 //! What is printed: operations per second and latency for each workload,
 //! then what each server cost: memory, CPU time, and disk.
@@ -79,15 +79,32 @@ fn cpu_seconds(root: u32) -> f64 {
     ticks as f64 / 100.0
 }
 
-fn disk_bytes(dir: &Path) -> u64 {
-    let mut total = 0;
+/// The bytes of the files under `dir`, as (data, log): the write-ahead
+/// log is counted apart, because Postgres keeps its used segments to
+/// write over again (up to a gigabyte, as it is configured here) while
+/// this server deletes its log at a checkpoint.
+fn disk_bytes(dir: &Path) -> (u64, u64) {
+    let (mut data, mut log) = (0, 0);
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
-            total += if meta.is_dir() { disk_bytes(&entry.path()) } else { meta.len() };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if meta.is_dir() {
+                let (d, l) = disk_bytes(&entry.path());
+                if name == "pg_wal" {
+                    log += d + l;
+                } else {
+                    data += d;
+                    log += l;
+                }
+            } else if name.contains(".wal-") {
+                log += meta.len();
+            } else {
+                data += meta.len();
+            }
         }
     }
-    total
+    (data, log)
 }
 
 struct Server {
@@ -695,7 +712,7 @@ struct Report {
     idle_memory: u64,
     memory: u64,
     cpu: f64,
-    disk: u64,
+    disk: (u64, u64),
     load: Timing,
     timings: Vec<Timing>,
 }
@@ -720,6 +737,24 @@ async fn run(name: &'static str, server: Server, target: Target) -> Report {
         Target::Ours(db) => db.admin().checkpoint().await.unwrap(),
         Target::Pg(_) => {
             target.pg(0).batch_execute("CHECKPOINT").await.unwrap();
+            // BENCH_DETAILS=1 shows how Postgres stores the mails: how
+            // much of a body stays in its row, and what each part weighs.
+            if std::env::var_os("BENCH_DETAILS").is_some() {
+                let sizes = "SELECT pg_relation_size('mails')::float8, (pg_table_size('mails') - pg_relation_size('mails'))::float8, pg_relation_size('mails_search')::float8, pg_relation_size('mails_user_date')::float8, \
+                             (SELECT avg(octet_length(text))::float8 FROM mails), (SELECT avg(pg_column_size(text))::float8 FROM mails), (SELECT avg(pg_column_size(search_vector))::float8 FROM mails)";
+                let row = target.pg(0).query_one(sizes, &[]).await.unwrap();
+                let mb = |i: usize| row.get::<_, f64>(i) / 1_048_576.0;
+                eprintln!(
+                    "{name}: mails heap {:.0} MB, out-of-row (TOAST) {:.0} MB, search index {:.0} MB, date index {:.0} MB; a body is {:.0} bytes and takes {:.0} stored; a search vector takes {:.0}",
+                    mb(0),
+                    mb(1),
+                    mb(2),
+                    mb(3),
+                    row.get::<_, f64>(4),
+                    row.get::<_, f64>(5),
+                    row.get::<_, f64>(6)
+                );
+            }
         }
     }
     let disk = disk_bytes(&server.dir);
@@ -764,7 +799,8 @@ fn print(reports: &[Report]) {
     println!("| Memory when idle, before any request | {} |", reports.iter().map(|r| mb(r.idle_memory)).collect::<Vec<_>>().join(" | "));
     println!("| Memory after the run | {} |", reports.iter().map(|r| mb(r.memory)).collect::<Vec<_>>().join(" | "));
     println!("| CPU time for the whole run | {} |", reports.iter().map(|r| format!("{:.1} s", r.cpu)).collect::<Vec<_>>().join(" | "));
-    println!("| Files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk)).collect::<Vec<_>>().join(" | "));
+    println!("| Data files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk.0)).collect::<Vec<_>>().join(" | "));
+    println!("| Log files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk.1)).collect::<Vec<_>>().join(" | "));
 }
 
 #[tokio::main]

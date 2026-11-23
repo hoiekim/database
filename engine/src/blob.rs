@@ -11,7 +11,7 @@
 //!
 //! So byte `n` of a value is in chunk `n / CHUNK`, found by one descent of
 //! the tree, and a row can be read, filtered and listed without touching
-//! the megabytes of a mail body it points at. Chunks of one value sit side
+//! the megabytes of text it points at. Chunks of one value sit side
 //! by side in the tree's leaves, four to a page.
 
 use crate::btree::{self, Cursor, Pages, PagesMut};

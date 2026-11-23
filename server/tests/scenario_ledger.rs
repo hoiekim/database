@@ -1,21 +1,22 @@
-//! Budget, the personal-finance app, said through the client: its 23
-//! tables, the generic builder most of its statements come from, and the
-//! statements it writes by hand. `docs/requirements/budget.md` is the
-//! inventory; the `Q-`, `G` and `T` ids in the comments are its.
+//! A personal-finance ledger, said through the client: users and sharing
+//! groups, accounts, transactions with exact decimal amounts, categories,
+//! recurring charges, snapshots, soft deletes and delta sync. The suite
+//! covers the schema and its migration, a generic builder that most
+//! statements go through, and the statements written by hand.
 //!
-//! Three things Postgres did for budget are done here by the test file, as
-//! the app will have to: the SQL function `sharing_user_ids` is a Rust
-//! function that returns an expression, the builder's `SELECT *` and
-//! `RETURNING *` name the model's columns, and a statement's way into a
-//! table (which index, which range) is chosen by the caller.
+//! Three things a SQL database does for such a ledger are done here by the
+//! test file, as an application has to: what would be a SQL function,
+//! `sharing_user_ids`, is a Rust function that returns an expression; the
+//! builder's `SELECT *` and `RETURNING *` name the model's columns; and the
+//! caller chooses a statement's way into a table (the index and the range).
 //!
-//! Where the client has no word for what a statement did, the nearest
-//! thing stands in and the helper says so: no regular expressions
+//! Where the client has no word for what a statement says in SQL, the
+//! nearest thing stands in and the helper says so: no regular expressions
 //! (`highest_unknown`), no query without a table (`sharing_group`,
 //! `suggest_pair`), no CTE and no `UNION` (`suggest`, `accept_invitation`),
 //! no unnesting of parallel arrays (`create_default_splits`).
 //!
-//! Where `docs/CLIENT.md` is silent the tests expect what Postgres did:
+//! Where `docs/CLIENT.md` is silent the tests expect what Postgres does:
 //! `date - date` is a number of days and `date + n` a date; a key that is
 //! NULL, and an empty list of keys, find no row; a key of the wrong kind is
 //! a `TypeMismatch`; `lower()` folds letters beyond ASCII; an upsert's
@@ -68,7 +69,7 @@ fn updated() -> ColumnDef {
     opt("updated", Type::Timestamp).default_now()
 }
 
-/// Nullable on purpose: budget's predicate treats NULL as live.
+/// Nullable on purpose: the live predicate treats NULL as live.
 fn is_deleted() -> ColumnDef {
     opt("is_deleted", Type::Bool).default(false)
 }
@@ -82,11 +83,10 @@ fn lower_email_index() -> IndexDef {
     IndexDef::new("idx_users_lower_email").on_expr(col("email").lower()).unique().filter(col("email").is_not_null())
 }
 
-/// Budget's models, in the order it creates them: a table comes after the
-/// ones it references. Names, keys, unique constraints, foreign keys and
-/// defaults are the app's. The plain indexes are the ones its statements
-/// are read through here, since nothing plans them: where Postgres had an
-/// index on `account_id` alone and sorted by date afterwards, this has
+/// The ledger's models, in the order they are created: a table comes after
+/// the ones it references. The plain indexes are the ones the statements
+/// here read through, since nothing plans them: where Postgres would take
+/// an index on `account_id` alone and sort by date afterwards, this has
 /// `(account_id, date)`.
 fn models() -> &'static [TableDef] {
     static MODELS: OnceLock<Vec<TableDef>> = OnceLock::new();
@@ -237,7 +237,7 @@ fn models() -> &'static [TableDef] {
                 .column(opt("raw", Type::Json))
                 .column(updated())
                 .column(is_deleted())
-                .column(req("source", Type::Text).default("plaid"))
+                .column(req("source", Type::Text).default("bank"))
                 .primary_key(["transaction_id"])
                 .index(idx("idx_transactions_account_id_date", &["account_id", "date"]))
                 .index(idx("idx_transactions_user_id_date", &["user_id", "date"]))
@@ -302,7 +302,7 @@ fn models() -> &'static [TableDef] {
                 .column(opt("raw", Type::Json))
                 .column(updated())
                 .column(is_deleted())
-                .column(req("source", Type::Text).default("plaid"))
+                .column(req("source", Type::Text).default("bank"))
                 .primary_key(["investment_transaction_id"])
                 .index(idx("idx_investment_transactions_account_id_date", &["account_id", "date"]))
                 .index(idx("idx_investment_transactions_user_id_investment_transaction_id", &["user_id", "investment_transaction_id"]))
@@ -474,8 +474,8 @@ fn models() -> &'static [TableDef] {
     })
 }
 
-/// What budget does at every start (§5.1 step 3): each model's table is
-/// created unless it is there, one statement per table.
+/// What the application does at every start: each model's table is created
+/// unless it is there, one statement per table.
 async fn schema(db: &Client) -> DbResult<()> {
     for model in models() {
         db.create_table_if_not_exists(model.clone()).await?;
@@ -484,11 +484,11 @@ async fn schema(db: &Client) -> DbResult<()> {
 }
 
 fn model(table: &str) -> &'static TableDef {
-    models().iter().find(|m| m.name == table).expect("one of budget's tables")
+    models().iter().find(|m| m.name == table).expect("one of the ledger's tables")
 }
 
 /// The single key column the generic operations work on. They refuse a
-/// table with a composite key, as budget's builder does.
+/// table with a composite key.
 fn primary_key(table: &str) -> &'static str {
     let key = &model(table).primary_key;
     assert_eq!(key.len(), 1, "{table} has a composite primary key");
@@ -519,10 +519,10 @@ fn live_in(alias: &str) -> Expr {
     col(&flag).is_null().or(col(&flag).eq(false))
 }
 
-/// Budget's SQL function `sharing_user_ids(viewer)`: every other member of
-/// the viewer's sharing group, then the viewer. For someone in no group,
-/// just the viewer. It is part of the statement it appears in, so
-/// membership is read afresh by every statement.
+/// In SQL, a function `sharing_user_ids(viewer)`: every other member of the
+/// viewer's sharing group, then the viewer. For someone in no group, just
+/// the viewer. It is part of the statement it appears in, so membership is
+/// read afresh by every statement.
 fn sharing_user_ids(viewer: Uuid) -> Expr {
     let peers = Query::table("sharing_members")
         .alias("own")
@@ -537,8 +537,8 @@ fn sharing_user_ids(viewer: Uuid) -> Expr {
     list_of(peers).list_concat(list([val(viewer)]))
 }
 
-/// Q-SHR-1, `SELECT unnest(sharing_user_ids($1))`: the group as rows, for
-/// the statements that want its members as ranges of an index. There is no
+/// `SELECT unnest(sharing_user_ids($1))`: the group as rows, for the
+/// statements that want its members as ranges of an index. There is no
 /// query without a table, so the viewer's own row carries the list.
 async fn sharing_group(db: &impl Db, viewer: Uuid) -> DbResult<Vec<Uuid>> {
     db.query(Query::table("users").key([viewer]).each("member", sharing_user_ids(viewer)).select("user_id", col("member"))).await?.column()
@@ -549,7 +549,7 @@ fn uuid_list(ids: &[Uuid]) -> Expr {
     val(ids.iter().map(|id| id.0).collect::<Vec<[u8; 16]>>())
 }
 
-/// Whose rows a statement may see or change (§4.9).
+/// Whose rows a statement may see or change.
 #[derive(Clone, Copy)]
 enum Scope {
     /// Global tables, and jobs that walk every user.
@@ -570,7 +570,7 @@ impl Scope {
     }
 }
 
-/// What a generated `WHERE` can hold (§2.0.2), ANDed together.
+/// What a generated `WHERE` can hold, ANDed together.
 #[derive(Clone)]
 struct Filters {
     scope: Scope,
@@ -625,7 +625,7 @@ impl Filters {
     }
 }
 
-/// G1, `Table::query`: the rows `from` reads (a whole table, or the index
+/// The builder's query: the rows `from` reads (a whole table, or the index
 /// range the caller chose) that pass the filters. `LIVE` is added for a
 /// soft-deletable table unless tombstones were asked for.
 fn find(from: Query, filters: &Filters) -> Query {
@@ -642,18 +642,19 @@ fn find(from: Query, filters: &Filters) -> Query {
     query
 }
 
-/// G3, `Table::query_one`: the first row or none, with no order asked for.
+/// The builder's query for one row: the first row or none, with no
+/// order asked for.
 async fn find_one(db: &impl Db, from: Query, filters: &Filters) -> DbResult<Option<Row>> {
     db.query_opt(find(from, filters).limit(1)).await
 }
 
-/// How many rows budget streams per statement (`STREAM_BATCH_SIZE`).
+/// How many rows a stream reads per statement.
 const BATCH: u64 = 500;
 
-/// G2, `Table::query_in_batches`: keyset pages on the primary key, one
-/// statement each, until a page comes back short. The pages are returned
-/// as read, so an exact multiple ends with an empty one. Nothing ties the
-/// statements to one moment, as nothing did in Postgres.
+/// The builder's stream: keyset pages on the primary key, one statement
+/// each, until a page comes back short. The pages are returned as read, so
+/// an exact multiple ends with an empty one. Nothing ties the statements to
+/// one moment, as nothing does in Postgres.
 async fn find_in_batches(db: &impl Db, table: &str, filters: &Filters, batch: u64) -> DbResult<Vec<Vec<Row>>> {
     let key = primary_key(table);
     let mut pages = Vec::new();
@@ -675,7 +676,7 @@ async fn find_in_batches(db: &impl Db, table: &str, filters: &Filters, batch: u6
     }
 }
 
-/// G4, `Table::query_by_ids`: rows by primary key; ids that are missing,
+/// The builder's query by ids: rows by primary key; ids that are missing,
 /// deleted or out of scope are simply absent. No statement for no ids.
 async fn find_by_ids(db: &impl Db, table: &str, ids: Vec<Value>, scope: Scope) -> DbResult<Vec<Row>> {
     if ids.is_empty() {
@@ -694,7 +695,7 @@ fn returned(table: &str, columns: &[&'static str]) -> Vec<&'static str> {
     }
 }
 
-/// G5, `Table::insert`: `updated` first, then the supplied columns; the
+/// The builder's insert: `updated` first, then the supplied columns; the
 /// rest take their defaults. With `do_nothing`, a row that breaks any
 /// unique index is skipped and nothing comes back for it.
 async fn insert(db: &impl Db, table: &str, data: Data, returning: &[&'static str], do_nothing: bool) -> DbResult<Rows> {
@@ -708,7 +709,7 @@ async fn insert(db: &impl Db, table: &str, data: Data, returning: &[&'static str
     db.insert(insert.returning(returned(table, returning))).await
 }
 
-/// G6, `Table::update`: sets the supplied columns and `updated` on the row
+/// The builder's update: sets the supplied columns and `updated` on the row
 /// with this key, if it also passes the scope, the guards and (for a
 /// soft-deletable table) `LIVE`. `raw` is never written by an update. With
 /// nothing left to set no statement is sent, which is `None`.
@@ -734,8 +735,8 @@ async fn update(db: &impl Db, table: &str, id: impl Into<Value>, data: Data, sco
     Ok(Some(db.update(update.returning([key])).await?))
 }
 
-/// §2.0.4: the status a repository reports for a row, from how many rows
-/// its statement touched.
+/// The status a caller reports for a row, from how many rows its
+/// statement touched.
 fn status(rows: &Rows) -> u16 {
     if rows.affected() > 0 {
         200
@@ -753,7 +754,7 @@ fn update_status(outcome: &Option<Rows>) -> u16 {
     }
 }
 
-/// G7, `Table::upsert`: inserts, or on a conflict with `conflict` (the
+/// The builder's upsert: inserts, or on a conflict with `conflict` (the
 /// primary key unless another unique index is named, with its columns)
 /// rewrites the supplied columns that `allow` permits, and `updated`. The
 /// key and the conflict columns are never rewritten. With nothing to
@@ -782,8 +783,8 @@ async fn upsert(db: &impl Db, table: &str, data: Data, allow: Option<&[&str]>, c
     db.insert(insert.returning(all_columns(table))).await
 }
 
-/// G8, `Table::upsert_many`: rows are de-duplicated by key (the last one
-/// wins, in the first one's place), grouped by the columns they supply,
+/// The builder's multi-row upsert: rows are de-duplicated by key (the last
+/// one wins, in the first one's place), grouped by the columns they supply,
 /// and each group is one multi-row statement on the primary key.
 async fn upsert_many(db: &impl Db, table: &str, rows: Vec<Data>, allow: Option<&[&str]>) -> DbResult<Vec<Row>> {
     let key = primary_key(table);
@@ -832,14 +833,14 @@ fn tombstone(rows: Query, scope: Scope) -> Update {
     update
 }
 
-/// G9, `Table::soft_delete`: whether a row was flagged. There is no `LIVE`
+/// The builder's soft delete: whether a row was flagged. There is no `LIVE`
 /// guard, so deleting a deleted row succeeds again and re-stamps it.
 async fn soft_delete(db: &impl Db, table: &str, id: impl Into<Value>, scope: Scope) -> DbResult<bool> {
     let update = tombstone(Query::table(table).key([id.into()]), scope).returning([primary_key(table)]);
     Ok(db.update(update).await?.affected() > 0)
 }
 
-/// G10, `Table::bulk_soft_delete`: how many of these keys were flagged.
+/// The builder's soft delete by keys: how many of them were flagged.
 async fn bulk_soft_delete(db: &impl Db, table: &str, ids: Vec<Value>, scope: Scope) -> DbResult<u64> {
     if ids.is_empty() {
         return Ok(0);
@@ -848,7 +849,7 @@ async fn bulk_soft_delete(db: &impl Db, table: &str, ids: Vec<Value>, scope: Sco
     Ok(db.update(update).await?.affected())
 }
 
-/// G11, `Table::bulk_soft_delete_by_column`: `col = $1`, or `col = ANY($1)`
+/// The builder's soft delete by a column: `col = $1`, or `col = ANY($1)`
 /// when the value is a list. An empty list sends no statement.
 async fn bulk_soft_delete_by_column(db: &impl Db, table: &str, column: &str, value: impl Into<Value>, scope: Scope) -> DbResult<u64> {
     let matches = match value.into() {
@@ -860,7 +861,7 @@ async fn bulk_soft_delete_by_column(db: &impl Db, table: &str, column: &str, val
     Ok(db.update(update).await?.affected())
 }
 
-/// G12, `Table::bulk_soft_delete_by_related_column`:
+/// The builder's soft delete by a column of a related table:
 /// `col IN (SELECT select FROM source WHERE matches = ANY($1))`.
 async fn bulk_soft_delete_by_related_column(
     db: &impl Db,
@@ -876,12 +877,12 @@ async fn bulk_soft_delete_by_related_column(
     Ok(db.update(update).await?.affected())
 }
 
-/// G13, `Table::hard_delete`.
+/// The builder's hard delete: whether a row was removed.
 async fn hard_delete(db: &impl Db, table: &str, id: impl Into<Value>) -> DbResult<bool> {
     Ok(db.delete(Delete::from(table).key([id.into()]).returning([primary_key(table)])).await?.affected() > 0)
 }
 
-/// G14, `Table::bulk_hard_delete`.
+/// The builder's hard delete by keys: how many rows were removed.
 async fn bulk_hard_delete(db: &impl Db, table: &str, ids: Vec<Value>) -> DbResult<u64> {
     if ids.is_empty() {
         return Ok(0);
@@ -890,12 +891,12 @@ async fn bulk_hard_delete(db: &impl Db, table: &str, ids: Vec<Value>) -> DbResul
     Ok(db.delete(Delete::rows(rows).returning([primary_key(table)])).await?.affected())
 }
 
-/// G15, `Table::hard_delete_by_column`.
+/// The builder's hard delete by a column: `col = $1`.
 async fn hard_delete_by_column(db: &impl Db, table: &str, column: &str, value: impl Into<Value>) -> DbResult<u64> {
     delete_by_condition(db, table, column, CmpOp::Eq, value).await
 }
 
-/// G16, `Table::delete_by_condition`: `col <op> $1`.
+/// The builder's hard delete by a condition: `col <op> $1`.
 async fn delete_by_condition(db: &impl Db, table: &str, column: &str, op: CmpOp, value: impl Into<Value>) -> DbResult<u64> {
     let condition = Expr::Cmp(op, Box::new(col(column)), Box::new(val(value.into())));
     Ok(db.delete(Delete::from(table).filter(condition).returning([primary_key(table)])).await?.affected())
@@ -970,7 +971,8 @@ fn day_of(t: Timestamp) -> Date {
     Date(t.micros().div_euclid(86_400_000_000) as i32)
 }
 
-// R-S1, R-S2, R-S3, R-S5, R-S6, R-O3: budget Q-DDL-2, Q-DDL-7, Q-SYS-1 (§5.1 steps 1-3).
+// R-S1, R-S2, R-S3, R-S5, R-S6, R-O3: every start creates the tables that are missing, one statement per table, and
+// leaves the ones that are there alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn tables_are_created_from_the_models_and_left_alone_when_present() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1019,12 +1021,12 @@ async fn tables_are_created_from_the_models_and_left_alone_when_present() -> DbR
     Ok(())
 }
 
-/// The name budget's processes agree on, where Postgres had the advisory
-/// lock key 6453604.
-const MIGRATION_LOCK: &str = "budget.migration";
+/// The name the application's processes agree on, where Postgres would have
+/// an advisory lock key.
+const MIGRATION_LOCK: &str = "app.migration";
 
-/// §5.1 step 5.4: a NOT NULL column without a default gets one inferred
-/// from its type, so the rows already there have a value.
+/// A NOT NULL column without a default gets one inferred from its type, so
+/// the rows already there have a value.
 fn with_inferred_default(column: ColumnDef) -> ColumnDef {
     if column.nullable || column.default.is_some() {
         return column;
@@ -1077,8 +1079,9 @@ async fn add_missing_columns(tx: &Transaction, wanted: &[TableDef]) -> DbResult<
     }
 }
 
-/// T1: the lock is taken before the transaction and given up after it,
-/// whatever happened; the additions land together or not at all.
+/// The column migration: the lock is taken before the transaction and
+/// given up after it, whatever happened; the additions land together or
+/// not at all.
 async fn migrate(db: &Client, wanted: &[TableDef]) -> DbResult<Vec<String>> {
     let guard = db.lock(MIGRATION_LOCK).await?;
     let tx = db.begin().await?;
@@ -1093,7 +1096,8 @@ async fn migrate(db: &Client, wanted: &[TableDef]) -> DbResult<Vec<String>> {
     outcome
 }
 
-// R-S1, R-S8, R-X5, R-S11: budget T1 (Q-SYS-4, Q-DDL-4, Q-DDL-5, Q-DDL-7; §5.1 steps 3, 5 and 6).
+// R-S1, R-S8, R-X5, R-S11: the migration at start: the tables are created, the missing columns added in one
+// transaction under a named lock, and the indexes built after them.
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_columns_are_added_in_one_transaction_under_the_migration_lock() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1140,7 +1144,7 @@ async fn missing_columns_are_added_in_one_transaction_under_the_migration_lock()
 
     // Rows written before the column existed read its default; a nullable
     // column without one reads NULL.
-    assert_eq!(stored(&db, "transactions", "t-old").await?.get::<String>("source")?, "plaid");
+    assert_eq!(stored(&db, "transactions", "t-old").await?.get::<String>("source")?, "bank");
     assert_eq!(stored(&db, "sessions", "s-old").await?.get::<Option<String>>("auth_sid")?, None);
     assert!(stored(&db, "accounts", "acc-1").await?.is_null("plan_fund_mappings")?);
     txn(&db, ann, "t-new", "acc-1", 1, "2026-03-06").await?;
@@ -1178,7 +1182,8 @@ async fn missing_columns_are_added_in_one_transaction_under_the_migration_lock()
     Ok(())
 }
 
-// R-S11, R-S3, R-Q3, R-Q11, R-W11: budget Q-DDL-6, Q-DDL-7 (§5.1 step 6).
+// R-S11, R-S3, R-Q3, R-Q11, R-W11: a unique expression index comes to a table that has rows: the check for
+// duplicates before it, and the index once they are gone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_unique_index_is_built_only_once_its_duplicates_are_gone() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1189,8 +1194,8 @@ async fn a_unique_index_is_built_only_once_its_duplicates_are_gone() -> DbResult
         insert(&db, "users", data! {"username": name, "email": email}, &[], false).await?;
     }
 
-    // Q-DDL-6: the keys held more than once, among the rows the index
-    // would cover. Users without an email are not duplicates of each other.
+    // The keys held more than once, among the rows the index would cover.
+    // Users without an email are not duplicates of each other.
     let duplicates = || {
         Query::table("users")
             .filter(col("email").is_not_null())
@@ -1204,8 +1209,8 @@ async fn a_unique_index_is_built_only_once_its_duplicates_are_gone() -> DbResult
     assert_eq!(texts_of(&found, "email"), ["ann@example.com"]);
     assert_eq!(column::<i64>(&found, "n"), [2]);
 
-    // Budget refuses to start instead of trying. Were it to try, the
-    // index is refused and nothing of it is left behind.
+    // The application refuses to start instead of trying. Were it to try,
+    // the index is refused and nothing of it is left behind.
     let refused = db.create_index("users", lower_email_index()).await.unwrap_err();
     assert_eq!(refused.code, ErrorCode::UniqueViolation);
     assert!(refused.violates("idx_users_lower_email"));
@@ -1241,16 +1246,16 @@ async fn matching(db: &impl Db, owner: Uuid, condition: Expr) -> DbResult<Vec<St
         .column()
 }
 
-// R-T5, R-T1, R-W1, R-W6: budget §4.4 (amounts bound as float8, int, text; Q-TXN-15, Q-TXN-16, Q-TXN-17).
+// R-T5, R-T1, R-W1, R-W6: amounts bound as floats, integers and text, by an insert, an update and an upsert.
 #[tokio::test(flavor = "multi_thread")]
 async fn floats_written_to_money_columns_are_rounded_half_away_from_zero_to_the_cent() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     let ann = user(&db, "ann").await?;
 
-    // What the app binds, and what `NUMERIC(15,2)` then holds. A float
-    // goes through its first 15 significant digits, so 2.675 (a hair
-    // under in binary) and 0.1 + 0.2 (a hair over) land where they print.
+    // What a caller binds, and what `NUMERIC(15,2)` then holds. A float
+    // goes through its first 15 significant digits, so 2.675 (a hair under
+    // in binary) and 0.1 + 0.2 (a hair over) land where they print.
     let cases: Vec<(Value, &str)> = vec![
         (12.345.into(), "12.35"),
         ((-12.345).into(), "-12.35"),
@@ -1281,7 +1286,7 @@ async fn floats_written_to_money_columns_are_rounded_half_away_from_zero_to_the_
         assert_eq!(returned.get::<Decimal>("amount")?.to_string(), kept, "{id}");
         let row = stored(&db, "transactions", id.as_str()).await?;
         assert_eq!(row.get::<Decimal>("amount")?.to_string(), kept, "{id}");
-        // The API hands the number on as a float parsed from that text.
+        // Read as a float, it is the float parsed from that text.
         assert_eq!(row.get::<f64>("amount")?, kept.parse::<f64>().unwrap(), "{id}");
     }
 
@@ -1311,15 +1316,15 @@ async fn floats_written_to_money_columns_are_rounded_half_away_from_zero_to_the_
     Ok(())
 }
 
-// R-T5, R-W11, R-W2: budget §3.5 (22003 numeric overflow), §4.4.
+// R-T5, R-W11, R-W2: numeric overflow (22003 in Postgres) on money and price columns.
 #[tokio::test(flavor = "multi_thread")]
 async fn amounts_too_large_for_their_column_are_out_of_range() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
     let ann = user(&db, "ann").await?;
 
-    // `DECIMAL_15_2_MAX` is 9999999999999.99. One cent more does not fit,
-    // nor does a value that only reaches 14 whole digits by rounding.
+    // `NUMERIC(15,2)` holds up to 9999999999999.99. One cent more does not
+    // fit, nor does a value that only reaches 14 whole digits by rounding.
     let too_large: Vec<Value> = vec![
         1e13.into(),
         (-1e13).into(),
@@ -1335,7 +1340,7 @@ async fn amounts_too_large_for_their_column_are_out_of_range() -> DbResult<()> {
     }
     assert!(matching(&db, ann, val(true)).await?.is_empty());
 
-    // `DECIMAL_15_6_MAX` is 999999999.999999.
+    // `NUMERIC(15,6)` holds up to 999999999.999999.
     upsert(&db, "securities", data! {"security_id": "sec-1", "close_price": "999999999.999999"}, None, None).await?;
     for price in [Value::from(1e9), Value::from("999999999.9999995"), Value::from(1_000_000_000)] {
         let refused = upsert(&db, "securities", data! {"security_id": "sec-1", "close_price": price}, None, None).await;
@@ -1362,7 +1367,7 @@ async fn amounts_too_large_for_their_column_are_out_of_range() -> DbResult<()> {
     Ok(())
 }
 
-// R-T5: budget §4.4 (`NUMERIC(15,6)`: Q-SEC-4, Q-HLD-3, Q-INV-7, Q-CPI-2, Q-SNP-11).
+// R-T5: `NUMERIC(15,6)` for a security's price, a holding, a trade and an index value.
 #[tokio::test(flavor = "multi_thread")]
 async fn prices_and_quantities_keep_six_decimal_places() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1433,7 +1438,7 @@ async fn prices_and_quantities_keep_six_decimal_places() -> DbResult<()> {
     Ok(())
 }
 
-// R-T5, R-Q11, R-W2: budget §4.4 (what is stored is exact decimal; `SUM`).
+// R-T5, R-Q11, R-W2: what is stored is exact decimal, and so is its `SUM`.
 #[tokio::test(flavor = "multi_thread")]
 async fn sums_of_money_are_exact_where_float_addition_drifts() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1499,8 +1504,8 @@ async fn sums_of_money_are_exact_where_float_addition_drifts() -> DbResult<()> {
     Ok(())
 }
 
-// R-T5, R-Q16, R-Q9, R-T9: budget §4.4 (`t2.amount = -t1.amount`, `amount <> 0`, `BETWEEN` floats, `SIGN`, `ABS`,
-// `label_category_confidence = 1`); the predicates of Q-TXN-11, Q-TXN-12, Q-TXN-14, Q-TXN-19, Q-SPL-9.
+// R-T5, R-Q16, R-Q9, R-T9: decimal amounts compared exactly with float and integer parameters
+// (`t2.amount = -t1.amount`, `amount <> 0`, `BETWEEN` floats, `SIGN`, `ABS`, `label_category_confidence = 1`).
 #[tokio::test(flavor = "multi_thread")]
 async fn decimal_columns_compare_exactly_with_float_and_integer_parameters() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1594,7 +1599,7 @@ async fn decimal_columns_compare_exactly_with_float_and_integer_parameters() -> 
     Ok(())
 }
 
-// R-T2, R-T3, R-T4: budget §4.3 (date and timestamp parameters travel as text), §2 conventions (what comes out).
+// R-T2, R-T3, R-T4: date, timestamp and uuid parameters travel as text, and come back typed.
 #[tokio::test(flavor = "multi_thread")]
 async fn dates_timestamps_and_uuids_written_as_text_are_parsed() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1646,7 +1651,7 @@ async fn dates_timestamps_and_uuids_written_as_text_are_parsed() -> DbResult<()>
     for id in ["s-utc", "s-offset", "s-space"] {
         assert_eq!(stored(&db, "sessions", id).await?.get::<Timestamp>("cookie_expires")?, instant, "{id}");
     }
-    // Budget's API truncates to milliseconds on the way out; the stored
+    // A caller may truncate to milliseconds on the way out; the stored
     // value is the microsecond one.
     assert_eq!(instant.micros() % 1000, 456);
     assert_eq!(Timestamp::from_millis(instant.millis()), stored(&db, "sessions", "s-millis").await?.get::<Timestamp>("cookie_expires")?);
@@ -1670,8 +1675,8 @@ async fn dates_timestamps_and_uuids_written_as_text_are_parsed() -> DbResult<()>
     Ok(())
 }
 
-// R-Q22, R-T2, R-T4, R-W11: budget §3.5 (22P02, 22007, 42883 are pinned as errors), Q-REC-1 with a bad
-// `start-date`, Q-REC-7 with a non-uuid id, Q-ITM-4 and Q-SNP-6 with a number for a text id.
+// R-Q22, R-T2, R-T4, R-W11: a value that cannot be read as its column's type is an error (22P02, 22007, 42883 in
+// Postgres): a cursor that is no timestamp, an id that is no uuid, a number for a text id.
 #[tokio::test(flavor = "multi_thread")]
 async fn unreadable_dates_and_ids_are_type_errors_not_empty_results() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1700,7 +1705,7 @@ async fn unreadable_dates_and_ids_are_type_errors_not_empty_results() -> DbResul
     )
     .await?;
 
-    // `GET /recurrings?start-date=yesterday`: the cursor cannot be read as
+    // A delta is asked for since `yesterday`: the cursor cannot be read as
     // a timestamp, whether it is compared or used as the bound of a range.
     let compared = find(Query::table("recurrings"), &Filters::new(Scope::Group(ann)).since("updated", "yesterday"));
     assert_eq!(code(db.query(compared).await), ErrorCode::TypeMismatch);
@@ -1713,10 +1718,10 @@ async fn unreadable_dates_and_ids_are_type_errors_not_empty_results() -> DbResul
     let no_such_instant = find(Query::table("snapshots"), &Filters::new(Scope::Owner(ann)).until("snapshot_date", "2026-02-30T00:00:00Z"));
     assert_eq!(code(db.query(no_such_instant).await), ErrorCode::TypeMismatch);
 
-    // `POST` and `DELETE /recurrings` with an id that is no uuid.
+    // A read and a write of a recurring by an id that is no uuid.
     assert_eq!(code(db.get("recurrings", ["not-a-uuid"]).await), ErrorCode::TypeMismatch);
     assert_eq!(code(update(&db, "recurrings", "not-a-uuid", data! {"status": "dismissed"}, Scope::Owner(ann), vec![]).await), ErrorCode::TypeMismatch);
-    // One bad id fails the whole batch, which is why the routes validate.
+    // One bad id fails the whole batch, which is why callers validate.
     let one_bad_id =
         find(Query::table("recurrings"), &Filters::new(Scope::Owner(ann)).any_of("recurring_id", [Value::from("not-a-uuid"), Value::from(uuid(1))]));
     assert_eq!(code(db.query(one_bad_id).await), ErrorCode::TypeMismatch);
@@ -1739,7 +1744,7 @@ async fn unreadable_dates_and_ids_are_type_errors_not_empty_results() -> DbResul
     assert_eq!(code(insert(&db, "users", data! {"user_id": "not-a-uuid", "username": "bob"}, &[], false).await), ErrorCode::TypeMismatch);
     assert_eq!(code(insert(&db, "users", data! {"username": 7}, &[], false).await), ErrorCode::TypeMismatch);
     assert_eq!(code(upsert(&db, "sessions", data! {"session_id": "s-1", "cookie_expires": "soon"}, None, None).await), ErrorCode::TypeMismatch);
-    // Postgres read decimal text into a BIGINT; here the app sends the
+    // Postgres reads decimal text into a BIGINT; here the caller sends the
     // integer it has.
     assert_eq!(code(upsert(&db, "sessions", data! {"session_id": "s-1", "cookie_max_age": "604800000"}, None, None).await), ErrorCode::TypeMismatch);
     upsert(&db, "sessions", data! {"session_id": "s-1", "cookie_max_age": 604_800_000_i64}, None, None).await?;
@@ -1756,8 +1761,9 @@ async fn unreadable_dates_and_ids_are_type_errors_not_empty_results() -> DbResul
     Ok(())
 }
 
-// R-T6, R-Q13, R-Q7: budget §4.5 (jsonb key order reaches the API through `plan_fund_mappings` and
-// `charts.configuration`; `raw->'personal_finance_category'->>'primary'`), Q-ACC-8, Q-CHT-2, Q-BSC-5.
+// R-T6, R-Q13, R-Q7: JSON is stored whole and returned in jsonb key order, which a reader sees through
+// `plan_fund_mappings` and `charts.configuration`; a path into it is read inside a statement
+// (`raw->'category_hint'->>'primary'`).
 #[tokio::test(flavor = "multi_thread")]
 async fn json_is_stored_whole_and_returned_in_jsonb_key_order() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1765,8 +1771,8 @@ async fn json_is_stored_whole_and_returned_in_jsonb_key_order() -> DbResult<()> 
     let ann = user(&db, "ann").await?;
     account(&db, ann, "acc-401k").await?;
 
-    // Q-ACC-8. The API lists the funds in the order the keys come back:
-    // shorter keys first, then by bytes, at every depth.
+    // A reader lists the funds in the order the keys come back: shorter
+    // keys first, then by bytes, at every depth.
     let mappings = json!({
         "Vanguard Target 2050": {"security_id": "sec-vt", "restated": false},
         "Zeta": {"security_id": "sec-z", "restated": true},
@@ -1784,8 +1790,9 @@ async fn json_is_stored_whole_and_returned_in_jsonb_key_order() -> DbResult<()> 
     assert_eq!(kept["Bond"].to_string(), r#"{"restated":false,"security_id":"sec-b"}"#);
     assert_eq!(kept, mappings);
 
-    // Q-CHT-2. The client sends text; the app parses it, the database
-    // stores the value, and the app serializes what it reads back.
+    // A chart's configuration arrives as text: the application parses
+    // it, the database stores the value, and the application serializes
+    // what it reads back.
     let sent = r#"{ "title": "Net worth", "series": [ {"name": "b", "id": 2}, {"id": 1, "name": "a"} ], "type": "line", "y": {"min": 0, "max": 10.5} }"#;
     assert_eq!(code(insert(&db, "charts", data! {"user_id": ann, "configuration": sent}, &[], false).await), ErrorCode::TypeMismatch);
     let parsed: Json = serde_json::from_str(sent).unwrap();
@@ -1795,7 +1802,7 @@ async fn json_is_stored_whole_and_returned_in_jsonb_key_order() -> DbResult<()> 
         r#"{"y":{"max":10.5,"min":0},"type":"line","title":"Net worth","series":[{"id":2,"name":"b"},{"id":1,"name":"a"}]}"#
     );
 
-    // Q-BSC-5. An array keeps its order; only object keys are sorted.
+    // An array keeps its order; only object keys are sorted.
     let capacities = json!([{"month": "2026-02", "amount": 300}, {"amount": 250.5, "month": "2026-01"}]);
     let budget = insert(&db, "budgets", data! {"user_id": ann, "name": "Home", "capacities": capacities}, &["*"], false).await?.one()?;
     assert_eq!(budget.get::<Json>("capacities")?.to_string(), r#"[{"month":"2026-02","amount":300},{"month":"2026-01","amount":250.5}]"#);
@@ -1820,9 +1827,9 @@ async fn json_is_stored_whole_and_returned_in_jsonb_key_order() -> DbResult<()> 
     // The provider's payload is kept whole and read by path inside
     // statements. A missing step of the path gives NULL, never an error.
     let payloads = [
-        ("t-out", Some(json!({"personal_finance_category": {"primary": "TRANSFER_OUT", "detailed": "TRANSFER_OUT_SAVINGS"}, "amount": 5.5}))),
-        ("t-food", Some(json!({"personal_finance_category": {"primary": "FOOD_AND_DRINK"}}))),
-        ("t-flat", Some(json!({"personal_finance_category": "none"}))),
+        ("t-out", Some(json!({"category_hint": {"primary": "TRANSFER_OUT", "detailed": "TRANSFER_OUT_SAVINGS"}, "amount": 5.5}))),
+        ("t-food", Some(json!({"category_hint": {"primary": "FOOD_AND_DRINK"}}))),
+        ("t-flat", Some(json!({"category_hint": "none"}))),
         ("t-empty", Some(json!({}))),
         ("t-none", None),
     ];
@@ -1836,7 +1843,7 @@ async fn json_is_stored_whole_and_returned_in_jsonb_key_order() -> DbResult<()> 
         )
         .await?;
     }
-    let primary = || col("raw").json_text(["personal_finance_category", "primary"]);
+    let primary = || col("raw").json_text(["category_hint", "primary"]);
     assert_eq!(matching(&db, ann, primary().eq("TRANSFER_OUT")).await?, ["t-out"]);
     assert_eq!(matching(&db, ann, primary().like("TRANSFER%")).await?, ["t-out"]);
     assert_eq!(matching(&db, ann, primary().not_like("TRANSFER%")).await?, ["t-food"]);
@@ -1846,7 +1853,7 @@ async fn json_is_stored_whole_and_returned_in_jsonb_key_order() -> DbResult<()> 
             Query::table("transactions")
                 .key(["t-out"])
                 .select("primary", primary())
-                .select("category", col("raw").json(["personal_finance_category"]))
+                .select("category", col("raw").json(["category_hint"]))
                 .select("amount", col("raw").json_text(["amount"]))
                 .select("missing", col("raw").json(["location", "city"])),
         )
@@ -1874,8 +1881,8 @@ async fn json_is_stored_whole_and_returned_in_jsonb_key_order() -> DbResult<()> 
     Ok(())
 }
 
-// R-Q2, R-Q1, R-Q6, R-Q3: budget G1, G3, G4 (Q-ACC-1, Q-ACC-2, Q-ACC-3, Q-ACC-4, Q-HLD-2, Q-ITM-2, Q-ITM-3,
-// Q-TXN-3, Q-TXN-4, Q-TXN-6, Q-INS-2, Q-USR-3, Q-BSC-3; §2.0.2).
+// R-Q2, R-Q1, R-Q6, R-Q3: the builder's reads (many rows, one row, rows by ids) with the scope, equality and
+// `IS NULL` filters, `IN` lists and a case-insensitive match.
 #[tokio::test(flavor = "multi_thread")]
 async fn builder_reads_and_scope_filters_lists_and_the_live_predicate() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1897,19 +1904,19 @@ async fn builder_reads_and_scope_filters_lists_and_the_live_predicate() -> DbRes
     let ids = |rows: Rows| texts_of(&rows, "account_id");
     let group = Filters::new(Scope::Group(home.alice));
 
-    // Q-ACC-1: the whole group's live rows, whoever of it asks.
+    // The whole group's live rows, whoever of it asks.
     assert_eq!(ids(db.query(find(Query::table("accounts"), &group)).await?), ["acc-a1", "acc-a3", "acc-b1"]);
     assert_eq!(ids(db.query(find(Query::table("accounts"), &Filters::new(Scope::Group(home.bob)))).await?), ["acc-a1", "acc-a3", "acc-b1"]);
     assert_eq!(ids(db.query(find(Query::table("accounts"), &Filters::new(Scope::Group(home.carol)))).await?), ["acc-c1"]);
     assert_eq!(ids(db.query(find(Query::table("accounts"), &Filters::new(Scope::Owner(home.alice)))).await?), ["acc-a1", "acc-a3"]);
-    // Q-ITM-2 has no owner at all: the hourly job reads everyone's.
+    // With no owner at all: the hourly job reads everyone's.
     assert_eq!(db.query(find(Query::table("accounts"), &Filters::new(Scope::Everyone))).await?.len(), 4);
     // All rows come whole, in the model's column order.
     let whole = db.query(find(Query::table("accounts"), &group)).await?;
     assert_eq!(whole.columns(), all_columns("accounts"));
 
-    // Q-ACC-3: equality filters are ANDed. The caller picks the way in;
-    // the filters decide what of it is kept.
+    // Equality filters are ANDed. The caller picks the way in; the filters
+    // decide what of it is kept.
     let by_item = Query::table("accounts").index("idx_accounts_item_id", KeyRange::eq(["item-a"]));
     assert_eq!(ids(db.query(find(by_item.clone(), &group)).await?), ["acc-a1"]);
     assert_eq!(db.query(find(by_item.clone(), &group.clone().with_tombstones())).await?.len(), 2);
@@ -1918,13 +1925,13 @@ async fn builder_reads_and_scope_filters_lists_and_the_live_predicate() -> DbRes
         ["acc-a1", "acc-b1"]
     );
     assert!(db.query(find(by_item, &Filters::new(Scope::Group(home.carol)))).await?.is_empty());
-    // Q-TXN-6: a null filter value means `IS NULL`.
+    // A null filter value means `IS NULL`.
     assert_eq!(
         ids(db.query(find(Query::table("accounts"), &group.clone().eq("custom_name", Value::Null).eq("type", "depository"))).await?),
         ["acc-a1", "acc-a3", "acc-b1"]
     );
 
-    // Q-HLD-2, Q-BSC-3: an `IN` list; an empty one adds no condition.
+    // An `IN` list; an empty one adds no condition.
     assert_eq!(ids(db.query(find(Query::table("accounts"), &group.clone().any_of("item_id", ["item-b", "item-c", "item-d"]))).await?), ["acc-a3", "acc-b1"]);
     assert_eq!(ids(db.query(find(Query::table("accounts"), &group.clone().any_of("item_id", Vec::<String>::new()))).await?), ["acc-a1", "acc-a3", "acc-b1"]);
     assert_eq!(
@@ -1932,7 +1939,7 @@ async fn builder_reads_and_scope_filters_lists_and_the_live_predicate() -> DbRes
         ["acc-a2"]
     );
 
-    // Q-ACC-2 (G3): the first row or none.
+    // The first row or none.
     let one = find_one(&db, Query::table("accounts").key(["acc-b1"]), &group).await?.expect("a group member's account");
     assert_eq!(one.get::<Uuid>("user_id")?, home.bob);
     assert!(find_one(&db, Query::table("accounts").key(["acc-c1"]), &group).await?.is_none());
@@ -1940,19 +1947,19 @@ async fn builder_reads_and_scope_filters_lists_and_the_live_predicate() -> DbRes
     assert!(find_one(&db, Query::table("accounts"), &group.clone().eq("type", "loan")).await?.is_none());
     assert_eq!(find_one(&db, Query::table("accounts"), &group).await?.unwrap().get::<String>("account_id")?, "acc-a1");
 
-    // Q-ACC-4, Q-TXN-3 (G4): by ids. Unknown, deleted and foreign ids are
-    // simply absent, and the rows come in the order the ids were given.
+    // By ids. Unknown, deleted and foreign ids are simply absent, and the
+    // rows come in the order the ids were given.
     let asked: Vec<Value> = ["acc-b1", "acc-zz", "acc-a2", "acc-c1", "acc-a1"].map(Value::from).to_vec();
     let found = find_by_ids(&db, "accounts", asked, Scope::Group(home.alice)).await?;
     assert_eq!(found.iter().map(|row| row.get("account_id")).collect::<DbResult<Vec<String>>>()?, ["acc-b1", "acc-a1"]);
     assert!(find_by_ids(&db, "accounts", Vec::new(), Scope::Group(home.alice)).await?.is_empty());
-    // Q-INS-2: a global table has neither an owner nor a flag.
+    // A global table has neither an owner nor a flag.
     upsert_many(&db, "institutions", vec![data! {"institution_id": "ins-1", "name": "First"}, data! {"institution_id": "ins-2", "name": "Second"}], None)
         .await?;
     assert_eq!(find_by_ids(&db, "institutions", vec!["ins-2".into(), "ins-9".into()], Scope::Everyone).await?.len(), 1);
 
-    // Q-USR-3: `lower(email) = lower($1)`, as a filter and through the
-    // index made for it. Both fold the same way the app does.
+    // `lower(email) = lower($1)`, as a filter and through the index made
+    // for it. Both fold the same way Rust's `to_lowercase` does.
     update(&db, "users", home.carol, data! {"email": "Carol.Émond@Example.com"}, Scope::Everyone, vec![]).await?;
     let by_filter = find_one(&db, Query::table("users"), &Filters::new(Scope::Everyone).ignoring_case("email", "CAROL.ÉMOND@example.COM")).await?;
     assert_eq!(by_filter.expect("found whatever the case").get::<Uuid>("user_id")?, home.carol);
@@ -1966,8 +1973,8 @@ async fn builder_reads_and_scope_filters_lists_and_the_live_predicate() -> DbRes
     Ok(())
 }
 
-// R-Q4, R-Q21, R-W2, R-T1: budget G2 (Q-TXN-2, Q-INV-2, Q-SNP-1, Q-SNP-3: the cold sync), §4.7 (keyset order on
-// text keys), hardest thing 9 (500-row pages with no shared snapshot).
+// R-Q4, R-Q21, R-W2, R-T1: the builder's stream, as a cold sync reads a table: keyset order on text keys, in
+// 500-row pages with no shared snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn builder_batches_stream_a_table_in_key_order_500_rows_at_a_time() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -1975,14 +1982,14 @@ async fn builder_batches_stream_a_table_in_key_order_500_rows_at_a_time() -> DbR
     let home = household(&db).await?;
 
     // 1,000 of Alice's rows, 250 of Bob's and 100 of Carol's, with ids of
-    // the shapes providers and the app mint, so the key order is not the
-    // order of insertion.
+    // the shapes providers and the application mint, so the key order is
+    // not the order of insertion.
     let mut rows: Vec<(String, Uuid, &str)> = Vec::new();
     for i in 0..1250 {
         let id = match i % 5 {
             0 => format!("manual-{i:05}"),
-            1 => format!("Plaid{i:05}"),
-            2 => format!("plaid{i:05}"),
+            1 => format!("Bank{i:05}"),
+            2 => format!("bank{i:05}"),
             3 => format!("{i:05}-x"),
             _ => format!("ZZ-{i:05}"),
         };
@@ -2002,9 +2009,9 @@ async fn builder_batches_stream_a_table_in_key_order_500_rows_at_a_time() -> DbR
     // letters. `String`'s own order is the same.
     let mut group_ids: Vec<String> = rows.iter().filter(|(_, owner, _)| *owner != home.carol).map(|(id, _, _)| id.clone()).collect();
     group_ids.sort();
-    assert!(group_ids[0].starts_with('0') && group_ids[1249].starts_with("plaid"));
+    assert!(group_ids[0].starts_with('0') && group_ids[1249].starts_with("manual"));
 
-    // The whole group, tombstones included, as `GET /transactions` asks.
+    // The whole group, tombstones included, as a cold sync asks.
     let group = Filters::new(Scope::Group(home.alice)).with_tombstones();
     let pages = find_in_batches(&db, "transactions", &group, BATCH).await?;
     assert_eq!(sizes(&pages), [500, 500, 250]);
@@ -2052,9 +2059,8 @@ async fn builder_batches_stream_a_table_in_key_order_500_rows_at_a_time() -> DbR
     Ok(())
 }
 
-// R-W1, R-S5, R-S6, R-S7, R-W11, R-Q8: budget G5 (Q-ACC-5, Q-TXN-16, Q-INV-9, Q-SPL-3, Q-BSC-5, Q-CHT-2, Q-KEY-1),
-// Q-CHT-1; §1.0 (server-generated values and the defaults inserts rely on), §3.5 (constraint errors are per-row
-// failures: 23502, 23503, 23505, 22001).
+// R-W1, R-S5, R-S6, R-S7, R-W11, R-Q8: the builder's insert: the values the server generates and the defaults
+// inserts rely on; a constraint error is a failure of that row (23502, 23503, 23505, 22001 in Postgres).
 #[tokio::test(flavor = "multi_thread")]
 async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2062,7 +2068,7 @@ async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<
     let ann = user(&db, "ann").await?;
     let before = db.now().await?;
 
-    // Q-ACC-5: the whole row comes back, defaults filled in.
+    // The whole row comes back, defaults filled in.
     let created = insert(
         &db,
         "accounts",
@@ -2094,8 +2100,7 @@ async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<
     assert!(row.get::<Timestamp>("updated")? >= before);
     assert_eq!(row, stored(&db, "accounts", "manual-1").await?);
 
-    // Q-TXN-16, Q-INV-9: `source` says who made the row; left out, it is
-    // the provider's.
+    // `source` says who made the row; left out, it is the provider's.
     let manual = insert(
         &db,
         "transactions",
@@ -2109,15 +2114,15 @@ async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<
     .await?
     .one()?;
     assert_eq!((manual.get::<String>("source")?, manual.get::<Option<bool>>("pending")?), ("manual".to_string(), Some(false)));
-    txn(&db, ann, "plaid-t1", "manual-1", 5, "2026-03-01").await?;
-    let synced = stored(&db, "transactions", "plaid-t1").await?;
+    txn(&db, ann, "bank-t1", "manual-1", 5, "2026-03-01").await?;
+    let synced = stored(&db, "transactions", "bank-t1").await?;
     assert_eq!(
         (synced.get::<String>("source")?, synced.get::<Option<bool>>("pending")?, synced.get::<Option<f64>>("label_category_confidence")?),
-        ("plaid".to_string(), Some(false), None)
+        ("bank".to_string(), Some(false), None)
     );
 
-    // Q-BSC-5, Q-CHT-2, Q-SPL-3, Q-KEY-1: the id is the server's, one per
-    // row, and the app learns it from what the insert returns.
+    // The id is the server's, one per row, and the caller learns it from
+    // what the insert returns.
     let budget = insert(&db, "budgets", data! {"user_id": ann}, &["*"], false).await?.one()?;
     let other = insert(
         &db,
@@ -2140,7 +2145,7 @@ async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<
     );
     let chart = insert(&db, "charts", data! {"user_id": ann, "type": "line"}, &["chart_id", "name"], false).await?.one()?;
     assert_eq!(chart.get::<String>("name")?, "Unnamed");
-    // Q-CHT-1: the charts of the group, narrowed by type or by id.
+    // The charts of the group, narrowed by type or by id.
     let lines = db.query(find(Query::table("charts"), &Filters::new(Scope::Group(ann)).eq("type", "line"))).await?;
     assert_eq!(column::<Uuid>(&lines, "chart_id"), [chart.get::<Uuid>("chart_id")?]);
     assert!(db.query(find(Query::table("charts").key([chart.get::<Uuid>("chart_id")?]), &Filters::new(Scope::Group(ann)).eq("type", "bar"))).await?.is_empty());
@@ -2149,7 +2154,7 @@ async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<
             .await?
             .one()?;
     assert_eq!((split.get::<Decimal>("amount")?, split.get::<String>("custom_name")?), (dec("0"), String::new()));
-    let key = insert(&db, "api_keys", data! {"user_id": ann, "name": "laptop", "key_hash": "ab".repeat(32), "key_prefix": "bk_ab"}, &[], false).await?;
+    let key = insert(&db, "api_keys", data! {"user_id": ann, "name": "laptop", "key_hash": "ab".repeat(32), "key_prefix": "key_ab"}, &[], false).await?;
     assert_eq!(key.columns(), ["key_id"]);
     let key = stored(&db, "api_keys", key.one()?.get::<Uuid>("key_id")?).await?;
     assert!(key.get::<Vec<String>>("scopes")?.is_empty() && key.get::<Timestamp>("created_at")? >= before);
@@ -2161,9 +2166,9 @@ async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<
     let unnamed = insert(&db, "budgets", data! {"user_id": ann, "name": Value::Null, "roll_over": Value::Null}, &["*"], false).await?.one()?;
     assert!(unnamed.is_null("name")? && unnamed.is_null("roll_over")?);
 
-    // What cannot be stored is an error the repository reports as that
-    // row's 500: a missing required column, a NULL where none may be, an
-    // owner that does not exist, a key already there.
+    // What cannot be stored is an error the caller reports as that row's
+    // 500: a missing required column, a NULL where none may be, an owner
+    // that does not exist, a key already there.
     let no_item = insert(&db, "accounts", data! {"user_id": ann, "account_id": "manual-2", "institution_id": "manual"}, &[], false).await.unwrap_err();
     assert_eq!(no_item.code, ErrorCode::NotNullViolation);
     assert!(no_item.violates("item_id"));
@@ -2175,7 +2180,7 @@ async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<
         ErrorCode::NotNullViolation
     );
     assert_eq!(code(txn(&db, uuid(404), "t-orphan", "manual-1", 1, "2026-03-01").await), ErrorCode::ForeignKeyViolation);
-    let twice = txn(&db, ann, "plaid-t1", "manual-1", 6, "2026-03-02").await.unwrap_err();
+    let twice = txn(&db, ann, "bank-t1", "manual-1", 6, "2026-03-02").await.unwrap_err();
     assert_eq!(twice.code, ErrorCode::UniqueViolation);
     assert!(twice.violates(PRIMARY));
     // A `VARCHAR(10)` is text with a check on its length.
@@ -2183,18 +2188,18 @@ async fn builder_insert_takes_defaults_and_returns_the_stored_row() -> DbResult<
     let too_long = update(&db, "transactions", "t-long", data! {"iso_currency_code": "US-DOLLARS!"}, Scope::Owner(ann), vec![]).await.unwrap_err();
     assert_eq!(too_long.code, ErrorCode::CheckViolation);
     assert!(too_long.violates("iso_currency_code_length"));
-    assert_eq!(stored(&db, "transactions", "plaid-t1").await?.get::<Decimal>("amount")?, dec("5"));
-    assert_eq!(matching(&db, ann, val(true)).await?, ["manual-t1", "plaid-t1", "t-long"]);
+    assert_eq!(stored(&db, "transactions", "bank-t1").await?.get::<Decimal>("amount")?, dec("5"));
+    assert_eq!(matching(&db, ann, val(true)).await?, ["bank-t1", "manual-t1", "t-long"]);
     Ok(())
 }
 
-// R-W5, R-S3, R-T9: budget G5 with `ON CONFLICT DO NOTHING` (Q-USR-7, Q-SHR-7), Q-SHR-6; hardest thing 4
-// ("any unique key including a partial expression index").
+// R-W5, R-S3, R-T9: the builder's insert with `ON CONFLICT DO NOTHING`: a row that collides on any unique key, a
+// partial expression index included, is skipped in silence.
 #[tokio::test(flavor = "multi_thread")]
 async fn builder_insert_do_nothing_reports_any_taken_unique_key_as_no_row() -> DbResult<()> {
     let (_server, db) = fresh().await;
     schema(&db).await?;
-    // Q-USR-7: an identity provider's user, with the email when it has one.
+    // An identity provider's user, with the email when it has one.
     let create_sso_user = |username: &'static str, subject: &'static str, email: Option<&'static str>| {
         let mut row = data! {"username": username, "auth_sub": subject};
         row.extend(email.map(|email| ("email", Value::from(email))));
@@ -2227,8 +2232,8 @@ async fn builder_insert_do_nothing_reports_any_taken_unique_key_as_no_row() -> D
     assert_eq!(by_email.code, ErrorCode::UniqueViolation);
     assert!(by_email.violates("idx_users_lower_email"));
 
-    // Q-SHR-7: inviting twice is a silent no-op, and the invitation is
-    // then read back by its pair (Q-SHR-6).
+    // Inviting twice is a silent no-op, and the invitation is then read
+    // back by its pair.
     let bob = user(&db, "bob").await?;
     let invite = |from: Uuid, to: Uuid| insert(&db, "sharing_invitations", data! {"inviter_user_id": from, "invitee_user_id": to}, &["invitation_id"], true);
     let invitation: Uuid = invite(ann, bob).await?.one()?.get("invitation_id")?;
@@ -2248,8 +2253,7 @@ async fn builder_insert_do_nothing_reports_any_taken_unique_key_as_no_row() -> D
     Ok(())
 }
 
-// R-W6, R-W7, R-Q8: budget G6 (Q-ACC-7, Q-TXN-17, Q-ITM-6, Q-ITM-7, Q-INV-10, Q-SPL-2, Q-BSC-6, Q-CHT-3,
-// Q-SNP-13), §2.0.4 (200 / 304 from the returned row), §4.9 (the scope is ANDed into writes).
+// R-W6, R-W7, R-Q8: the builder's update: 200 or 304 from the returned row, with the scope ANDed into the write.
 #[tokio::test(flavor = "multi_thread")]
 async fn builder_update_writes_only_supplied_columns_and_reports_missing_rows() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2276,8 +2280,8 @@ async fn builder_update_writes_only_supplied_columns_and_reports_missing_rows() 
     let before = db.now().await?;
     let viewer = Scope::Group(home.alice);
 
-    // Q-TXN-17: Alice labels Bob's transaction. Only the columns she sent
-    // change; the row stays Bob's; `updated` moves to now.
+    // Alice labels Bob's transaction. Only the columns she sent change; the
+    // row stays Bob's; `updated` moves to now.
     let outcome = update(&db, "transactions", "t-bob", data! {"label_memo": "dinner", "label_category_confidence": 1}, viewer, vec![]).await?;
     assert_eq!(update_status(&outcome), 200);
     let returned = outcome.expect("a statement was sent");
@@ -2314,9 +2318,10 @@ async fn builder_update_writes_only_supplied_columns_and_reports_missing_rows() 
     let row = stored(&db, "transactions", "t-alice").await?;
     assert_eq!((row.get::<Json>("raw")?, row.get::<String>("label_memo")?), (json!({"id": "t-alice"}), "kept".to_string()));
 
-    // Q-ITM-6 within the group, Q-ITM-7 with no owner at all (the sync job).
+    // An item is updated within the group, or by the sync job with no
+    // owner at all.
     upsert(&db, "items", data! {"item_id": "item-1", "user_id": home.bob, "status": "OK", "cursor": "c-1"}, None, None).await?;
-    assert_eq!(update_status(&update(&db, "items", "item-1", data! {"status": "BAD", "status_reason": "ITEM_LOGIN_REQUIRED"}, viewer, vec![]).await?), 200);
+    assert_eq!(update_status(&update(&db, "items", "item-1", data! {"status": "BAD", "status_reason": "LOGIN_REQUIRED"}, viewer, vec![]).await?), 200);
     assert_eq!(update_status(&update(&db, "items", "item-1", data! {"status": "OK"}, Scope::Group(home.carol), vec![]).await?), 304);
     assert_eq!(
         update_status(
@@ -2338,7 +2343,7 @@ async fn builder_update_writes_only_supplied_columns_and_reports_missing_rows() 
         ("BAD".to_string(), "c-1".to_string(), ts("2026-03-05T10:00:00Z"))
     );
 
-    // Q-BSC-6, Q-CHT-3: any subset of the columns, JSON and dates included.
+    // Any subset of the columns, JSON and dates included.
     let budget: Uuid = insert(&db, "budgets", data! {"user_id": home.alice, "name": "Home"}, &[], false).await?.one()?.get("budget_id")?;
     update(
         &db,
@@ -2358,8 +2363,7 @@ async fn builder_update_writes_only_supplied_columns_and_reports_missing_rows() 
     Ok(())
 }
 
-/// The columns a conflicting item write may rewrite (Q-ITM-5): never the
-/// owner.
+/// The columns a conflicting item write may rewrite: never the owner.
 const ITEM_COLUMNS: &[&str] = &[
     "access_token",
     "institution_id",
@@ -2374,12 +2378,12 @@ const ITEM_COLUMNS: &[&str] = &[
     "raw",
 ];
 
-/// The same for a holding (Q-HLD-3): never the owner or the account.
+/// The same for a holding: never the owner or the account.
 const HOLDING_COLUMNS: &[&str] =
     &["security_id", "institution_price", "institution_price_as_of", "institution_value", "cost_basis", "quantity", "iso_currency_code", "raw"];
 
-// R-W4, R-W1, R-T7: budget G7 (Q-USR-5, Q-SEC-4, Q-ACC-6, Q-TXN-15, Q-INV-7; with an allowlist Q-ITM-5, Q-HLD-3),
-// §4.9 (upserts carry no owner predicate; the allowlist is the protection).
+// R-W4, R-W1, R-T7: the builder's upsert, with and without an allowlist. Upserts carry no owner predicate; the
+// allowlist is the protection.
 #[tokio::test(flavor = "multi_thread")]
 async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2387,7 +2391,7 @@ async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> Db
     let home = household(&db).await?;
     let long_ago = ts("2001-01-01T00:00:00Z");
 
-    // Q-TXN-15: the first sync inserts and gets the whole row back.
+    // The first sync inserts and gets the whole row back.
     let pending = upsert(
         &db,
         "transactions",
@@ -2400,7 +2404,7 @@ async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> Db
     )
     .await?;
     assert_eq!((pending.affected(), pending.columns().len()), (1, all_columns("transactions").len()));
-    assert_eq!(pending.one()?.get::<String>("source")?, "plaid");
+    assert_eq!(pending.one()?.get::<String>("source")?, "bank");
     // The user labels it; then the provider reports it again, settled.
     update(
         &db,
@@ -2447,8 +2451,8 @@ async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> Db
     upsert(&db, "transactions", data! {"user_id": home.bob, "transaction_id": "p-1", "account_id": "acc-9", "date": "2026-03-06"}, None, None).await?;
     assert_eq!(stored(&db, "transactions", "p-1").await?.get::<Uuid>("user_id")?, home.bob);
 
-    // Q-USR-5: the seeded users. Without an id the row is always new, so
-    // the caller looks the name up first and upserts with the id it found.
+    // The seeded users. Without an id the row is always new, so the caller
+    // looks the name up first and upserts with the id it found.
     let admin: Uuid = upsert(&db, "users", data! {"username": "admin", "password": "hash-1"}, None, None).await?.one()?.get("user_id")?;
     let again = upsert(&db, "users", data! {"user_id": admin, "username": "admin", "password": "hash-2"}, None, None).await?.one()?;
     assert_eq!((again.get::<Uuid>("user_id")?, again.get::<String>("password")?), (admin, "hash-2".to_string()));
@@ -2456,15 +2460,15 @@ async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> Db
     assert!(unseen.violates("users_username_key"));
     assert_eq!(stored(&db, "users", admin).await?.get::<String>("password")?, "hash-2");
 
-    // Q-ITM-5: an item write on a taken id may rewrite the allowlisted
-    // columns it supplies, and nothing else. The owner is not one of them.
+    // An item write on a taken id may rewrite the allowlisted columns it
+    // supplies, and nothing else. The owner is not one of them.
     let products = vec!["transactions", "investments"];
     upsert(
         &db,
         "items",
         data! {
             "item_id": "item-1", "user_id": home.alice, "access_token": "access-1", "institution_id": "ins-1", "available_products": products.clone(),
-            "status": "OK", "provider": "plaid",
+            "status": "OK", "provider": "bank",
         },
         Some(ITEM_COLUMNS),
         None,
@@ -2479,10 +2483,10 @@ async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> Db
     );
     assert_eq!(
         (taken.get::<Vec<String>>("available_products")?, taken.get::<String>("provider")?),
-        (vec!["transactions".to_string(), "investments".to_string()], "plaid".to_string())
+        (vec!["transactions".to_string(), "investments".to_string()], "bank".to_string())
     );
-    // The Plaid sync advances the cursor with a write of just that; `raw`
-    // is on the list, so the partial object replaces the payload.
+    // The bank sync advances the cursor with a write of just that; `raw` is
+    // on the list, so the partial object replaces the payload.
     let advanced = upsert(
         &db,
         "items",
@@ -2497,7 +2501,7 @@ async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> Db
         ("cursor-2".to_string(), "access-2".to_string(), json!({"item_id": "item-1", "cursor": "cursor-2"}))
     );
 
-    // Q-HLD-3: neither the owner nor the account of a holding moves.
+    // Neither the owner nor the account of a holding moves.
     upsert(
         &db,
         "holdings",
@@ -2531,7 +2535,7 @@ async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> Db
         upsert(&db, "holdings", data! {"user_id": home.carol, "holding_id": "h-2", "account_id": "acc-x", "security_id": "sec-1"}, Some(&[]), None).await?;
     assert_eq!(fresh_key.one()?.get::<Uuid>("user_id")?, home.carol);
 
-    // Q-SEC-4: a global table; every supplied column, once per security.
+    // A global table: every supplied column, once per security.
     upsert(
         &db,
         "securities",
@@ -2553,7 +2557,8 @@ async fn builder_upsert_rewrites_supplied_columns_and_leaves_absent_ones() -> Db
     Ok(())
 }
 
-// R-W2, R-W4, R-W5, R-Q4: budget G8 (Q-INS-1, Q-CPI-2, Q-INV-8, Q-SHR-14), Q-CPI-1, Q-INV-1, Q-INV-5.
+// R-W2, R-W4, R-W5, R-Q4: the builder's multi-row upsert: rows de-duplicated by key and grouped by the columns they
+// supply; with an empty allowlist it only ever inserts.
 #[tokio::test(flavor = "multi_thread")]
 async fn builder_upsert_many_dedupes_rows_and_groups_them_by_columns() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2561,9 +2566,9 @@ async fn builder_upsert_many_dedupes_rows_and_groups_them_by_columns() -> DbResu
     let home = household(&db).await?;
     let long_ago = ts("2001-01-01T00:00:00Z");
 
-    // Q-INS-1: one multi-row statement. A key given twice is written
-    // once, with the last row's values; the returned rows tell the caller
-    // which inputs were stored.
+    // One multi-row statement. A key given twice is written once, with the
+    // last row's values; the returned rows tell the caller which inputs
+    // were stored.
     let returned = upsert_many(
         &db,
         "institutions",
@@ -2595,8 +2600,8 @@ async fn builder_upsert_many_dedupes_rows_and_groups_them_by_columns() -> DbResu
     assert_eq!(column::<Json>(&all, "raw"), [json!({"n": 3}), json!({"n": 2}), json!({"n": 4})]);
     assert!(upsert_many(&db, "institutions", Vec::new(), None).await?.is_empty());
 
-    // Q-CPI-2: the monthly index values. `updated` moves on every upsert,
-    // changed or not: the refresh job's 22-hour gate reads it.
+    // The monthly index values. `updated` moves on every upsert, changed or
+    // not: the refresh job reads it to tell how long ago it last ran.
     let months = |values: [f64; 3]| {
         ["2026-03", "2026-01", "2026-02"]
             .iter()
@@ -2622,14 +2627,14 @@ async fn builder_upsert_many_dedupes_rows_and_groups_them_by_columns() -> DbResu
     }
     let again = upsert_many(&db, "cpi_snapshots", months([327.4, 325.252, 326.0]), None).await?;
     assert!(again.iter().all(|row| row.get::<Timestamp>("updated").unwrap() > long_ago));
-    // Q-CPI-1: a whole series, oldest first, straight off its index.
+    // A whole series, oldest first, straight off its index.
     let series = db.query(Query::table("cpi_snapshots").index("idx_cpi_snapshots_series_id_snapshot_date", KeyRange::eq(["CUUR0000SA0"]))).await?;
     assert_eq!(column::<Date>(&series, "snapshot_date").iter().map(Date::to_string).collect::<Vec<_>>(), ["2026-01-01", "2026-02-01", "2026-03-01"]);
     assert_eq!(column::<Decimal>(&series, "index_value"), [dec("325.252"), dec("326"), dec("327.4")]);
 
-    // Q-INV-8: a plan statement imported again never overwrites. A row
-    // whose id exists, even under another owner, is skipped in silence,
-    // and only the rows actually inserted come back.
+    // A plan statement imported again never overwrites. A row whose id
+    // exists, even under another owner, is skipped in silence, and only the
+    // rows actually inserted come back.
     let trade = |id: &'static str, owner: Uuid, amount: f64| {
         data! {
             "user_id": owner, "investment_transaction_id": id, "account_id": "acc-401k", "date": "2026-03-05", "amount": amount, "source": "plan",
@@ -2649,7 +2654,7 @@ async fn builder_upsert_many_dedupes_rows_and_groups_them_by_columns() -> DbResu
     assert_eq!(imported.iter().map(|row| row.get("investment_transaction_id")).collect::<DbResult<Vec<String>>>()?, ["plan-3"]);
     let kept = stored(&db, "investment_transactions", "plan-2").await?;
     assert_eq!((kept.get::<Uuid>("user_id")?, kept.get::<Decimal>("amount")?), (home.carol, dec("20")));
-    // Q-INV-5: which of the ids an owner already has, deleted or not.
+    // Which of the ids an owner already has, deleted or not.
     soft_delete(&db, "investment_transactions", "plan-1", Scope::Owner(home.alice)).await?;
     let present = db
         .query(find(
@@ -2658,7 +2663,7 @@ async fn builder_upsert_many_dedupes_rows_and_groups_them_by_columns() -> DbResu
         ))
         .await?;
     assert_eq!(texts_of(&present, "investment_transaction_id"), ["plan-1", "plan-3"]);
-    // Q-INV-1: one of them by id, if it is live and the group's.
+    // One of them by id, if it is live and the group's.
     let one = |id: &'static str, viewer: Uuid| {
         let db = &db;
         async move { find_one(db, Query::table("investment_transactions").key([id]), &Filters::new(Scope::Group(viewer))).await }
@@ -2666,7 +2671,7 @@ async fn builder_upsert_many_dedupes_rows_and_groups_them_by_columns() -> DbResu
     assert_eq!(one("plan-3", home.bob).await?.expect("a group member's row").get::<Decimal>("amount")?, dec("30"));
     assert!(one("plan-3", home.carol).await?.is_none() && one("plan-1", home.bob).await?.is_none());
 
-    // Q-SHR-14: both users join a group unless they are in one already.
+    // Both users join a group unless they are in one already.
     let dave = user(&db, "dave").await?;
     let other_group = uuid(0x6008);
     let joined = upsert_many(
@@ -2681,8 +2686,8 @@ async fn builder_upsert_many_dedupes_rows_and_groups_them_by_columns() -> DbResu
     Ok(())
 }
 
-// R-W6, R-W10, R-Q10, R-Q8: budget G9, G10, G11, G12 (Q-USR-8, Q-BSC-9, Q-CHT-4, Q-SNP-14, Q-ITM-8, Q-ACC-9,
-// Q-HLD-4, Q-HLD-5, Q-TXN-20, Q-TXN-21, Q-INV-11, Q-INV-12, Q-SPL-4, Q-SPL-5, Q-PAR-7, Q-PAR-8, Q-SNP-15, Q-SNP-16).
+// R-W6, R-W10, R-Q10, R-Q8: the builder's soft deletes: of one row, of some keys, by a column, and by a column of a
+// related table.
 #[tokio::test(flavor = "multi_thread")]
 async fn builder_soft_deletes_keep_tombstones_and_report_counts() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2711,7 +2716,7 @@ async fn builder_soft_deletes_keep_tombstones_and_report_counts() -> DbResult<()
         }
     };
 
-    // G9 (Q-CHT-4): one row, within the group; the answer is a boolean.
+    // One row, within the group; the answer is a boolean.
     let chart: Uuid = insert(&db, "charts", data! {"user_id": home.alice, "name": "Worth"}, &[], false).await?.one()?.get("chart_id")?;
     assert!(!soft_delete(&db, "charts", chart, Scope::Group(home.carol)).await?);
     assert!(!soft_delete(&db, "charts", uuid(404), Scope::Group(home.alice)).await?);
@@ -2725,10 +2730,10 @@ async fn builder_soft_deletes_keep_tombstones_and_report_counts() -> DbResult<()
     backdate(&db, "charts", chart, long_ago).await?;
     assert!(soft_delete(&db, "charts", chart, Scope::Group(home.alice)).await?);
     assert!(stored(&db, "charts", chart).await?.get::<Timestamp>("updated")? > long_ago);
-    // Q-USR-8 has no scope at all.
+    // A user is deleted with no scope at all.
     assert!(soft_delete(&db, "users", user(&db, "dave").await?, Scope::Everyone).await?);
 
-    // G10 (Q-TXN-20): the count of the keys that were the group's.
+    // By keys: the count of the ones that were the group's.
     let asked: Vec<Value> = ["t-a1", "t-b1", "t-c1", "t-zz"].map(Value::from).to_vec();
     assert_eq!(bulk_soft_delete(&db, "transactions", asked, Scope::Group(home.alice)).await?, 2);
     assert_eq!(flags(&["t-a1", "t-b1", "t-c1"]).await?, [Some(true), Some(true), Some(false)]);
@@ -2736,11 +2741,11 @@ async fn builder_soft_deletes_keep_tombstones_and_report_counts() -> DbResult<()
     assert!(stored(&db, "transactions", "t-a1").await?.get::<Timestamp>("updated")? > long_ago);
     assert_eq!(stored(&db, "transactions", "t-c1").await?.get::<Timestamp>("updated")?, long_ago);
 
-    // G11 (Q-TXN-21) with one value: every row of the account, the ones
+    // By a column, with one value: every row of the account, the ones
     // already deleted counted again.
     assert_eq!(bulk_soft_delete_by_column(&db, "transactions", "account_id", "acc-a", Scope::Group(home.bob)).await?, 2);
     assert_eq!(flags(&["t-a1", "t-a2", "t-a3"]).await?, [Some(true), Some(true), Some(false)]);
-    // With a list (Q-HLD-5, the item cascade): any of the accounts. The
+    // With a list, as the item cascade has it: any of the accounts. The
     // scope still holds, so Carol's account in the list changes nothing.
     assert_eq!(bulk_soft_delete_by_column(&db, "transactions", "account_id", vec!["acc-a2", "acc-b", "acc-c"], Scope::Group(home.alice)).await?, 3);
     assert_eq!(flags(&["t-a3", "t-b1", "t-b2", "t-c1", "t-c2"]).await?, [Some(true), Some(true), Some(true), Some(false), Some(false)]);
@@ -2748,9 +2753,10 @@ async fn builder_soft_deletes_keep_tombstones_and_report_counts() -> DbResult<()
     assert_eq!(bulk_soft_delete_by_column(&db, "transactions", "account_id", Vec::<String>::new(), Scope::Group(home.carol)).await?, 0);
     assert_eq!(flags(&["t-c1", "t-c2"]).await?, [Some(false), Some(false)]);
 
-    // G11 on the pair table, once per side (Q-PAR-7), then G12 (Q-PAR-8):
-    // pairs whose transaction sits on one of some accounts. The subquery
-    // has no `LIVE`: it runs right after those transactions were deleted.
+    // By a column on the pair table, once per side; then by a column of a
+    // related table: pairs whose transaction sits on one of some accounts.
+    // The subquery has no `LIVE`: it runs right after those transactions
+    // were deleted.
     for (n, a, b, owner) in [
         (1, "t-a1", "t-b1", home.alice),
         (2, "t-a2", "t-a3", home.alice),
@@ -2803,7 +2809,8 @@ async fn builder_soft_deletes_keep_tombstones_and_report_counts() -> DbResult<()
     Ok(())
 }
 
-// R-Q1, R-S3, R-T9, R-W7, R-X3: budget Q-USR-1, Q-USR-2, Q-USR-4, Q-USR-6, Q-USR-8 (§1.1; §3.6 compare-and-swap).
+// R-Q1, R-S3, R-T9, R-W7, R-X3: users are found by id, name and subject, linked to an identity by compare-and-swap,
+// listed and soft-deleted.
 #[tokio::test(flavor = "multi_thread")]
 async fn users_are_found_by_key_name_and_subject_and_linked_to_an_identity_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2815,21 +2822,20 @@ async fn users_are_found_by_key_name_and_subject_and_linked_to_an_identity_once(
     let by_name = |name: &str| Query::table("users").index("users_username_key", KeyRange::eq([name]));
     let by_subject = |subject: &str| Query::table("users").index("users_auth_sub_key", KeyRange::eq([subject]));
 
-    // Q-USR-1: by id, by name, or by both. Names are case-sensitive.
+    // By id, by name, or by both. Names are case-sensitive.
     assert_eq!(find_one(&db, by_name("ann"), &everyone).await?.expect("ann").get::<Uuid>("user_id")?, ann);
     assert!(find_one(&db, by_name("Ann"), &everyone).await?.is_none());
     assert!(find_one(&db, Query::table("users").key([ann]), &everyone.clone().eq("username", "ann")).await?.is_some());
     assert!(find_one(&db, Query::table("users").key([ann]), &everyone.clone().eq("username", "bob")).await?.is_none());
 
-    // Q-USR-6: an account is linked to an identity only while it has
-    // none. The row comes back to the sign-in that linked it and to no
-    // other.
+    // An account is linked to an identity only while it has none. The row
+    // comes back to the sign-in that linked it and to no other.
     let link = |user: Uuid, subject: &'static str| update(&db, "users", user, data! {"auth_sub": subject}, Scope::Everyone, vec![col("auth_sub").is_null()]);
     let linked = link(ann, "sub-ann").await?.expect("a statement");
     assert_eq!(linked.one()?.get::<Uuid>("user_id")?, ann);
     assert_eq!(update_status(&link(ann, "sub-other").await?), 304);
     assert_eq!(stored(&db, "users", ann).await?.get::<String>("auth_sub")?, "sub-ann");
-    // Q-USR-2: every SSO sign-in finds its user by the subject.
+    // Every single-sign-on sign-in finds its user by the subject.
     assert_eq!(find_one(&db, by_subject("sub-ann"), &everyone).await?.expect("linked").get::<String>("username")?, "ann");
     assert!(find_one(&db, by_subject("sub-other"), &everyone).await?.is_none());
 
@@ -2847,8 +2853,8 @@ async fn users_are_found_by_key_name_and_subject_and_linked_to_an_identity_once(
     assert!(stored(&db, "users", cat).await?.is_null("auth_sub")?);
     user(&db, "dan").await?;
 
-    // Q-USR-4: every live user, for the hourly jobs. Q-USR-8 hides one,
-    // which still holds its name.
+    // Every live user, for the hourly jobs. A soft delete hides one, which
+    // still holds its name.
     assert!(soft_delete(&db, "users", cat, Scope::Everyone).await?);
     let live_users = db.query(find(Query::table("users"), &everyone)).await?;
     let mut names = texts_of(&live_users, "username");
@@ -2860,8 +2866,8 @@ async fn users_are_found_by_key_name_and_subject_and_linked_to_an_identity_once(
     Ok(())
 }
 
-// R-W4, R-W7, R-W10, R-Q1, R-T9: budget Q-SES-1, Q-SES-2, Q-SES-3, Q-SES-4, Q-SES-5, Q-SES-6, Q-SES-7
-// (G3, G6, G7, G13, G15, G16) and G14.
+// R-W4, R-W7, R-W10, R-Q1, R-T9: a session through the builder: its upsert, read and update, and the hard deletes
+// by key, by keys, by a column and by a condition.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_are_upserted_refreshed_without_resurrection_and_hard_deleted() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2870,8 +2876,8 @@ async fn sessions_are_upserted_refreshed_without_resurrection_and_hard_deleted()
     let long_ago = ts("2001-01-01T00:00:00Z");
     let week = 604_800_000_i64;
 
-    // Q-SES-2: the first write of a single-sign-on session names every
-    // column, the `auth_*` ones too.
+    // The first write of a single-sign-on session names every column, the
+    // `auth_*` ones too.
     let created = upsert(
         &db,
         "sessions",
@@ -2912,7 +2918,7 @@ async fn sessions_are_upserted_refreshed_without_resurrection_and_hard_deleted()
     assert!(written.get::<Timestamp>("updated")? > long_ago);
     // A column named with null is cleared.
     upsert(&db, "sessions", data! {"session_id": "s-sso", "auth_refresh_token": Value::Null}, None, None).await?;
-    // Q-SES-1: read on every request that carries the cookie.
+    // The session is read on every request that carries the cookie.
     let read = find_one(&db, Query::table("sessions").key(["s-sso"]), &Filters::new(Scope::Everyone)).await?.expect("the session");
     assert!(read.is_null("auth_refresh_token")? && read.is_null("cookie_domain")?);
     assert_eq!(
@@ -2920,7 +2926,7 @@ async fn sessions_are_upserted_refreshed_without_resurrection_and_hard_deleted()
         ("sid-1".to_string(), ann, (week - 5_000) as f64)
     );
 
-    // Q-SES-4: the re-check result, and whether the row was still there.
+    // The re-check stores its result and learns whether the row was there.
     let rechecked = update(
         &db,
         "sessions",
@@ -2932,21 +2938,21 @@ async fn sessions_are_upserted_refreshed_without_resurrection_and_hard_deleted()
     .await?;
     assert_eq!(update_status(&rechecked), 200);
 
-    // Q-SES-5: sign-out deletes the row for good; again finds nothing.
+    // Sign-out deletes the row for good; again finds nothing.
     assert!(hard_delete(&db, "sessions", "s-sso").await?);
     assert!(!hard_delete(&db, "sessions", "s-sso").await?);
     assert!(db.get("sessions", ["s-sso"]).await?.is_none());
-    // Q-SES-3: a refresh at the end of a request that began before the
-    // deletion is an update, so the session stays deleted. The upsert of
-    // Q-SES-2 would have brought it back.
+    // A refresh at the end of a request that began before the deletion is
+    // an update, so the session stays deleted. The upsert that first wrote
+    // it would have brought it back.
     let refreshed =
         update(&db, "sessions", "s-sso", data! {"user_user_id": ann, "user_username": "ann", "cookie_max_age": week}, Scope::Everyone, vec![]).await?;
     assert_eq!(update_status(&refreshed), 304);
     assert!(db.get("sessions", ["s-sso"]).await?.is_none());
 
-    // Q-SES-6: an identity-provider event ends sessions by its session
-    // id, or all of a user's. Password sessions have no such id, and a
-    // missing one in the event must not match them.
+    // An identity-provider event ends sessions by its session id, or all of
+    // a user's. Password sessions have no such id, and a missing one in the
+    // event must not match them.
     let bob = user(&db, "bob").await?;
     for (id, owner, sid, expires) in [
         ("s-1", ann, Some("sid-a"), Some("2026-03-01T00:00:00Z")),
@@ -2964,19 +2970,20 @@ async fn sessions_are_upserted_refreshed_without_resurrection_and_hard_deleted()
     assert_eq!(hard_delete_by_column(&db, "sessions", "auth_sid", "sid-a").await?, 0);
     assert_eq!(texts_of(&db.query(Query::table("sessions").index("idx_sessions_user_user_id", KeyRange::eq([ann]))).await?, "session_id"), ["s-3"]);
 
-    // Q-SES-7: the hourly purge, up to and including the app's clock. A
-    // session with no expiry is not "expired".
+    // The hourly purge, up to and including the caller's clock. A session
+    // with no expiry is not "expired".
     assert_eq!(delete_by_condition(&db, "sessions", "cookie_expires", CmpOp::Le, "2026-03-05T00:00:00Z").await?, 2);
     assert_eq!(texts_of(&db.query(Query::table("sessions")).await?, "session_id"), ["s-4", "s-5"]);
     assert_eq!(hard_delete_by_column(&db, "sessions", "user_user_id", bob).await?, 2);
-    // G14: several keys at once; the count is of the rows that existed.
+    // Several keys at once; the count is of the rows that existed.
     upsert(&db, "sessions", data! {"session_id": "s-7"}, None, None).await?;
     assert_eq!(bulk_hard_delete(&db, "sessions", vec!["s-7".into(), "s-8".into()]).await?, 1);
     assert!(db.query(Query::table("sessions")).await?.is_empty());
     Ok(())
 }
 
-// R-W1, R-W7, R-Q1, R-Q4, R-T7, R-S3: budget Q-KEY-1, Q-KEY-2, Q-KEY-3, Q-KEY-4, Q-KEY-5.
+// R-W1, R-W7, R-Q1, R-Q4, R-T7, R-S3: API keys are created, listed newest first, found by their hash, stamped when
+// used and revoked once.
 #[tokio::test(flavor = "multi_thread")]
 async fn api_keys_are_listed_newest_first_and_revoked_once() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -2984,7 +2991,7 @@ async fn api_keys_are_listed_newest_first_and_revoked_once() -> DbResult<()> {
     let (ann, bob) = (user(&db, "ann").await?, user(&db, "bob").await?);
     let hash = |seed: &str| seed.repeat(64);
 
-    // Q-KEY-1: the id is the server's; `scopes` is a list of text.
+    // The id is the server's; `scopes` is a list of text.
     let mut keys = Vec::new();
     for (name, seed, owner, created) in [
         ("laptop", "a", ann, "2026-03-01T08:00:00Z"),
@@ -2993,7 +3000,7 @@ async fn api_keys_are_listed_newest_first_and_revoked_once() -> DbResult<()> {
         ("bobs", "d", bob, "2026-03-04T08:00:00Z"),
     ] {
         let row = data! {
-            "user_id": owner, "name": name, "key_hash": hash(seed), "key_prefix": format!("bk_{seed}"),
+            "user_id": owner, "name": name, "key_hash": hash(seed), "key_prefix": format!("key_{seed}"),
             "scopes": vec!["transactions:read", "accounts:read"], "expires_at": Value::Null, "created_at": created,
         };
         keys.push(insert(&db, "api_keys", row, &["key_id"], false).await?.one()?.get::<Uuid>("key_id")?);
@@ -3001,11 +3008,11 @@ async fn api_keys_are_listed_newest_first_and_revoked_once() -> DbResult<()> {
     let (laptop, phone) = (keys[0], keys[1]);
     assert_eq!(stored(&db, "api_keys", laptop).await?.get::<Vec<String>>("scopes")?, ["transactions:read", "accounts:read"]);
     // The hash is unique: the same key cannot be stored twice.
-    let twice = insert(&db, "api_keys", data! {"user_id": bob, "name": "copy", "key_hash": hash("a"), "key_prefix": "bk_a"}, &[], false).await.unwrap_err();
+    let twice = insert(&db, "api_keys", data! {"user_id": bob, "name": "copy", "key_hash": hash("a"), "key_prefix": "key_a"}, &[], false).await.unwrap_err();
     assert!(twice.violates("api_keys_key_hash_key"));
 
-    // Q-KEY-2: the caller's own unrevoked keys, newest first, without the
-    // hash. Keys are never shared, so the scope is the owner alone.
+    // The caller's own unrevoked keys, newest first, without the hash. Keys
+    // are never shared, so the scope is the owner alone.
     let shown = ["key_id", "user_id", "name", "key_prefix", "scopes", "created_at", "last_used_at", "revoked_at", "expires_at"];
     let list = |owner: Uuid| {
         Query::table("api_keys").index("idx_api_keys_user_id_created_at", KeyRange::eq([owner])).reverse().filter(col("revoked_at").is_null()).columns(shown)
@@ -3014,17 +3021,17 @@ async fn api_keys_are_listed_newest_first_and_revoked_once() -> DbResult<()> {
     assert_eq!(listed.columns(), shown);
     assert_eq!(texts_of(&listed, "name"), ["phone", "script", "laptop"]);
 
-    // Q-KEY-4: every bearer request looks its key up by the hash.
+    // Every bearer request looks its key up by the hash.
     let by_hash = |seed: &str| Query::table("api_keys").index("api_keys_key_hash_key", KeyRange::eq([hash(seed)]));
     let found = find_one(&db, by_hash("b"), &Filters::new(Scope::Everyone)).await?.expect("the key");
     assert_eq!((found.get::<Uuid>("key_id")?, found.get::<Uuid>("user_id")?), (phone, ann));
     assert!(found.is_null("revoked_at")? && found.is_null("last_used_at")?);
     assert!(find_one(&db, by_hash("z"), &Filters::new(Scope::Everyone)).await?.is_none());
-    // Q-KEY-5: the "last used" stamp, by key alone.
+    // The "last used" stamp, by key alone.
     assert_eq!(update_status(&update(&db, "api_keys", phone, data! {"last_used_at": "2026-03-05T12:00:00Z"}, Scope::Everyone, vec![]).await?), 200);
 
-    // Q-KEY-3: a key is revoked once, by its owner. Anyone else, and a
-    // second revoke, get no row, which the route answers with 404.
+    // A key is revoked once, by its owner. Anyone else, and a second
+    // revoke, get no row, which the caller answers with "not found".
     let revoke = |key: Uuid, owner: Uuid| {
         update(&db, "api_keys", key, data! {"revoked_at": "2026-03-05T13:00:00Z"}, Scope::Owner(owner), vec![col("revoked_at").is_null()])
     };
@@ -3040,8 +3047,8 @@ async fn api_keys_are_listed_newest_first_and_revoked_once() -> DbResult<()> {
     Ok(())
 }
 
-// R-X7, R-Q8, R-X4, R-X1: budget §4.2 (`CURRENT_TIMESTAMP` is the transaction's start; `updated` is the change
-// feed and must move forward on every write).
+// R-X7, R-Q8, R-X4, R-X1: `CURRENT_TIMESTAMP` is the transaction's start; `updated` is the change feed and must
+// move forward on every write.
 #[tokio::test(flavor = "multi_thread")]
 async fn rows_written_in_one_transaction_carry_its_start_time() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3089,9 +3096,9 @@ async fn rows_written_in_one_transaction_carry_its_start_time() -> DbResult<()> 
     Ok(())
 }
 
-/// Q-SHR-5, `get_row_owner`: who owns a row the viewer may act on, so a
-/// new child row takes its parent's owner and not the requester's. One
-/// function for every table, by name and key.
+/// Who owns a row the viewer may act on, so a new child row takes its
+/// parent's owner and not the requester's. One function for every table, by
+/// name and key.
 async fn row_owner(db: &impl Db, table: &str, id: impl Into<Value>, viewer: Uuid) -> DbResult<Option<(Uuid, String)>> {
     let mut rows = Query::table(table).alias("r").key([id.into()]).filter(col("r.user_id").in_list(sharing_user_ids(viewer)));
     if soft_deletes(table) {
@@ -3105,9 +3112,8 @@ async fn row_owner(db: &impl Db, table: &str, id: impl Into<Value>, viewer: Uuid
     owner.map(|row| Ok((row.get("user_id")?, row.get("username")?))).transpose()
 }
 
-// R-Q10, R-Q9, R-T7, R-X4: budget Q-SHR-1, Q-SHR-5, Q-SHR-17, Q-ITM-1, Q-ITM-4, Q-TXN-1, Q-TXN-8, Q-DDL-3
-// (the SQL function `sharing_user_ids`, here a Rust function that returns an expression); §4.9 (membership is
-// resolved per statement; rows keep their owner), hardest thing 5.
+// R-Q10, R-Q9, R-T7, R-X4: the sharing scope (in SQL a function `sharing_user_ids`, here a Rust function that
+// returns an expression): membership is resolved per statement, and rows keep their owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sharing_scope_is_the_viewer_and_their_group_read_afresh_by_every_statement() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3131,12 +3137,12 @@ async fn the_sharing_scope_is_the_viewer_and_their_group_read_afresh_by_every_st
     assert_eq!(as_list(home.bob).await?, [home.alice, home.bob]);
     assert_eq!(as_list(home.carol).await?, [home.carol]);
     assert_eq!(sorted(as_list(erin).await?), sorted(vec![erin, frank]));
-    // Q-SHR-1: the same as rows, after every mutation, to fan events out.
+    // The same as rows, read after every mutation to fan events out.
     assert_eq!(sorted(sharing_group(&db, home.alice).await?), sorted(vec![home.alice, home.bob]));
     assert_eq!(sharing_group(&db, home.carol).await?, [home.carol]);
 
     for (owner, name) in [(home.alice, "alice"), (home.bob, "bob"), (home.carol, "carol")] {
-        upsert(&db, "items", data! {"item_id": format!("item-{name}"), "user_id": owner, "provider": "plaid"}, None, None).await?;
+        upsert(&db, "items", data! {"item_id": format!("item-{name}"), "user_id": owner, "provider": "bank"}, None, None).await?;
         insert(
             &db,
             "accounts",
@@ -3158,12 +3164,12 @@ async fn the_sharing_scope_is_the_viewer_and_their_group_read_afresh_by_every_st
     .await?;
     let viewer = Filters::new(Scope::Group(home.alice));
 
-    // Q-ITM-1, Q-TXN-1: one row by key, if it is the group's.
+    // One row by key, if it is the group's.
     assert_eq!(find_one(&db, Query::table("items").key(["item-bob"]), &viewer).await?.expect("the group's item").get::<Uuid>("user_id")?, home.bob);
     assert!(find_one(&db, Query::table("items").key(["item-carol"]), &viewer).await?.is_none());
     assert!(find_one(&db, Query::table("transactions").key(["t-bob"]), &viewer).await?.is_some());
     assert!(find_one(&db, Query::table("transactions").key(["t-bob"]), &Filters::new(Scope::Group(home.carol))).await?.is_none());
-    // Q-TXN-8: three columns of it, before every `POST /transaction`.
+    // Three columns of it, read before every edit of a transaction.
     let label = db
         .query_opt(
             find(Query::table("transactions").key(["t-bob"]), &viewer).columns(["label_category_id", "label_budget_id", "label_category_confidence"]).limit(1),
@@ -3176,7 +3182,7 @@ async fn the_sharing_scope_is_the_viewer_and_their_group_read_afresh_by_every_st
         (uuid(50), uuid(40), 0.8)
     );
 
-    // Q-SHR-5: the owner of a parent row, joined to their name.
+    // The owner of a parent row, joined to their name.
     assert_eq!(row_owner(&db, "accounts", "acc-bob", home.alice).await?, Some((home.bob, "bob".to_string())));
     assert_eq!(row_owner(&db, "items", "item-alice", home.bob).await?, Some((home.alice, "alice".to_string())));
     assert_eq!(row_owner(&db, "transactions", "t-alice", home.alice).await?, Some((home.alice, "alice".to_string())));
@@ -3184,8 +3190,8 @@ async fn the_sharing_scope_is_the_viewer_and_their_group_read_afresh_by_every_st
     assert_eq!(row_owner(&db, "accounts", "acc-nowhere", home.alice).await?, None);
     soft_delete(&db, "accounts", "acc-bob", Scope::Group(home.alice)).await?;
     assert_eq!(row_owner(&db, "accounts", "acc-bob", home.alice).await?, None);
-    // Q-ITM-4: a webhook's item with its owner's name; no scope, since
-    // the provider is the caller.
+    // A webhook's item with its owner's name; no scope, since the provider
+    // is the caller.
     let with_owner = db
         .query_one(
             Query::table("items")
@@ -3200,11 +3206,11 @@ async fn the_sharing_scope_is_the_viewer_and_their_group_read_afresh_by_every_st
     assert_eq!(with_owner.columns().len(), all_columns("items").len() + 1);
     assert_eq!(
         (with_owner.get::<String>("username")?, with_owner.get::<String>("provider")?, with_owner.get::<Uuid>("user_id")?),
-        ("carol".to_string(), "plaid".to_string(), home.carol)
+        ("carol".to_string(), "bank".to_string(), home.carol)
     );
 
-    // Q-SHR-17: Bob leaves. The very next statement of either of them
-    // sees less; no row changed owner on the way in or out.
+    // Bob leaves. The very next statement of either of them sees less; no
+    // row changed owner on the way in or out.
     db.delete(Delete::rows(Query::table("sharing_members").keys([[home.alice], [home.bob]]))).await?;
     assert_eq!(as_list(home.alice).await?, [home.alice]);
     assert!(find_one(&db, Query::table("items").key(["item-bob"]), &viewer).await?.is_none());
@@ -3217,9 +3223,9 @@ async fn the_sharing_scope_is_the_viewer_and_their_group_read_afresh_by_every_st
     Ok(())
 }
 
-/// Q-SHR-2: the members of the viewer's group with their names. The
-/// viewer's group is a scalar subquery; with no group it is NULL, the
-/// comparison is not true for any row, and the list is empty.
+/// The members of the viewer's group with their names. The viewer's group
+/// is a scalar subquery; with no group it is NULL, the comparison is not
+/// true for any row, and the list is empty.
 fn group_members(viewer: Uuid) -> Query {
     let own_group = scalar(Query::table("sharing_members").alias("own").key([viewer]).select("group_id", col("own.group_id")));
     Query::table("sharing_members")
@@ -3231,7 +3237,7 @@ fn group_members(viewer: Uuid) -> Query {
         .order_by(col("u.username"))
 }
 
-/// Q-SHR-3: the invitations a viewer received, or that their group sent.
+/// The invitations a viewer received, or that their group sent.
 fn invitations_for(viewer: Uuid) -> Query {
     Query::table("sharing_invitations")
         .alias("i")
@@ -3258,7 +3264,7 @@ fn concerns_by_email(viewer: Uuid) -> Expr {
     col("e.inviter_user_id").in_list(sharing_user_ids(viewer)).or(col("e.invitee_email").eq(own_email(viewer)).and(col("e.expires_at").gt(now())))
 }
 
-/// Q-SHR-4: those invitations, with whether the viewer's side sent them.
+/// Those invitations, with whether the viewer's side sent them.
 fn email_invitations_for(viewer: Uuid) -> Query {
     Query::table("sharing_email_invitations")
         .alias("e")
@@ -3274,7 +3280,7 @@ fn email_invitations_for(viewer: Uuid) -> Query {
         .order_by(col("e.invitation_id"))
 }
 
-/// The unique pair an email invitation is upserted on (Q-SHR-9).
+/// The unique pair an email invitation is upserted on.
 const EMAIL_PAIR: (&str, &[&str]) = ("sharing_email_invitations_pair_unique", &["inviter_user_id", "invitee_email"]);
 
 async fn invite(db: &impl Db, from: Uuid, to: Uuid) -> DbResult<Uuid> {
@@ -3329,8 +3335,8 @@ async fn invitations(db: &impl Db) -> DbResult<Invitations> {
     })
 }
 
-// R-Q9, R-Q10, R-Q8, R-T2, R-T9: budget Q-SHR-2, Q-SHR-3, Q-SHR-4 (`GET /sharing`, three statements at once),
-// §4.7 (the order of names reaches the API).
+// R-Q9, R-Q10, R-Q8, R-T2, R-T9: what the sharing page reads, three statements at once: the members, the
+// invitations and the invitations by email. The order of names reaches the reader.
 #[tokio::test(flavor = "multi_thread")]
 async fn members_and_invitations_are_listed_for_those_they_concern() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3342,13 +3348,13 @@ async fn members_and_invitations_are_listed_for_those_they_concern() -> DbResult
     let (members, direct, by_email) = tokio::join!(db.query(group_members(alice)), db.query(invitations_for(alice)), db.query(email_invitations_for(alice)));
     let (members, direct, by_email) = (members?, direct?, by_email?);
 
-    // Q-SHR-2. Names sort by their bytes, so a capital comes first.
+    // Names sort by their bytes, so a capital comes first.
     assert_eq!(texts_of(&members, "username"), ["Zed", "alice", "bob"]);
     assert_eq!(column::<Uuid>(&members, "user_id"), [all.zed, alice, bob]);
     assert!(db.query(group_members(carol)).await?.is_empty());
 
-    // Q-SHR-3. Alice was invited by Carol, and her group invited Carol
-    // (twice) and Dave: by invitee's name, then by invitation id.
+    // Alice was invited by Carol, and her group invited Carol (twice) and
+    // Dave: by invitee's name, then by invitation id.
     let mut to_carol = [all.zed_to_carol, all.alice_to_carol];
     to_carol.sort();
     assert_eq!(ids(&direct), [all.carol_to_alice, to_carol[0], to_carol[1], all.bob_to_dave]);
@@ -3361,8 +3367,8 @@ async fn members_and_invitations_are_listed_for_those_they_concern() -> DbResult
     carols.sort();
     assert_eq!(ids(&db.query(invitations_for(carol)).await?), [all.carol_to_alice, carols[0], carols[1], carols[2]]);
 
-    // Q-SHR-4. `sent` is computed per row: true for what the group sent,
-    // false for what was addressed to the viewer.
+    // `sent` is computed per row: true for what the group sent, false for
+    // what was addressed to the viewer.
     assert_eq!(ids(&by_email), [all.dave_to_alices_address, all.alice_to_carols_address, all.bob_to_a_stranger]);
     assert_eq!(texts_of(&by_email, "invitee_email"), ["alice@example.com", "carol@example.com", "stranger@example.com"]);
     assert_eq!(column::<bool>(&by_email, "sent"), [false, true, true]);
@@ -3380,8 +3386,8 @@ async fn members_and_invitations_are_listed_for_those_they_concern() -> DbResult
     Ok(())
 }
 
-// R-W7, R-W10, R-Q10, R-Q3: budget Q-SHR-10, Q-SHR-11 (conditional `DELETE .. RETURNING`, with a subquery in
-// the predicate and in what is returned).
+// R-W7, R-W10, R-Q10, R-Q3: a conditional `DELETE .. RETURNING`, with a subquery in the predicate and in
+// what is returned.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invitation_is_declined_or_withdrawn_only_by_those_it_concerns() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3389,8 +3395,8 @@ async fn an_invitation_is_declined_or_withdrawn_only_by_those_it_concerns() -> D
     let all = invitations(&db).await?;
     let (alice, bob, carol) = (all.home.alice, all.home.bob, all.home.carol);
 
-    // Q-SHR-10: the invitee declines, the inviter's group withdraws. The
-    // returned row is the permission check and the list of whom to tell.
+    // The invitee declines, the inviter's group withdraws. The returned row
+    // is the permission check and the list of whom to tell.
     let answer = |viewer: Uuid, invitation: Uuid| {
         let concerned = col("invitee_user_id").eq(viewer).or(col("inviter_user_id").in_list(sharing_user_ids(viewer)));
         db.delete(Delete::from("sharing_invitations").key([invitation]).filter(concerned).returning(["inviter_user_id", "invitee_user_id"]))
@@ -3405,8 +3411,8 @@ async fn an_invitation_is_declined_or_withdrawn_only_by_those_it_concerns() -> D
     assert_eq!(parties(answer(alice, uuid(404)).await?)?, None);
     assert_eq!(db.query(Query::table("sharing_invitations")).await?.len(), 2);
 
-    // Q-SHR-11: the same for an invitation by email. The invitee is
-    // whoever holds the address now, looked up as the row goes.
+    // The same for an invitation by email. The invitee is whoever holds the
+    // address now, looked up as the row goes.
     let answer_email = |viewer: Uuid, invitation: Uuid| {
         let holder =
             scalar(Query::table("users").alias("u").index("idx_users_lower_email", KeyRange::eq([col("e.invitee_email")])).select("user_id", col("u.user_id")));
@@ -3436,10 +3442,10 @@ async fn an_invitation_is_declined_or_withdrawn_only_by_those_it_concerns() -> D
 /// How many email invitations one user may have out.
 const EMAIL_INVITATION_CAP: usize = 20;
 
-/// T6, `invite_by_email`: read the user's invitations, count them against
-/// the cap, then send or renew. Postgres needed an advisory lock keyed on
-/// the user so that two sends could not both pass the count; a writing
-/// transaction is alone from `begin` to `commit`.
+/// Inviting by email: read the user's invitations, count them against the
+/// cap, then send or renew. Postgres needs an advisory lock keyed on the
+/// user so that two sends cannot both pass the count; a writing transaction
+/// is alone from `begin` to `commit`.
 async fn invite_by_email(db: &Client, inviter: Uuid, email: &str, expires_at: Timestamp) -> DbResult<Option<Row>> {
     let tx = db.begin().await?;
     let sent = tx.query(Query::table("sharing_email_invitations").index(EMAIL_PAIR.0, KeyRange::eq([inviter]))).await?;
@@ -3456,8 +3462,8 @@ async fn invite_by_email(db: &Client, inviter: Uuid, email: &str, expires_at: Ti
     Ok(Some(row))
 }
 
-// R-X2, R-X3, R-W4, R-Q3: budget T6 (Q-SYS-8, Q-SHR-8, Q-SHR-9), Q-USR-3; hardest thing 3 (read, count,
-// write made safe by a lock) and 4 (upsert on a two-column unique key).
+// R-X2, R-X3, R-W4, R-Q3: a read, a count and a write that must not interleave with another's; an upsert on a
+// two-column unique key; a lookup through the index over `lower(email)`.
 #[tokio::test(flavor = "multi_thread")]
 async fn email_invitations_are_renewed_in_place_and_capped_even_when_sends_race() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3466,9 +3472,8 @@ async fn email_invitations_are_renewed_in_place_and_capped_even_when_sends_race(
     let now = db.now().await?;
     let (soon, later) = (now.plus_secs(86_400), now.plus_secs(7 * 86_400));
 
-    // Q-SHR-9: a second send to the same address renews the first. The
-    // row, and its id, stay; the pair is the conflict target and is not
-    // rewritten.
+    // A second send to the same address renews the first. The row, and its
+    // id, stay; the pair is the conflict target and is not rewritten.
     let sent = invite_by_email(&db, home.alice, "dana@example.com", soon).await?.expect("under the cap");
     assert_eq!(sent.columns(), all_columns("sharing_email_invitations"));
     backdate(&db, "sharing_email_invitations", sent.get::<Uuid>("invitation_id")?, ts("2001-01-01T00:00:00Z")).await?;
@@ -3502,9 +3507,9 @@ async fn email_invitations_are_renewed_in_place_and_capped_even_when_sends_race(
         .await?;
     assert_eq!(holder.get::<Uuid>("user_id")?, dana);
 
-    // Q-SHR-8 and the cap. With 18 out, six sends race for the two
-    // places left: each reads the count and then writes, and no two of
-    // them can do so at once.
+    // The cap. With 18 out, six sends race for the two places left:
+    // each reads the count and then writes, and no two of them can do
+    // so at once.
     for i in 1..18 {
         invite_by_email(&db, home.alice, &format!("friend{i:02}@example.com"), soon).await?.expect("under the cap");
     }
@@ -3532,11 +3537,11 @@ async fn email_invitations_are_renewed_in_place_and_capped_even_when_sends_race(
     Ok(())
 }
 
-/// T7, `accept_sharing_invitation`. The invitation is of either kind
-/// (Q-SHR-12, a `UNION ALL` in SQL, two reads here); both users end in
-/// one group; every invitation between members of that group is settled.
-/// Answers the group as the transaction itself sees it, or `None` when
-/// the invitation is not the viewer's to accept.
+/// Accepting a sharing invitation. The invitation is of either kind (a
+/// `UNION ALL` in SQL, two reads here); both users end in one group; every
+/// invitation between members of that group is settled. Answers the group
+/// as the transaction itself sees it, or `None` when the invitation is not
+/// the viewer's to accept.
 async fn accept_invitation(db: &Client, invitation: Uuid, viewer: Uuid, new_group: Uuid) -> DbResult<Option<Vec<Uuid>>> {
     let tx = db.begin().await?;
     let direct = Query::table("sharing_invitations").key([invitation]).filter(col("invitee_user_id").eq(viewer)).columns(["inviter_user_id"]);
@@ -3553,7 +3558,7 @@ async fn accept_invitation(db: &Client, invitation: Uuid, viewer: Uuid, new_grou
         return Ok(None);
     };
 
-    // Q-SHR-13: where the two stand now. A user is in at most one group.
+    // Where the two stand now. A user is in at most one group.
     let memberships = tx.query(Query::table("sharing_members").keys([[inviter], [viewer]])).await?;
     let groups: BTreeSet<Uuid> = column::<Uuid>(&memberships, "group_id").into_iter().collect();
     if groups.len() > 1 {
@@ -3561,17 +3566,17 @@ async fn accept_invitation(db: &Client, invitation: Uuid, viewer: Uuid, new_grou
         return Ok(None);
     }
     let group = groups.first().copied().unwrap_or(new_group);
-    // Q-SHR-14.
+    // Both join it; one who is a member already is left alone.
     upsert_many(&tx, "sharing_members", vec![data! {"user_id": inviter, "group_id": group}, data! {"user_id": viewer, "group_id": group}], Some(&[])).await?;
-    // Q-SHR-15: `DELETE .. USING sharing_members inviter, sharing_members
-    // invitee`: invitations whose two ends are now in the group.
+    // `DELETE .. USING sharing_members inviter, sharing_members invitee`:
+    // invitations whose two ends are now in the group.
     let member = |alias: &str, user: Expr| Query::table("sharing_members").alias(alias).key([user]).filter(col(&format!("{alias}.group_id")).eq(group));
     tx.delete(Delete::rows(
         Query::table("sharing_invitations").alias("i").join(member("inviter", col("i.inviter_user_id"))).join(member("invitee", col("i.invitee_user_id"))),
     ))
     .await?;
-    // Q-SHR-16: the same through the address: the invitee is the user
-    // whose folded email is the invited one.
+    // The same through the address: the invitee is the user whose folded
+    // email is the invited one.
     tx.delete(Delete::rows(
         Query::table("sharing_email_invitations")
             .alias("e")
@@ -3580,14 +3585,14 @@ async fn accept_invitation(db: &Client, invitation: Uuid, viewer: Uuid, new_grou
             .join(member("invitee", col("u.user_id"))),
     ))
     .await?;
-    // Q-SHR-1, inside the transaction: it must see the members just added.
+    // The group as the transaction sees it, with the members just added.
     let members = sharing_group(&tx, viewer).await?;
     tx.commit().await?;
     Ok(Some(members))
 }
 
-// R-W8, R-W10, R-X1, R-X2, R-Q9, R-Q10: budget T7 (Q-SYS-5, Q-SHR-12, Q-SHR-13, Q-SHR-14, Q-SHR-15, Q-SHR-16,
-// Q-SHR-1); hardest thing 5 (`DELETE .. USING` two aliases of the membership table).
+// R-W8, R-W10, R-X1, R-X2, R-Q9, R-Q10: accepting an invitation in one transaction, with a `DELETE .. USING` two
+// aliases of the membership table.
 #[tokio::test(flavor = "multi_thread")]
 async fn accepting_an_invitation_joins_the_group_and_settles_what_is_between_its_members() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3636,9 +3641,9 @@ async fn accepting_an_invitation_joins_the_group_and_settles_what_is_between_its
     Ok(())
 }
 
-/// T8, `remove_sharing_member`: the group is read, the member removed (a
-/// group of two is dissolved), and the transfer pairs that now span the
-/// split are soft-deleted (Q-PAR-11). Answers how many pairs that was.
+/// Removing a member from a sharing group: the group is read, the member
+/// removed (a group of two is dissolved), and the transfer pairs that now
+/// span the split are soft-deleted. Answers how many pairs that was.
 async fn remove_member(db: &Client, viewer: Uuid, leaver: Uuid) -> DbResult<Option<u64>> {
     let tx = db.begin().await?;
     let former = sharing_group(&tx, viewer).await?;
@@ -3662,8 +3667,8 @@ async fn remove_member(db: &Client, viewer: Uuid, leaver: Uuid) -> DbResult<Opti
     Ok(Some(pairs))
 }
 
-// R-W8, R-W10, R-Q9, R-X1: budget T8 (Q-SHR-1, Q-SHR-17, Q-PAR-11); hardest thing 5 (`UPDATE .. FROM` two
-// aliases of `transactions` with `(a.user_id = $2) <> (b.user_id = $2)`).
+// R-W8, R-W10, R-Q9, R-X1: removing a member in one transaction, with an `UPDATE .. FROM` two aliases of
+// `transactions` and `(a.user_id = $2) <> (b.user_id = $2)`.
 #[tokio::test(flavor = "multi_thread")]
 async fn leaving_a_group_soft_deletes_the_pairs_that_span_the_split() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3724,8 +3729,8 @@ async fn leaving_a_group_soft_deletes_the_pairs_that_span_the_split() -> DbResul
     Ok(())
 }
 
-// R-Q4, R-T3, R-Q2, R-Q6, R-T2: budget Q-TXN-2 (warm sync), Q-PAR-1, Q-REC-1, Q-SPL-1 (`updated >= cursor`,
-// tombstones included); §4.2 (the change feed), hardest thing 9.
+// R-Q4, R-T3, R-Q2, R-Q6, R-T2: the change feed as a warm sync reads it: `updated >= cursor`, tombstones included,
+// for transactions, pairs, recurrings and splits.
 #[tokio::test(flavor = "multi_thread")]
 async fn delta_sync_returns_what_changed_since_the_cursor_tombstones_included() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3814,9 +3819,9 @@ async fn delta_sync_returns_what_changed_since_the_cursor_tombstones_included() 
     let after = db.query(changed("transactions", "idx_transactions_user_id_updated", &Timestamp(exact.micros() + 1).to_rfc3339())).await?;
     assert_eq!(sorted(texts_of(&after, "transaction_id")), ["t-a2", "t-a3", "t-a4", "t-b1", "t-b2"]);
 
-    // Q-PAR-1: the pairs feed, in key order. A rejected pair and a
-    // deleted one both come back when tombstones are asked for: the
-    // client evicts them. Uuids order by their bytes.
+    // The pairs feed, in key order. A rejected pair and a deleted one both
+    // come back when tombstones are asked for: the client evicts them.
+    // Uuids order by their bytes.
     assert_eq!(
         db.update(
             Update::table("transaction_pairs")
@@ -3841,7 +3846,7 @@ async fn delta_sync_returns_what_changed_since_the_cursor_tombstones_included() 
     let same_through_the_index = db.query(changed("transaction_pairs", "idx_transaction_pairs_user_id_updated", &cursor).order_by(col("pair_id"))).await?;
     assert_eq!(column::<Uuid>(&same_through_the_index, "pair_id"), [uuid(1), uuid(3)]);
 
-    // Q-REC-1: recurrings of the group, some ids of them, or a delta.
+    // Recurrings of the group, some ids of them, or a delta.
     update(&db, "recurrings", uuid(2), data! {"status": "dismissed"}, Scope::Owner(home.bob), vec![]).await?;
     let group = Filters::new(Scope::Group(home.alice));
     assert_eq!(column::<Uuid>(&db.query(find(Query::table("recurrings"), &group)).await?, "recurring_id"), [uuid(1), uuid(2)]);
@@ -3851,7 +3856,7 @@ async fn delta_sync_returns_what_changed_since_the_cursor_tombstones_included() 
     );
     assert_eq!(column::<Uuid>(&db.query(find(Query::table("recurrings"), &group.clone().since("updated", cursor.as_str()))).await?, "recurring_id"), [uuid(2)]);
 
-    // Q-SPL-1: splits of the group, newest first, by parent or as a delta.
+    // Splits of the group, newest first, by parent or as a delta.
     for (date, parent) in [("2026-03-01", "t-a2"), ("2026-03-09", "t-a2"), ("2026-03-05", "t-b2")] {
         insert(
             &db,
@@ -3873,8 +3878,8 @@ async fn delta_sync_returns_what_changed_since_the_cursor_tombstones_included() 
     Ok(())
 }
 
-// R-Q4, R-Q5, R-T3, R-T4, R-Q6: budget Q-TXN-5, Q-INV-3, Q-INV-4, Q-SNP-4, Q-SNP-5 (§2.0.2: `col >= $n` and
-// `col <= $m`, both inclusive, bound as text, on a `DATE` or a `TIMESTAMPTZ`).
+// R-Q4, R-Q5, R-T3, R-T4, R-Q6: a date range is `col >= $n` and `col <= $m`, both inclusive, bound as text, on a
+// `DATE` or a `TIMESTAMPTZ`.
 #[tokio::test(flavor = "multi_thread")]
 async fn date_ranges_are_inclusive_at_both_ends_on_dates_and_on_timestamps() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -3910,9 +3915,9 @@ async fn date_ranges_are_inclusive_at_both_ends_on_dates_and_on_timestamps() -> 
         ids
     };
 
-    // Q-TXN-5: the stored window of some accounts, newest first, read
-    // through `(account_id, date)`. The bounds are `YYYY-MM-DD` text and
-    // both days belong to the window. The provider sync wants tombstones.
+    // The stored window of some accounts, newest first, read through
+    // `(account_id, date)`. The bounds are `YYYY-MM-DD` text and both days
+    // belong to the window. The provider sync wants tombstones.
     let window = |table: &str, accounts: &[&str], from: Option<&str>, to: Option<&str>| {
         let bound = |day: Option<&str>| day.map_or(Bound::Unbounded, |day| Bound::included([day]));
         let index = format!("idx_{table}_account_id_date");
@@ -3944,9 +3949,9 @@ async fn date_ranges_are_inclusive_at_both_ends_on_dates_and_on_timestamps() -> 
     let built = db.query(find(Query::table("transactions"), &filters.clone().with_tombstones()).order_by(col("date").desc())).await?;
     assert_eq!(dates(&built), dates(&march));
 
-    // Q-INV-3 is the same statement on the other table, sent at the same
-    // time on a second connection. Q-INV-4 pages it by offset, and can
-    // count what the pages are cut from.
+    // The same statement on the other table, sent at the same time on a
+    // second connection. It is also paged by offset, and can count what the
+    // pages are cut from.
     let (transactions, investments) = tokio::join!(
         db.query(window("transactions", &["acc-1", "acc-2"], Some("2026-03-01"), Some("2026-03-31"))),
         db.query(window("investment_transactions", &["acc-1", "acc-2"], Some("2026-03-01"), Some("2026-03-31")))
@@ -3957,8 +3962,8 @@ async fn date_ranges_are_inclusive_at_both_ends_on_dates_and_on_timestamps() -> 
     let last_page = db.query(window("investment_transactions", &["acc-1"], Some("2026-03-01"), None).offset(4).limit(2).with_total()).await?;
     assert_eq!((last_page.len(), last_page.total()), (1, Some(5)));
 
-    // Q-SNP-4: a security's price history, oldest first. `snapshot_date`
-    // is a timestamp, and the bounds are instants to the microsecond.
+    // A security's price history, oldest first. `snapshot_date` is a
+    // timestamp, and the bounds are instants to the microsecond.
     let instants = [
         "2026-02-28T23:59:59.999999Z",
         "2026-03-01T00:00:00Z",
@@ -4018,7 +4023,7 @@ async fn date_ranges_are_inclusive_at_both_ends_on_dates_and_on_timestamps() -> 
     assert_eq!(prices(db.query(history("2026-03-01", "2026-03-31")).await?), [dec("101"), dec("103")]);
     assert_eq!(prices(db.query(history("2026-03-01", "2026-04-01")).await?), [dec("101"), dec("103"), dec("104")]);
 
-    // Q-SNP-5: the group's holding history in time order, through
+    // The group's holding history in time order, through
     // `(user_id, snapshot_date, snapshot_id)`, one range per member.
     let members = sharing_group(&db, home.alice).await?;
     let holding_history = Query::table("snapshots")
@@ -4039,11 +4044,11 @@ async fn date_ranges_are_inclusive_at_both_ends_on_dates_and_on_timestamps() -> 
     Ok(())
 }
 
-/// Q-TXN-7, Q-INV-6: the highest N among a user's rows named `Unknown_N`,
-/// deleted rows included, or 0. Postgres matched `^Unknown_[0-9]+$` and
-/// captured the digits; there are no regular expressions here, so the
-/// prefix is matched with `like` (its underscore escaped) and the rest is
-/// read as an integer where it is one.
+/// The highest N among a user's rows named `Unknown_N`, deleted rows
+/// included, or 0. Postgres would match `^Unknown_[0-9]+$` and capture the
+/// digits; there are no regular expressions here, so the prefix is matched
+/// with `like` (its underscore escaped) and the rest is read as an integer
+/// where it is one.
 fn highest_unknown(table: &str, index: &str, owner: Uuid) -> Query {
     let rest = col("name").substr(9, col("name").length());
     Query::table(table)
@@ -4052,7 +4057,7 @@ fn highest_unknown(table: &str, index: &str, owner: Uuid) -> Query {
         .select("max", greatest([max(rest.try_cast(Type::Int)), val(0)]))
 }
 
-// R-Q7, R-Q11, R-Q15, R-Q16, R-Q22: budget Q-TXN-7, Q-INV-6 (regex match, capture, cast, `MAX`, `COALESCE`).
+// R-Q7, R-Q11, R-Q15, R-Q16, R-Q22: what SQL says with a regex match, a capture, a cast, `MAX` and `COALESCE`.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_next_unknown_name_comes_from_the_highest_suffix_in_use() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4108,7 +4113,7 @@ async fn the_next_unknown_name_comes_from_the_highest_suffix_in_use() -> DbResul
     soft_delete(&db, "transactions", "t-gone", Scope::Owner(home.alice)).await?;
     assert_eq!(db.query_one(unknown(home.alice)).await?.get::<i64>("max")?, 40);
 
-    // Q-INV-6 is the same statement on the other table.
+    // The same statement on the other table.
     insert(
         &db,
         "investment_transactions",
@@ -4146,9 +4151,9 @@ fn pair_naming(transaction: Expr, also: Expr) -> Expr {
     side("idx_transaction_pairs_transaction_id_a").or(side("idx_transaction_pairs_transaction_id_b"))
 }
 
-/// Q-TXN-12: every settled, non-zero transaction of one user on a visible
-/// account that is not half of a confirmed transfer, in id order. The
-/// join to `accounts` has no owner or soft-delete condition, as in SQL.
+/// Every settled, non-zero transaction of one user on a visible account
+/// that is not half of a confirmed transfer, in id order. The join to
+/// `accounts` has no owner or soft-delete condition, on purpose.
 fn recurring_candidates(owner: Uuid) -> Query {
     let confirmed_transfer =
         pair_naming(col("t.transaction_id"), col("tp.user_id").eq(col("t.user_id")).and(live_in("tp")).and(col("tp.status").eq("confirmed")));
@@ -4170,8 +4175,8 @@ fn recurring_candidates(owner: Uuid) -> Query {
         .select("name", col("t.name"))
 }
 
-// R-Q9, R-Q10, R-T9, R-Q22, R-Q6: budget Q-TXN-12, Q-TXN-13 (inner join, `COALESCE`, anti-join with `OR`,
-// `date::text`, `= ANY($2::text[])`).
+// R-Q9, R-Q10, R-T9, R-Q22, R-Q6: an inner join, `COALESCE`, an anti-join with `OR`, `date::text`,
+// `= ANY($2::text[])`.
 #[tokio::test(flavor = "multi_thread")]
 async fn recurring_candidates_skip_hidden_accounts_and_halves_of_confirmed_transfers() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4259,8 +4264,8 @@ async fn recurring_candidates_skip_hidden_accounts_and_halves_of_confirmed_trans
     db.update(Update::table("transaction_pairs").key([uuid(4)]).set("status", "rejected").set("updated", now())).await?;
     assert_eq!(texts_of(&db.query(recurring_candidates(home.bob)).await?, "transaction_id"), ["r-bob"]);
 
-    // Q-TXN-13: the members of confirmed recurrings, by a list of ids;
-    // rows of other users, deleted rows and unknown ids drop out.
+    // The members of confirmed recurrings, by a list of ids; rows of other
+    // users, deleted rows and unknown ids drop out.
     let members = Query::table("transactions")
         .alias("t")
         .keys([["r-13"], ["r-01"], ["r-07"], ["r-bob"], ["r-99"]])
@@ -4273,8 +4278,8 @@ async fn recurring_candidates_skip_hidden_accounts_and_halves_of_confirmed_trans
     Ok(())
 }
 
-// R-Q18, R-T9: budget §4.7 (`pg_trgm.similarity`, on which the suggestion engine's results depend), Q-TXN-11;
-// Q-DDL-1 (there is no extension to create: the function is the server's own).
+// R-Q18, R-T9: `pg_trgm.similarity`, on which the suggestion engine's results depend. There is no extension to
+// create: the function is the server's own.
 #[tokio::test(flavor = "multi_thread")]
 async fn trigram_similarity_gives_the_numbers_pg_trgm_gives() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4337,7 +4342,7 @@ async fn trigram_similarity_gives_the_numbers_pg_trgm_gives() -> DbResult<()> {
 }
 
 /// What the suggestion engine knows about the transaction it wants to
-/// label: the parameters of Q-TXN-11.
+/// label: the parameters of its statement.
 #[derive(Clone)]
 struct Target {
     merchant_name: Option<&'static str>,
@@ -4346,14 +4351,14 @@ struct Target {
     amount_band: (f64, f64),
     channel: Option<&'static str>,
     account_id: &'static str,
-    plaid_category: Option<&'static str>,
+    provider_category: Option<&'static str>,
     /// Days of the month around the target's; may run below 1 or past 31.
     day_band: (i64, i64),
 }
 
-/// Q-TXN-11's `{score}` for a transaction `t`: how much it resembles the
-/// target, as weighted points. The SQL text repeated it three times; here
-/// it is a value, built once per use.
+/// The score of a transaction `t`: how much it resembles the target, as
+/// weighted points. SQL text would repeat it three times; here it is a
+/// value, built once per use.
 fn score(target: &Target) -> Expr {
     let points = |condition: Expr, points: i64| when(condition, points, 0);
     // `SIGN($13) = 0 OR SIGN(t.amount) = SIGN($13)`: money in is never
@@ -4362,19 +4367,19 @@ fn score(target: &Target) -> Expr {
     let alike = |column: &str, text: Option<&str>| {
         val(text).is_not_null().and(col(column).is_not_null()).and(call(Func::Similarity, [col(column), val(text)]).ge(0.5)).and(same_direction())
     };
-    let primary = col("t.raw").json_text(["personal_finance_category", "primary"]);
+    let primary = col("t.raw").json_text(["category_hint", "primary"]);
     points(alike("t.merchant_name", target.merchant_name), 100)
         + points(alike("t.name", target.name), 50)
         + points(col("t.amount").between(target.amount_band.0, target.amount_band.1), 5)
         + points(val(target.channel).is_not_null().and(col("t.payment_channel").eq(target.channel)), 1)
         + points(col("t.account_id").eq(target.account_id), 1)
-        + points(val(target.plaid_category).is_not_null().and(primary.eq(target.plaid_category)).and(same_direction()), 10)
+        + points(val(target.provider_category).is_not_null().and(primary.eq(target.provider_category)).and(same_direction()), 10)
         + points(call(Func::DatePart, [val("day"), col("t.date")]).between(target.day_band.0, target.day_band.1), 1)
 }
 
-/// The CTEs `scored` and `winning`: the owner's confirmed, live history
-/// scored against the target, the rows above the floor summed per
-/// category, and the category with the highest sum.
+/// What SQL would say with two CTEs, `scored` and `winning`: the owner's
+/// confirmed, live history scored against the target, the rows above the
+/// floor summed per category, and the category with the highest sum.
 fn winning_category(owner: Uuid, target: &Target, floor: i64) -> Query {
     Query::table("transactions")
         .alias("t")
@@ -4388,10 +4393,10 @@ fn winning_category(owner: Uuid, target: &Target, floor: i64) -> Query {
         .limit(1)
 }
 
-/// The rest of Q-TXN-11, for the winner: its budget, through two joins
-/// that both carry the sharing scope, and how strongly the same category
-/// was rejected before: the same score summed over the rejections of it,
-/// joined to their transactions.
+/// The rest of the suggestion, for the winner: its budget, through two
+/// joins that both carry the sharing scope, and how strongly the same
+/// category was rejected before: the same score summed over the rejections
+/// of it, joined to their transactions.
 fn winner_details(owner: Uuid, category: Uuid, target: &Target, floor: i64) -> Query {
     let rejected = Query::table("rejected_categories")
         .alias("rc")
@@ -4408,9 +4413,10 @@ fn winner_details(owner: Uuid, category: Uuid, target: &Target, floor: i64) -> Q
         .select("rejected", scalar(rejected))
 }
 
-/// One run of Q-TXN-11. Postgres ran it as one statement over two CTEs;
-/// here it is two reads of one moment: the winner, then what is joined
-/// to it. Answers `(category, budget, accepted, count_matched, rejected)`.
+/// One run of the suggestion. Postgres would run it as one statement
+/// over two CTEs; here it is two reads of one moment: the winner, then
+/// what is joined to it.
+/// Answers `(category, budget, accepted, count_matched, rejected)`.
 async fn suggest(db: &Client, owner: Uuid, target: &Target, floor: i64) -> DbResult<Option<(Uuid, Uuid, i64, i64, i64)>> {
     let target = target.clone();
     db.read(|tx| async move {
@@ -4422,8 +4428,8 @@ async fn suggest(db: &Client, owner: Uuid, target: &Target, floor: i64) -> DbRes
     .await
 }
 
-// R-Q11, R-Q13, R-Q16, R-Q18, R-Q9, R-Q10, R-Q21, R-T5, R-T9: budget Q-TXN-11 (hardest thing 1): a per-row
-// weighted score, filtered, grouped and summed, top group first; then a correlated aggregate over a join.
+// R-Q11, R-Q13, R-Q16, R-Q18, R-Q9, R-Q10, R-Q21, R-T5, R-T9: a per-row weighted score, filtered, grouped and
+// summed, top group first; then a correlated aggregate over a join.
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4447,7 +4453,7 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
         let id: Uuid = insert(&db, "categories", data! {"user_id": owner, "section_id": section, "name": name}, &[], false).await?.one()?.get("category_id")?;
         categories.insert(name, id);
     }
-    let pfc = |primary: &str| Some(json!({"personal_finance_category": {"primary": primary}}));
+    let hint = |primary: &str| Some(json!({"category_hint": {"primary": primary}}));
 
     // (id, owner, merchant, name, amount, channel, account, raw, date, category, confidence)
     type History = (
@@ -4472,14 +4478,14 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
             5.25,
             Some("in store"),
             "acc-1",
-            pfc("FOOD_AND_DRINK"),
+            hint("FOOD_AND_DRINK"),
             "2026-10-12",
             Some("coffee"),
             1.0,
         ),
-        ("h2", home.alice, Some("Starbucks"), Some("Starbucks"), 20.0, Some("online"), "acc-2", pfc("FOOD_AND_DRINK"), "2026-09-25", Some("coffee"), 1.0),
-        ("h3", home.alice, Some("Shell"), Some("SHELL OIL"), 5.5, Some("in store"), "acc-1", pfc("TRANSPORTATION"), "2026-10-14", Some("fuel"), 1.0),
-        ("h4", home.alice, Some("Starbucks"), None, -5.75, Some("in store"), "acc-1", pfc("FOOD_AND_DRINK"), "2026-08-13", Some("refunds"), 1.0),
+        ("h2", home.alice, Some("Starbucks"), Some("Starbucks"), 20.0, Some("online"), "acc-2", hint("FOOD_AND_DRINK"), "2026-09-25", Some("coffee"), 1.0),
+        ("h3", home.alice, Some("Shell"), Some("SHELL OIL"), 5.5, Some("in store"), "acc-1", hint("TRANSPORTATION"), "2026-10-14", Some("fuel"), 1.0),
+        ("h4", home.alice, Some("Starbucks"), None, -5.75, Some("in store"), "acc-1", hint("FOOD_AND_DRINK"), "2026-08-13", Some("refunds"), 1.0),
         ("h5", home.alice, None, None, 6.0, None, "acc-1", None, "2026-10-11", Some("misc"), 1.0),
         (
             "h6",
@@ -4489,7 +4495,7 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
             30.0,
             Some("online"),
             "acc-3",
-            pfc("GENERAL_MERCHANDISE"),
+            hint("GENERAL_MERCHANDISE"),
             "2026-10-02",
             Some("treats"),
             1.0,
@@ -4503,7 +4509,7 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
             5.25,
             Some("in store"),
             "acc-1",
-            pfc("FOOD_AND_DRINK"),
+            hint("FOOD_AND_DRINK"),
             "2026-10-12",
             Some("treats"),
             0.7,
@@ -4516,12 +4522,12 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
             5.25,
             Some("in store"),
             "acc-1",
-            pfc("FOOD_AND_DRINK"),
+            hint("FOOD_AND_DRINK"),
             "2026-10-12",
             Some("treats"),
             1.0,
         ),
-        ("h9", home.bob, Some("Starbucks"), Some("Starbucks"), 5.25, Some("in store"), "acc-1", pfc("FOOD_AND_DRINK"), "2026-10-12", Some("treats"), 1.0),
+        ("h9", home.bob, Some("Starbucks"), Some("Starbucks"), 5.25, Some("in store"), "acc-1", hint("FOOD_AND_DRINK"), "2026-10-12", Some("treats"), 1.0),
         // Rejections are scored on these; they carry no label themselves.
         ("r1", home.alice, Some("Starbucks"), None, 5.6, None, "acc-9", None, "2026-10-20", None, 0.0),
         ("r2", home.alice, Some("Starbucks"), None, 5.6, None, "acc-9", None, "2026-10-20", None, 0.0),
@@ -4554,7 +4560,7 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
         amount_band: (5.0, 6.5),
         channel: Some("in store"),
         account_id: "acc-1",
-        plaid_category: Some("FOOD_AND_DRINK"),
+        provider_category: Some("FOOD_AND_DRINK"),
         day_band: (10, 16),
     };
 
@@ -4602,7 +4608,7 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
     let directionless = Target { amount: 0.0, ..target.clone() };
     let scored: Vec<(String, i64)> = db.query(scores(&directionless)).await?.map()?;
     assert_eq!(scored[3], ("h4".to_string(), 113));
-    let bare = Target { merchant_name: None, name: None, channel: None, plaid_category: None, ..target.clone() };
+    let bare = Target { merchant_name: None, name: None, channel: None, provider_category: None, ..target.clone() };
     let scored: Vec<(String, i64)> = db.query(scores(&bare)).await?.map()?;
     assert_eq!(scored.iter().map(|(_, score)| *score).collect::<Vec<_>>(), [7, 0, 7, 2, 7, 0]);
 
@@ -4615,7 +4621,7 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
         amount_band: (30.0, 50.0),
         channel: None,
         account_id: "acc-x",
-        plaid_category: None,
+        provider_category: None,
         day_band: (-2, 40),
     };
     let winner = db.query_one(winning_category(home.alice, &petrol, 19)).await?;
@@ -4624,8 +4630,7 @@ async fn auto_suggest_scores_the_confirmed_history_and_picks_the_top_category() 
     Ok(())
 }
 
-// R-Q2, R-Q9, R-Q8, R-W7, R-X3: budget Q-TXN-6, Q-SPL-8, Q-TXN-18, Q-SPL-10 (the engine's feeders and its
-// compare-and-swap label writes; §3.6).
+// R-Q2, R-Q9, R-Q8, R-W7, R-X3: what feeds the suggestion engine, and its compare-and-swap label writes.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_suggestion_engine_labels_a_row_only_while_it_is_still_unlabeled() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4659,8 +4664,8 @@ async fn the_suggestion_engine_labels_a_row_only_while_it_is_still_unlabeled() -
     }
     soft_delete(&db, "transactions", "u-5", Scope::Owner(home.alice)).await?;
 
-    // Q-TXN-6: every unlabeled live transaction of one user, whole rows.
-    // Zero is a label state ("cleared"), not the absence of one.
+    // Every unlabeled live transaction of one user, whole rows. Zero is a
+    // label state ("cleared"), not the absence of one.
     let unlabeled = db
         .query(find(
             Query::table("transactions").index("idx_transactions_user_id_transaction_id", KeyRange::eq([home.alice])),
@@ -4670,8 +4675,8 @@ async fn the_suggestion_engine_labels_a_row_only_while_it_is_still_unlabeled() -
     assert_eq!(texts_of(&unlabeled, "transaction_id"), ["u-1", "u-2", "u-6", "u-7"]);
     assert_eq!(unlabeled.first().unwrap().get::<Json>("raw")?, json!({"id": "u-1"}));
 
-    // Q-SPL-8: unlabeled splits with their parent's features, for parents
-    // dated within the last week by the server's clock.
+    // Unlabeled splits with their parent's features, for parents dated
+    // within the last week by the server's clock.
     // (parent, split's owner, confidence, deleted)
     let splits = [
         ("u-1", home.alice, None, false),
@@ -4719,8 +4724,8 @@ async fn the_suggestion_engine_labels_a_row_only_while_it_is_still_unlabeled() -
         ("Corner Shop".to_string(), dec("12.5"), days_ago(1), json!({"id": "u-1"}))
     );
 
-    // Q-TXN-18: the engine writes its label only if the row is still
-    // unlabeled when the statement runs.
+    // The engine writes its label only if the row is still unlabeled when
+    // the statement runs.
     let label = |id: &'static str, owner: Uuid, confidence: f64| {
         update(
             &db,
@@ -4752,7 +4757,7 @@ async fn the_suggestion_engine_labels_a_row_only_while_it_is_still_unlabeled() -
     let outcomes = [update_status(&one?), update_status(&other?)];
     assert!(outcomes == [200, 304] || outcomes == [304, 200], "{outcomes:?}");
 
-    // Q-SPL-10: the same guard on a split.
+    // The same guard on a split.
     let label_split = |id: Uuid, confidence: f64| {
         update(
             &db,
@@ -4771,8 +4776,8 @@ async fn the_suggestion_engine_labels_a_row_only_while_it_is_still_unlabeled() -
     Ok(())
 }
 
-/// The first anti-join of Q-TXN-14 and of Q-PAR-10: one of the group's
-/// live pairs that is not rejected names `x` or `y`, on either side.
+/// The first anti-join of the transfer statements: one of the group's live
+/// pairs that is not rejected names `x` or `y`, on either side.
 fn open_pair_touching(group: &[Uuid], x: Expr, y: Expr) -> Expr {
     let open = col("tp.user_id").in_list(uuid_list(group)).and(live_in("tp")).and(col("tp.status").ne("rejected"));
     pair_naming(x, open.clone()).or(pair_naming(y, open))
@@ -4794,16 +4799,16 @@ fn pair_of(group: &[Uuid], x: Expr, y: Expr, also: Option<Expr>) -> Expr {
     ordered(x.clone(), y.clone()).or(ordered(y, x))
 }
 
-/// Q-TXN-14: pairs of the group's live transactions that look like the
-/// two halves of a transfer: exactly negated, non-zero amounts on
-/// different visible accounts, within `window` days of each other, not
-/// already paired and not rejected as a pair before. Closest dates first.
+/// Pairs of the group's live transactions that look like the two halves of
+/// a transfer: exactly negated, non-zero amounts on different visible
+/// accounts, within `window` days of each other, not already paired and not
+/// rejected as a pair before. Closest dates first.
 ///
-/// Where Postgres hash-joined on the amount, the second half is looked up
-/// in `(user_id, amount, date)`: the negated amount is the key, the
+/// Where Postgres would hash-join on the amount, the second half is looked
+/// up in `(user_id, amount, date)`: the negated amount is the key, the
 /// window the range.
 fn transfer_candidates(group: &[Uuid], window: i64, limit: u64) -> Query {
-    let primary = |alias: &str| col(&format!("{alias}.raw")).json_text(["personal_finance_category", "primary"]);
+    let primary = |alias: &str| col(&format!("{alias}.raw")).json_text(["category_hint", "primary"]);
     let days_apart = call(Func::Abs, [col("t1.date") - col("t2.date")]);
     let other_half = Query::table("transactions")
         .alias("t2")
@@ -4834,15 +4839,14 @@ fn transfer_candidates(group: &[Uuid], window: i64, limit: u64) -> Query {
         .select("user_id_a", col("t1.user_id"))
         .select("user_id_b", col("t2.user_id"))
         .select("date_delta", days_apart.clone())
-        .select("is_plaid_transfer", primary("t1").like("TRANSFER%").or(primary("t2").like("TRANSFER%")))
+        .select("is_bank_transfer", primary("t1").like("TRANSFER%").or(primary("t2").like("TRANSFER%")))
         .order_by(days_apart)
         .order_by(col("t1.transaction_id"))
         .limit(limit)
 }
 
-// R-T5, R-Q9, R-Q10, R-Q16, R-Q13, R-Q7, R-T9: budget Q-TXN-14 (hardest thing 2): the self-join on an exactly
-// negated amount within a date window, two more joins, two anti-joins, computed columns, order by an
-// expression, limit.
+// R-T5, R-Q9, R-Q10, R-Q16, R-Q13, R-Q7, R-T9: the self-join on an exactly negated amount within a date window, two
+// more joins, two anti-joins, computed columns, order by an expression, limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn transfer_candidates_pair_exactly_negated_amounts_within_a_week() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -4857,13 +4861,13 @@ async fn transfer_candidates_pair_exactly_negated_amounts_within_a_week() -> DbR
     ] {
         insert(&db, "accounts", data! {"user_id": owner, "account_id": id, "item_id": "item-1", "institution_id": "ins-1", "hide": hide}, &[], false).await?;
     }
-    let pfc = |primary: &str| Some(json!({"personal_finance_category": {"primary": primary}}));
-    // (id, owner, account, amount, date, raw). The amounts arrive as the
-    // app binds them: floats, integers, text.
+    let hint = |primary: &str| Some(json!({"category_hint": {"primary": primary}}));
+    // (id, owner, account, amount, date, raw). The amounts arrive as a
+    // caller binds them: floats, integers, text.
     type Booked = (&'static str, Uuid, &'static str, Value, &'static str, Option<Json>);
     let rows: Vec<Booked> = vec![
-        ("t01", home.alice, "acc-chk", 500.into(), "2026-10-01", pfc("TRANSFER_OUT")),
-        ("t02", home.alice, "acc-sav", (-500).into(), "2026-10-03", pfc("TRANSFER_IN")),
+        ("t01", home.alice, "acc-chk", 500.into(), "2026-10-01", hint("TRANSFER_OUT")),
+        ("t02", home.alice, "acc-sav", (-500).into(), "2026-10-03", hint("TRANSFER_IN")),
         ("t03", home.alice, "acc-chk", 120.5.into(), "2026-10-10", None),
         ("t04", home.bob, "acc-bob", "-120.50".into(), "2026-10-10", None),
         // Eight days apart; the same account; a cent off; zero.
@@ -4887,14 +4891,14 @@ async fn transfer_candidates_pair_exactly_negated_amounts_within_a_week() -> DbR
         ("t20", home.alice, "acc-sav", (-250).into(), "2026-10-15", None),
         ("t24", home.alice, "acc-sav", (-250).into(), "2026-10-14", None),
         // Rejected as a pair, which blocks only that pair: t21 with t23 is open.
-        ("t21", home.alice, "acc-chk", 19.99.into(), "2026-10-16", pfc("GENERAL_MERCHANDISE")),
+        ("t21", home.alice, "acc-chk", 19.99.into(), "2026-10-16", hint("GENERAL_MERCHANDISE")),
         ("t22", home.alice, "acc-sav", (-19.99).into(), "2026-10-17", None),
-        ("t23", home.alice, "acc-sav", (-19.99).into(), "2026-10-18", pfc("FOOD_AND_DRINK")),
+        ("t23", home.alice, "acc-sav", (-19.99).into(), "2026-10-18", hint("FOOD_AND_DRINK")),
         // Thirty cents as floats do not add up to; stored, they match.
-        ("t25", home.alice, "acc-chk", (0.1 + 0.2).into(), "2026-10-21", pfc("FOOD_AND_DRINK")),
-        ("t26", home.alice, "acc-sav", (-0.3).into(), "2026-10-21", pfc("TRANSFER_IN")),
+        ("t25", home.alice, "acc-chk", (0.1 + 0.2).into(), "2026-10-21", hint("FOOD_AND_DRINK")),
+        ("t26", home.alice, "acc-sav", (-0.3).into(), "2026-10-21", hint("TRANSFER_IN")),
         // Exactly seven days apart.
-        ("t27", home.alice, "acc-chk", 64.into(), "2026-10-01", pfc("RENT_AND_UTILITIES")),
+        ("t27", home.alice, "acc-chk", 64.into(), "2026-10-01", hint("RENT_AND_UTILITIES")),
         ("t28", home.alice, "acc-sav", "-64.00".into(), "2026-10-08", None),
     ];
     for (id, owner, account, amount, date, raw) in rows {
@@ -4923,7 +4927,7 @@ async fn transfer_candidates_pair_exactly_negated_amounts_within_a_week() -> DbR
     type Candidate = (String, String, Uuid, Uuid, i64, Option<bool>);
     let group = sharing_group(&db, home.alice).await?;
     let found: Vec<Candidate> = db.query(transfer_candidates(&group, 7, 500 * group.len() as u64)).await?.map()?;
-    let candidate = |a: &str, b: &str, owner_b: Uuid, days: i64, plaid: Option<bool>| (a.to_string(), b.to_string(), home.alice, owner_b, days, plaid);
+    let candidate = |a: &str, b: &str, owner_b: Uuid, days: i64, transfer: Option<bool>| (a.to_string(), b.to_string(), home.alice, owner_b, days, transfer);
     // Same-day pairs first, then by the first half's id. The flag is
     // three-valued: unknown where neither payload says, or where one
     // says no and the other nothing.
@@ -4961,11 +4965,11 @@ async fn transfer_candidates_pair_exactly_negated_amounts_within_a_week() -> DbR
     Ok(())
 }
 
-/// Q-PAR-10: insert a suggestion unless either transaction is already in
-/// an open pair of the group, or the group has a pair for these two at
-/// all. `INSERT .. SELECT .. WHERE NOT EXISTS` selected constants from no
-/// table; here the row of the first transaction, which the foreign key
-/// requires to exist, carries them.
+/// Insert a suggestion unless either transaction is already in an open pair
+/// of the group, or the group has a pair for these two at all. SQL's
+/// `INSERT .. SELECT .. WHERE NOT EXISTS` selects constants from no table;
+/// here the row of the first transaction, which the foreign key requires to
+/// exist, carries them.
 fn suggest_pair(group: &[Uuid], pair_id: Uuid, owner: Uuid, a: &str, b: &str) -> Insert {
     let blocked = open_pair_touching(group, val(a), val(b)).or(pair_of(group, val(a), val(b), None));
     let proposed = Query::table("transactions")
@@ -4979,8 +4983,7 @@ fn suggest_pair(group: &[Uuid], pair_id: Uuid, owner: Uuid, a: &str, b: &str) ->
     Insert::into("transaction_pairs").columns(["pair_id", "user_id", "transaction_id_a", "transaction_id_b", "status"]).from_query(proposed)
 }
 
-/// Q-PAR-9: soft-delete the group's live pairs of which a half has been
-/// deleted.
+/// Soft-delete the group's live pairs of which a half has been deleted.
 fn sweep_stale_pairs(group: &[Uuid]) -> Update {
     let a_deleted_half =
         exists(Query::table("transactions").alias("t").keys([[col("tp.transaction_id_a")], [col("tp.transaction_id_b")]]).filter(col("t.is_deleted").eq(true)));
@@ -5002,11 +5005,11 @@ struct Detection {
     failed: usize,
 }
 
-/// T17, the hourly transfer detection for one sharing group: one
-/// transaction that reads the group, sweeps stale pairs, finds the
-/// candidates and inserts each under a savepoint, so that an insert that
-/// fails loses only itself. Postgres took two advisory locks first; the
-/// writing transaction is their equal.
+/// The hourly transfer detection for one sharing group: one transaction
+/// that reads the group, sweeps stale pairs, finds the candidates and
+/// inserts each under a savepoint, so that an insert that fails loses only
+/// itself. Postgres would take two advisory locks first; the writing
+/// transaction is their equal.
 async fn detect_transfers(db: &Client, viewer: Uuid, run: u128) -> DbResult<Detection> {
     let tx = db.begin().await?;
     let group = sharing_group(&tx, viewer).await?;
@@ -5021,7 +5024,7 @@ async fn detect_transfers(db: &Client, viewer: Uuid, run: u128) -> DbResult<Dete
                 done.suggested += 1;
                 done.inserted += rows.affected();
             }
-            // "Failed to insert transfer pair": logged, and on to the next.
+            // Logged, and on to the next.
             Err(_) => {
                 tx.rollback_to("pair_attempt").await?;
                 done.failed += 1;
@@ -5032,8 +5035,8 @@ async fn detect_transfers(db: &Client, viewer: Uuid, run: u128) -> DbResult<Dete
     Ok(done)
 }
 
-// R-X6, R-X1, R-X2, R-W3, R-W11, R-Q10: budget T17 (Q-SYS-3, Q-SYS-6, Q-SYS-7, Q-SHR-1, Q-PAR-9, Q-TXN-14,
-// Q-PAR-10); §3.5 (the one unique violation the app expects as an error); hardest things 2 and 3.
+// R-X6, R-X1, R-X2, R-W3, R-W11, R-Q10: a job that inserts each of its rows under a savepoint, so the one unique
+// violation it expects as an error costs that row alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn transfer_detection_keeps_its_other_pairs_when_one_insert_hits_a_unique_violation() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5153,11 +5156,11 @@ async fn transfer_detection_keeps_its_other_pairs_when_one_insert_hits_a_unique_
     Ok(())
 }
 
-/// Q-PAR-3: store a pair on its unique `(transaction_id_a,
-/// transaction_id_b)`. A new pair is inserted. A deleted or rejected one
-/// is revived with the offered status and a fresh `updated`. A live
-/// suggested or confirmed one keeps its status and its `updated`, so no
-/// delta is sent. Returns the id of the row that now stands.
+/// Store a pair on its unique `(transaction_id_a, transaction_id_b)`. A new
+/// pair is inserted. A deleted or rejected one is revived with the offered
+/// status and a fresh `updated`. A live suggested or confirmed one keeps
+/// its status and its `updated`, so no delta is sent. Returns the id of the
+/// row that now stands.
 fn upsert_pair(pair_id: Uuid, owner: Uuid, a: &str, b: &str, status: &str) -> Insert {
     let deleted = || col("is_deleted").eq(true);
     let rejected = || col("status").eq("rejected");
@@ -5174,8 +5177,8 @@ fn upsert_pair(pair_id: Uuid, owner: Uuid, a: &str, b: &str, status: &str) -> In
         .returning(["pair_id"])
 }
 
-// R-W4, R-S3, R-W11, R-S6: budget Q-PAR-3 (hardest thing 4: a conflict on a two-column unique key, `CASE` over
-// the existing row, tombstone revival, `RETURNING` the surviving row), §4.8 (tombstones stay in unique keys).
+// R-W4, R-S3, R-W11, R-S6: a conflict on a two-column unique key, `CASE` over the existing row, tombstone revival,
+// `RETURNING` the surviving row. Tombstones stay in unique keys.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pair_upsert_inserts_revives_a_tombstone_or_leaves_a_live_pair_alone() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5223,9 +5226,9 @@ async fn a_pair_upsert_inserts_revives_a_tombstone_or_leaves_a_live_pair_alone()
     assert_eq!(state(uuid(1)).await?, ("suggested".to_string(), Some(false), false));
     assert_eq!(db.query(Query::table("transaction_pairs")).await?.len(), 1);
 
-    // The key is the ordered pair: the app stores the two ids in its own
-    // canonical order, and the same two the other way round are another
-    // row to the database.
+    // The key is the ordered pair: the application stores the two ids in
+    // its own canonical order, and the same two the other way round are
+    // another row to the database.
     assert_eq!(db.insert(upsert_pair(uuid(6), ann, "b", "a", "suggested")).await?.one()?.get::<Uuid>("pair_id")?, uuid(6));
     // Only that key is the conflict target: an id already taken by
     // another pair is an error, as is a pair that names no transaction.
@@ -5248,7 +5251,7 @@ fn pairs_touching(viewer: Uuid, a: &str, b: &str) -> Query {
     ]))
 }
 
-/// Q-PAR-4: every other suggestion that names either half is rejected.
+/// Every other suggestion that names either half is rejected.
 fn reject_rivals(viewer: Uuid, pair: Uuid, a: &str, b: &str) -> Update {
     Update::rows(pairs_touching(viewer, a, b).filter(col("status").eq("suggested")).filter(col("pair_id").ne(pair)))
         .set("status", "rejected")
@@ -5256,22 +5259,21 @@ fn reject_rivals(viewer: Uuid, pair: Uuid, a: &str, b: &str) -> Update {
 }
 
 /// Why a pairing or a confirmation did nothing. These are answers, not
-/// errors: the transaction is rolled back and the route says so.
+/// errors: the transaction is rolled back and the caller says so.
 #[derive(Debug, PartialEq)]
 enum Refused {
     NotFound,
     Collision,
 }
 
-/// T10, `pair_transactions`: the user says two transactions are one
-/// transfer. Postgres read them `FOR SHARE` so a concurrent delete could
-/// not slip in before the pair was written; here nothing else writes
-/// until the commit.
+/// The user says two transactions are one transfer. Postgres would read
+/// them `FOR SHARE` so a concurrent delete could not slip in before the
+/// pair was written; here nothing else writes until the commit.
 async fn pair_transactions(db: &Client, viewer: Uuid, x: &str, y: &str, offered: Uuid) -> DbResult<Result<Uuid, Refused>> {
     let (a, b) = if x < y { (x, y) } else { (y, x) };
     let tx = db.begin().await?;
-    // Q-TXN-9: both must be live rows of the group; the caller compares
-    // how many came back with how many it asked for.
+    // Both must be live rows of the group; the caller compares how many
+    // came back with how many it asked for.
     let halves = tx
         .query(
             Query::table("transactions")
@@ -5286,7 +5288,7 @@ async fn pair_transactions(db: &Client, viewer: Uuid, x: &str, y: &str, offered:
         return Ok(Err(Refused::NotFound));
     }
     let owner: Uuid = halves.first().expect("two rows").get("user_id")?;
-    // Q-PAR-2: is either half in another confirmed pair?
+    // Is either half in another confirmed pair?
     let other_pair = col("transaction_id_a").eq(a).and(col("transaction_id_b").eq(b)).not();
     if tx.query_opt(pairs_touching(viewer, a, b).filter(col("status").eq("confirmed")).filter(other_pair).columns(["pair_id"]).limit(1)).await?.is_some() {
         tx.rollback().await?;
@@ -5298,12 +5300,12 @@ async fn pair_transactions(db: &Client, viewer: Uuid, x: &str, y: &str, offered:
     Ok(Ok(pair))
 }
 
-/// T11, `confirm_transfer_pair`: a suggestion becomes a confirmed pair,
-/// unless it is gone or one of its halves has been confirmed elsewhere.
+/// A suggestion becomes a confirmed pair, unless it is gone or one of its
+/// halves has been confirmed elsewhere.
 async fn confirm_pair(db: &Client, viewer: Uuid, pair: Uuid) -> DbResult<Result<(), Refused>> {
     let group = || col("user_id").in_list(sharing_user_ids(viewer));
     let tx = db.begin().await?;
-    // Q-PAR-5 (`FOR UPDATE` in SQL).
+    // The group's pair, live and not rejected (`FOR UPDATE` in SQL).
     let Some(row) = tx
         .query_opt(
             Query::table("transaction_pairs")
@@ -5319,7 +5321,7 @@ async fn confirm_pair(db: &Client, viewer: Uuid, pair: Uuid) -> DbResult<Result<
         return Ok(Err(Refused::NotFound));
     };
     let (a, b): (String, String) = (row.get("transaction_id_a")?, row.get("transaction_id_b")?);
-    // Q-PAR-2, second form.
+    // Is either half in another confirmed pair?
     if tx
         .query_opt(pairs_touching(viewer, &a, &b).filter(col("status").eq("confirmed")).filter(col("pair_id").ne(pair)).columns(["pair_id"]).limit(1))
         .await?
@@ -5328,15 +5330,15 @@ async fn confirm_pair(db: &Client, viewer: Uuid, pair: Uuid) -> DbResult<Result<
         tx.rollback().await?;
         return Ok(Err(Refused::Collision));
     }
-    // Q-PAR-6, then Q-PAR-4.
+    // Confirm it, then reject its rivals.
     tx.update(Update::table("transaction_pairs").key([pair]).filter(group()).filter(live()).set("status", "confirmed").set("updated", now())).await?;
     tx.update(reject_rivals(viewer, pair, &a, &b)).await?;
     tx.commit().await?;
     Ok(Ok(()))
 }
 
-// R-X1, R-X2, R-W4, R-W6, R-Q6: budget T10 (Q-SYS-6, Q-SYS-7, Q-TXN-9, Q-PAR-2, Q-PAR-3, Q-PAR-4), Q-PAR-6;
-// §3.3 (`FOR SHARE` against a concurrent soft delete), §4.9 (a new row takes its parent's owner).
+// R-X1, R-X2, R-W4, R-W6, R-Q6: pairing in one transaction, where SQL reads `FOR SHARE` against a concurrent soft
+// delete; a new row takes its parent's owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn pairing_two_transactions_checks_both_exist_and_rejects_rival_suggestions() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5378,9 +5380,9 @@ async fn pairing_two_transactions_checks_both_exist_and_rejects_rival_suggestion
     }
     assert_eq!(db.query(Query::table("transaction_pairs")).await?.len(), 3);
 
-    // Alice pairs p2 with p1, naming them the other way round. The pair
-    // is stored in the app's order; the suggestions that named either
-    // half are rejected and stamped; the one that named neither is not.
+    // Alice pairs p2 with p1, naming them the other way round. The pair is
+    // stored in canonical order; the suggestions that named either half are
+    // rejected and stamped; the one that named neither is not.
     let paired = pair_transactions(&db, home.alice, "p2", "p1", uuid(10)).await?.expect("paired");
     assert_eq!(paired, uuid(10));
     let row = stored(&db, "transaction_pairs", uuid(10)).await?;
@@ -5398,8 +5400,8 @@ async fn pairing_two_transactions_checks_both_exist_and_rejects_rival_suggestion
     // Pairing the same two again is not a collision with itself: the
     // pair that stands answers, under its first id.
     assert_eq!(pair_transactions(&db, home.bob, "p1", "p2", uuid(12)).await?, Ok(uuid(10)));
-    // Q-PAR-6, the lone rejection whose result nobody reads; then pairing
-    // them once more revives the very same row.
+    // A lone rejection whose result nobody reads; then pairing them once
+    // more revives the very same row.
     db.update(
         Update::table("transaction_pairs")
             .key([uuid(10)])
@@ -5420,7 +5422,7 @@ async fn pairing_two_transactions_checks_both_exist_and_rejects_rival_suggestion
     assert_eq!(pair_transactions(&db, home.carol, "p3", "p4", uuid(15)).await?, Err(Refused::NotFound));
 
     // A delete that commits first is seen by the pairing that follows:
-    // where Postgres made the `FOR SHARE` read wait and re-check, the
+    // where Postgres makes the `FOR SHARE` read wait and re-check, the
     // pairing simply begins after it.
     assert_eq!(bulk_soft_delete(&db, "transactions", vec!["p4".into()], Scope::Group(home.alice)).await?, 1);
     assert_eq!(pair_transactions(&db, home.alice, "p3", "p4", uuid(16)).await?, Err(Refused::NotFound));
@@ -5428,8 +5430,7 @@ async fn pairing_two_transactions_checks_both_exist_and_rejects_rival_suggestion
     Ok(())
 }
 
-// R-X2, R-X3, R-W7, R-X1: budget T11 (Q-PAR-5, Q-PAR-2, Q-PAR-6, Q-PAR-4); §3 (read, check, write under
-// a lock: of several racing to do a once-only thing, one succeeds); hardest thing 3.
+// R-X2, R-X3, R-W7, R-X1: read, check, write under a lock: of several racing to do a once-only thing, one succeeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn racing_confirmations_of_rival_pairs_let_exactly_one_through() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5512,7 +5513,7 @@ async fn racing_confirmations_of_rival_pairs_let_exactly_one_through() -> DbResu
     Ok(())
 }
 
-/// A recurring charge or income as the app proposes it.
+/// A recurring charge or income as a caller proposes it.
 #[derive(Clone)]
 struct Recurring {
     id: Uuid,
@@ -5544,10 +5545,10 @@ impl Recurring {
 /// merchant and direction, dismissed and deleted rows included.
 const RECURRING_KEY: &str = "recurrings_user_merchant_direction_unique";
 
-/// Q-REC-9: the user confirms a recurring. A new one is inserted. One
-/// already there for the merchant, whatever its state, is confirmed and
-/// undeleted, its members become the union of both lists, and its name
-/// is replaced only when `rename` says so. Returns the surviving id.
+/// The user confirms a recurring. A new one is inserted. One already there
+/// for the merchant, whatever its state, is confirmed and undeleted, its
+/// members become the union of both lists, and its name is replaced only
+/// when `rename` says so. Returns the surviving id.
 fn confirm_upsert(new: &Recurring, rename: bool) -> Insert {
     new.insert("confirmed")
         .on_conflict_update(RECURRING_KEY)
@@ -5559,10 +5560,10 @@ fn confirm_upsert(new: &Recurring, rename: bool) -> Insert {
         .returning(["recurring_id"])
 }
 
-/// Q-REC-13: the detector suggests a recurring. A row already there for
-/// the merchant is touched only if it is a tombstone, which is revived
-/// with its old status. Otherwise nothing is written and nothing comes
-/// back, which is how the caller knows to leave it be.
+/// The detector suggests a recurring. A row already there for the merchant
+/// is touched only if it is a tombstone, which is revived with its old
+/// status. Otherwise nothing is written and nothing comes back, which is
+/// how the caller knows to leave it be.
 fn suggest_upsert(new: &Recurring) -> Insert {
     new.insert("suggested")
         .on_conflict_update(RECURRING_KEY)
@@ -5573,8 +5574,8 @@ fn suggest_upsert(new: &Recurring) -> Insert {
         .returning(["recurring_id", "status"])
 }
 
-/// Q-REC-8: is any of these transactions already a member of another
-/// live recurring of the user that was not dismissed?
+/// Is any of these transactions already a member of another live recurring
+/// of the user that was not dismissed?
 fn overlapping(owner: Uuid, members: &[&str], except: Option<Uuid>) -> Query {
     let mut rows = Query::table("recurrings")
         .index("idx_recurrings_user_id_updated", KeyRange::eq([owner]))
@@ -5587,8 +5588,8 @@ fn overlapping(owner: Uuid, members: &[&str], except: Option<Uuid>) -> Query {
     rows.columns(["recurring_id"]).limit(1)
 }
 
-/// Q-TXN-9 on one's own rows: which of these ids are live transactions
-/// of the user (and, for adding to a recurring, settled ones).
+/// Which of these ids are live transactions of the user (and, for adding to
+/// a recurring, settled ones).
 fn own_transactions(owner: Uuid, ids: &[&str], settled: bool) -> Query {
     let mut rows = Query::table("transactions").keys(ids.iter().map(|id| [*id])).filter(col("user_id").eq(owner)).filter(live());
     if settled {
@@ -5597,8 +5598,8 @@ fn own_transactions(owner: Uuid, ids: &[&str], settled: bool) -> Query {
     rows.columns(["transaction_id", "amount"])
 }
 
-/// T14, `create_recurring`: the members must be the user's live
-/// transactions and belong to no other recurring; then the upsert.
+/// Creating a recurring: the members must be the user's live transactions
+/// and belong to no other recurring; then the upsert.
 async fn create_recurring(db: &Client, new: &Recurring, rename: bool) -> DbResult<Result<Uuid, Refused>> {
     let tx = db.begin().await?;
     if tx.query(own_transactions(new.owner, &new.members, false)).await?.len() != new.members.len() {
@@ -5614,11 +5615,11 @@ async fn create_recurring(db: &Client, new: &Recurring, rename: bool) -> DbResul
     Ok(Ok(id))
 }
 
-/// T15, `add_to_recurring`: more members for a recurring of the user's,
-/// de-duplicated (Q-REC-10). Answers the member list after the union.
+/// More members for a recurring of the user's, de-duplicated. Answers the
+/// member list after the union.
 async fn add_to_recurring(db: &Client, owner: Uuid, recurring: Uuid, members: &[&str]) -> DbResult<Result<Vec<String>, Refused>> {
     let tx = db.begin().await?;
-    // Q-REC-4.
+    // The recurring, if it is live and the user's.
     let this = Query::table("recurrings").key([recurring]).filter(col("user_id").eq(owner)).filter(live());
     if tx.query_opt(this.clone().columns(["recurring_id", "is_income", "status"])).await?.is_none()
         || tx.query(own_transactions(owner, members, true)).await?.len() != members.len()
@@ -5647,8 +5648,8 @@ fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|item| item.to_string()).collect()
 }
 
-// R-W4, R-Q14, R-T7, R-S3, R-X1: budget T14 (Q-SYS-8, Q-TXN-9, Q-REC-8, Q-REC-9), Q-REC-7; hardest things 4
-// and 7 (a conflict on a three-column unique key; `CASE` on a parameter; array union in the `SET`).
+// R-W4, R-Q14, R-T7, R-S3, R-X1: a conflict on a three-column unique key; `CASE` on a parameter;
+// array union in the `SET`.
 #[tokio::test(flavor = "multi_thread")]
 async fn confirming_a_recurring_upserts_on_the_merchant_and_unions_its_members() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5705,8 +5706,8 @@ async fn confirming_a_recurring_upserts_on_the_merchant_and_unions_its_members()
         ("confirmed".to_string(), "NETFLIX.COM".to_string(), strings(&["n1", "n2", "n3", "n4", "n5"]), Some(false))
     );
 
-    // Q-REC-7: the user dismisses it; the row stays as the merchant's
-    // denylist entry. Confirming the merchant again revives that row.
+    // The user dismisses it; the row stays as the merchant's denylist
+    // entry. Confirming the merchant again revives that row.
     assert_eq!(update_status(&update(&db, "recurrings", uuid(1), data! {"status": "dismissed"}, Scope::Owner(home.alice), vec![]).await?), 200);
     assert_eq!(update_status(&update(&db, "recurrings", uuid(1), data! {"status": "dismissed"}, Scope::Owner(home.bob), vec![]).await?), 304);
     assert_eq!(create_recurring(&db, &Recurring { id: uuid(4), members: vec!["n6"], ..netflix.clone() }, false).await?, Ok(uuid(1)));
@@ -5733,8 +5734,7 @@ async fn confirming_a_recurring_upserts_on_the_merchant_and_unions_its_members()
     Ok(())
 }
 
-// R-W4, R-W5, R-T9, R-Q2: budget Q-REC-13, Q-REC-14, Q-REC-2 (hardest thing 4: `DO UPDATE .. WHERE` that can
-// decline to write and return nothing; the caller branches on it).
+// R-W4, R-W5, R-T9, R-Q2: `DO UPDATE .. WHERE` can decline to write and return nothing; the caller branches on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_suggested_recurring_revives_a_tombstone_but_never_touches_a_live_row() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5772,8 +5772,8 @@ async fn a_suggested_recurring_revives_a_tombstone_but_never_touches_a_live_row(
     // A flag that is NULL is not "deleted" either.
     db.update(Update::table("recurrings").key([uuid(1)]).set("is_deleted", Value::Null)).await?;
     assert_eq!(attempt(&offered).await?, (0, None));
-    // Q-REC-14: so the detector, having got nothing back, replaces the
-    // member list itself, and only when it differs.
+    // So the detector, having got nothing back, replaces the member list
+    // itself, and only when it differs.
     db.update(Update::table("recurrings").key([uuid(1)]).set("transaction_ids", offered.members.clone()).set("cadence", offered.cadence).set("updated", now()))
         .await?;
     assert_eq!(stored(&db, "recurrings", uuid(1)).await?.get::<Vec<String>>("transaction_ids")?, ["g1", "g2", "g3"]);
@@ -5808,8 +5808,8 @@ async fn a_suggested_recurring_revives_a_tombstone_but_never_touches_a_live_row(
     }
     assert!(db.get("recurrings", [uuid(2)]).await?.is_none());
 
-    // Q-REC-2: the detector reads every row of the user, tombstones and
-    // all, to match its groups against.
+    // The detector reads every row of the user, tombstones and all, to
+    // match its groups against.
     db.insert(Recurring { id: uuid(3), merchant_key: "rent", ..gym.clone() }.insert("confirmed").set("is_deleted", true)).await?;
     let bob = user(&db, "bob").await?;
     db.insert(Recurring { id: uuid(4), owner: bob, ..gym.clone() }.insert("suggested")).await?;
@@ -5821,8 +5821,8 @@ async fn a_suggested_recurring_revives_a_tombstone_but_never_touches_a_live_row(
     Ok(())
 }
 
-// R-Q14, R-T7, R-Q10, R-W6, R-X1: budget T15 (Q-REC-4, Q-TXN-9, Q-REC-8, Q-REC-10), Q-REC-3, Q-REC-7, Q-REC-11,
-// Q-REC-12; §4.6, hardest thing 7 (overlap probes, append, de-duplicating union, `NOT EXISTS .. = ANY(column)`).
+// R-Q14, R-T7, R-Q10, R-W6, R-X1: a list of text as a column: overlap probes, append, de-duplicating union,
+// `NOT EXISTS .. = ANY(column)`.
 #[tokio::test(flavor = "multi_thread")]
 async fn recurring_member_lists_are_probed_for_overlap_unioned_appended_and_swept() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -5853,9 +5853,9 @@ async fn recurring_member_lists_are_probed_for_overlap_unioned_appended_and_swep
         async move { Ok::<_, DbError>(db.query_opt(query).await?.map(|row| row.get::<Uuid>("recurring_id").unwrap())) }
     };
 
-    // Q-REC-8: two lists overlap when they share any item. Dismissed and
-    // deleted recurrings do not hold on to their members, nor do other
-    // users' recurrings; the one being added to is left out by id.
+    // Two lists overlap when they share any item. Dismissed and deleted
+    // recurrings do not hold on to their members, nor do other users'
+    // recurrings; the one being added to is left out by id.
     assert_eq!(probe(&["m9", "m2"], None).await?, Some(gym));
     assert_eq!(probe(&["m3"], None).await?, Some(spotify));
     assert_eq!(probe(&["m4", "m5", "m6", "b1", "m9"], None).await?, None);
@@ -5863,7 +5863,7 @@ async fn recurring_member_lists_are_probed_for_overlap_unioned_appended_and_swep
     assert_eq!(probe(&["m1", "m2"], Some(gym)).await?, None);
     assert_eq!(probe(&["m1", "m3"], Some(gym)).await?, Some(spotify));
 
-    // T15 and Q-REC-10: new members join once, after the ones there.
+    // New members join once, after the ones there.
     assert_eq!(add_to_recurring(&db, home.alice, gym, &["m6"]).await?, Ok(strings(&["m1", "m2", "m6"])));
     assert_eq!(add_to_recurring(&db, home.alice, gym, &["m6", "m4", "m1"]).await?, Ok(strings(&["m1", "m2", "m6", "m4"])));
     // Refused: a member of another recurring; a pending, deleted or
@@ -5874,8 +5874,8 @@ async fn recurring_member_lists_are_probed_for_overlap_unioned_appended_and_swep
     }
     assert_eq!(recurring_state(&db, gym).await?.2, ["m1", "m2", "m6", "m4"]);
 
-    // Q-REC-11: the detector appends by key, without looking: `||` keeps
-    // what is already there a second time.
+    // The detector appends by key, without looking: `||` keeps what is
+    // already there a second time.
     db.update(Update::table("recurrings").key([gym]).set("transaction_ids", col("transaction_ids").list_concat(vec!["m4", "m5"])).set("updated", now()))
         .await?;
     assert_eq!(recurring_state(&db, gym).await?.2, ["m1", "m2", "m6", "m4", "m4", "m5"]);
@@ -5886,8 +5886,8 @@ async fn recurring_member_lists_are_probed_for_overlap_unioned_appended_and_swep
     .await?;
     assert_eq!(recurring_state(&db, gym).await?.2, ["m1", "m2", "m6", "m4", "m5"]);
 
-    // Q-REC-3: the defaults of a confirmed recurring, deleted or not.
-    // Q-REC-7 first stores them: a JSON array and a date.
+    // The defaults of a confirmed recurring, deleted or not. An update
+    // first stores them: a JSON array and a date.
     let splits = json!([
         {"amount": 20, "label": {"budget_id": uuid(40).to_string(), "category_id": uuid(50).to_string()}},
         {"amount": 10, "label": {"budget_id": null, "category_id": null}},
@@ -5915,9 +5915,9 @@ async fn recurring_member_lists_are_probed_for_overlap_unioned_appended_and_swep
     assert!(db.query_opt(defaults(spotify)).await?.is_none());
     assert!(db.query_opt(defaults(bobs)).await?.is_none());
 
-    // Q-REC-12: the hourly sweep soft-deletes the user's recurrings none
-    // of whose members is a live transaction of theirs: a member list
-    // that is empty, all deleted, or all someone else's.
+    // The hourly sweep soft-deletes the user's recurrings none of whose
+    // members is a live transaction of theirs: a member list that is empty,
+    // all deleted, or all someone else's.
     let (empty, dead, foreign) = (uuid(6), uuid(7), uuid(8));
     db.insert(Recurring { id: empty, merchant_key: "empty", ..base.clone() }.insert("suggested")).await?;
     db.insert(Recurring { id: dead, merchant_key: "dead", members: vec!["m8", "m-never"], ..base.clone() }.insert("confirmed")).await?;
@@ -5946,7 +5946,7 @@ async fn recurring_member_lists_are_probed_for_overlap_unioned_appended_and_swep
     Ok(())
 }
 
-/// Q-TXN-10: the label the user confirmed most often among some of their
+/// The label the user confirmed most often among some of their
 /// transactions; on a tie, the one used most recently.
 fn most_common_label(owner: Uuid, members: &[String]) -> Query {
     Query::table("transactions")
@@ -5965,13 +5965,12 @@ fn most_common_label(owner: Uuid, members: &[String]) -> Query {
 /// A `(budget, category)` label; either part may be missing.
 type Label = (Option<Uuid>, Option<Uuid>);
 
-/// Q-TXN-19: give a recurring's default label to its member
-/// transactions. A row takes it when it is unlabeled, or holds only a
-/// suggestion, or holds the recurring's previous default (so it was
-/// following it), or was cleared under no budget or the previous one.
-/// What the user labeled otherwise is left. A row that already has
-/// exactly the new label is not written at all, so its `updated` does
-/// not move and no delta is sent for it.
+/// Give a recurring's default label to its member transactions. A row takes
+/// it when it is unlabeled, or holds only a suggestion, or holds the
+/// recurring's previous default (so it was following it), or was cleared
+/// under no budget or the previous one. What the user labeled otherwise is
+/// left. A row that already has exactly the new label is not written at
+/// all, so its `updated` does not move and no delta is sent for it.
 fn propagate_label(owner: Uuid, members: &[String], new: Label, confidence: f64, previous: Label) -> Update {
     let (budget, category, confident) = (|| col("label_budget_id"), || col("label_category_id"), || col("label_category_confidence"));
     let may_take_it = any([
@@ -5992,10 +5991,10 @@ fn propagate_label(owner: Uuid, members: &[String], new: Label, confidence: f64,
         .set("updated", now())
 }
 
-/// `label_confirmed_recurring`, the tail of T12 to T16: read the
-/// recurring's defaults (Q-REC-3); if it has no default label yet, adopt
-/// the members' most common one (Q-TXN-10, Q-REC-5); propagate it
-/// (Q-TXN-19). Answers how many transactions were relabeled.
+/// The tail of every transaction that confirms or labels a recurring: read
+/// the recurring's defaults; if it has no default label yet, adopt the
+/// members' most common one; propagate it. Answers how many transactions
+/// were relabeled.
 async fn label_confirmed_recurring(tx: &Transaction, owner: Uuid, recurring: Uuid, previous: Option<Label>) -> DbResult<u64> {
     let this = || Query::table("recurrings").key([recurring]).filter(col("user_id").eq(owner));
     let Some(defaults) = tx
@@ -6015,12 +6014,12 @@ async fn label_confirmed_recurring(tx: &Transaction, owner: Uuid, recurring: Uui
     Ok(tx.update(propagate_label(owner, &members, label, 1.0, previous)).await?.affected())
 }
 
-/// T12, `confirm_recurring`. `None` when there is no such live recurring
-/// of the user's: the transaction is rolled back and the route says "not
+/// Confirming a recurring. `None` when there is no such live recurring of
+/// the user's: the transaction is rolled back and the caller says "not
 /// found".
 async fn confirm_recurring(db: &Client, owner: Uuid, recurring: Uuid) -> DbResult<Option<u64>> {
     let tx = db.begin().await?;
-    // Q-REC-6.
+    // Confirmed, if it is live and the user's.
     let confirmed = tx
         .update(
             Update::table("recurrings")
@@ -6041,9 +6040,9 @@ async fn confirm_recurring(db: &Client, owner: Uuid, recurring: Uuid) -> DbResul
     Ok(Some(relabeled))
 }
 
-/// T13, `set_recurring_label`: read the recurring (Q-REC-4), store the
-/// new default (Q-REC-5), and when it is confirmed, move the members
-/// that followed the old default over to the new one.
+/// Setting a recurring's default label: read the recurring, store the new
+/// default, and when it is confirmed, move the members that followed the
+/// old default over to the new one.
 async fn set_recurring_label(db: &Client, owner: Uuid, recurring: Uuid, new: Label) -> DbResult<Option<u64>> {
     let tx = db.begin().await?;
     let this = || Query::table("recurrings").key([recurring]).filter(col("user_id").eq(owner));
@@ -6058,8 +6057,8 @@ async fn set_recurring_label(db: &Client, owner: Uuid, recurring: Uuid, new: Lab
     Ok(Some(relabeled))
 }
 
-// R-T9, R-W6, R-W7, R-Q11, R-X1, R-T1: budget T12, T13 (Q-REC-6, Q-REC-3, Q-TXN-10, Q-REC-5, Q-REC-4, Q-TXN-19);
-// hardest thing 6 (NULL-safe comparisons, a four-branch predicate over a float state, no-op suppression).
+// R-T9, R-W6, R-W7, R-Q11, R-X1, R-T1: NULL-safe comparisons, a four-branch predicate over a float state,
+// no-op suppression.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recurrings_label_reaches_the_members_that_follow_it_and_no_others() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6118,9 +6117,9 @@ async fn a_recurrings_label_reaches_the_members_that_follow_it_and_no_others() -
             .collect::<DbResult<Vec<_>>>()
     };
 
-    // Q-TXN-10 on its own: streaming was confirmed twice, films once. On
-    // a tie the label used most recently wins. Unconfirmed, deleted and
-    // other users' rows have no say.
+    // The most common label on its own: streaming was confirmed twice,
+    // films once. On a tie the label used most recently wins. Unconfirmed,
+    // deleted and other users' rows have no say.
     let common = |members: &[&str]| {
         let query = most_common_label(home.alice, &strings(members));
         let db = &db;
@@ -6133,8 +6132,8 @@ async fn a_recurrings_label_reaches_the_members_that_follow_it_and_no_others() -
     assert_eq!(common(&["k4", "k5", "k6", "k8"]).await?, None);
     assert_eq!(common(&[]).await?, None);
 
-    // T12. Confirming a recurring someone else owns, or one that is not
-    // there, finds no row and changes nothing.
+    // Confirming a recurring someone else owns, or one that is not there,
+    // finds no row and changes nothing.
     assert_eq!(confirm_recurring(&db, home.bob, uuid(1)).await?, None);
     assert_eq!(confirm_recurring(&db, home.alice, uuid(404)).await?, None);
     assert_eq!(stored(&db, "recurrings", uuid(1)).await?.get::<String>("status")?, "suggested");
@@ -6168,7 +6167,7 @@ async fn a_recurrings_label_reaches_the_members_that_follow_it_and_no_others() -
     // Confirming again finds every follower labeled: nothing is written.
     assert_eq!(confirm_recurring(&db, home.alice, uuid(1)).await?, Some(0));
 
-    // T13. The default moves to flights under the travel budget. Every
+    // The default moves to flights under the travel budget. Every
     // member that carried the old default follows; k3 still does not;
     // k7, cleared under the travel budget, is not under the old default
     // and stays cleared.
@@ -6204,13 +6203,13 @@ async fn a_recurrings_label_reaches_the_members_that_follow_it_and_no_others() -
 /// One of a recurring's default splits: an amount and, perhaps, a label.
 type DefaultSplit = (Decimal, Option<Uuid>, Option<Uuid>);
 
-/// Q-SPL-9: give each of some transactions the recurring's default
-/// splits, unless it is small, old, deleted or already split. In SQL one
-/// `INSERT .. SELECT` cross-joined the transactions with three parallel
-/// array parameters. Here the eligible transactions are read, and their
-/// splits go in as one multi-row insert; the caller runs both in its
-/// writing transaction. Each row's id is the server's; its signed amount
-/// and its label state are computed by the server as the row goes in.
+/// Give each of some transactions the recurring's default splits, unless it
+/// is small, old, deleted or already split. In SQL one `INSERT .. SELECT`
+/// would cross-join the transactions with three parallel array parameters.
+/// Here the eligible transactions are read, and their splits go in as one
+/// multi-row insert; the caller runs both in its writing transaction. Each
+/// row's id is the server's; its signed amount and its label state are
+/// computed by the server as the row goes in.
 async fn create_default_splits(db: &impl Db, owner: Uuid, members: &[&str], splits: &[DefaultSplit], larger_than: Decimal, since: &str) -> DbResult<u64> {
     let already_split = exists(
         Query::table("split_transactions")
@@ -6264,8 +6263,8 @@ async fn create_default_splits(db: &impl Db, owner: Uuid, members: &[&str], spli
     Ok(db.insert(insert).await?.affected())
 }
 
-// R-W2, R-W3, R-T5, R-S5, R-Q10, R-Q16, R-X1: budget Q-SPL-9 (hardest thing 6: transactions crossed with three
-// parallel arrays, signed amounts in exact decimal, a state column from `CASE`, an anti-join, a uuid per row).
+// R-W2, R-W3, R-T5, R-S5, R-Q10, R-Q16, R-X1: transactions crossed with three parallel arrays, signed amounts in
+// exact decimal, a state column from `CASE`, an anti-join, a uuid per row.
 #[tokio::test(flavor = "multi_thread")]
 async fn default_splits_are_created_once_per_eligible_transaction_with_signed_amounts() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6371,8 +6370,8 @@ async fn default_splits_are_created_once_per_eligible_transaction_with_signed_am
     Ok(())
 }
 
-// R-W6, R-W7, R-Q1, R-Q2: budget Q-SPL-2, Q-SPL-4, Q-SPL-5, Q-SPL-6, Q-SPL-7 (the split's own statements;
-// Q-SPL-1 is with the delta sync, Q-SPL-3 with the builder insert).
+// R-W6, R-W7, R-Q1, R-Q2: a split's own statements: the probe for a live split, the move to another parent, the
+// edit and the soft deletes.
 #[tokio::test(flavor = "multi_thread")]
 async fn splits_are_probed_edited_repointed_and_deleted_with_their_parent() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6406,7 +6405,7 @@ async fn splits_are_probed_edited_repointed_and_deleted_with_their_parent() -> D
         backdate(&db, "split_transactions", *id, long_ago).await?;
     }
 
-    // Q-SPL-6: does this transaction have a live split of the user's?
+    // Does this transaction have a live split of the user's?
     let has_split = |owner: Uuid, parent: &'static str| {
         let db = &db;
         async move {
@@ -6429,9 +6428,9 @@ async fn splits_are_probed_edited_repointed_and_deleted_with_their_parent() -> D
     assert!(!has_split(home.bob, "pending-1").await?);
     assert!(!has_split(home.alice, "posted-1").await?);
 
-    // Q-SPL-7: the pending transaction was replaced by a posted one. The
-    // user's live splits follow it; the count is the answer. The deleted
-    // split and another user's split on the same parent stay behind.
+    // The pending transaction was replaced by a posted one. The user's live
+    // splits follow it; the count is the answer. The deleted split and
+    // another user's split on the same parent stay behind.
     let repoint = |owner: Uuid, from: &'static str, to: &'static str| {
         db.update(
             Update::table("split_transactions")
@@ -6449,7 +6448,7 @@ async fn splits_are_probed_edited_repointed_and_deleted_with_their_parent() -> D
     assert_eq!(parents, ["posted-1", "pending-1", "other", "bobs", "carols", "pending-1"]);
     assert!(stored(&db, "split_transactions", ids[0]).await?.get::<Timestamp>("updated")? > long_ago);
 
-    // Q-SPL-2: an edit within the group, and outside it.
+    // An edit within the group, and outside it.
     assert_eq!(
         update_status(
             &update(&db, "split_transactions", ids[3], data! {"amount": 7.5, "custom_name": "half", "label_memo": "shared"}, Scope::Group(home.alice), vec![])
@@ -6465,8 +6464,8 @@ async fn splits_are_probed_edited_repointed_and_deleted_with_their_parent() -> D
         (dec("7.5"), "half".to_string(), home.bob)
     );
 
-    // Q-SPL-5: the splits of deleted transactions, or of an account, go
-    // with them; Q-SPL-4 deletes some by id. All within the group.
+    // The splits of deleted transactions, or of an account, go with them;
+    // some are deleted by id. All within the group.
     assert_eq!(
         bulk_soft_delete_by_column(&db, "split_transactions", "transaction_id", vec!["posted-1", "carols", "nobodys"], Scope::Group(home.bob)).await?,
         1
@@ -6478,8 +6477,8 @@ async fn splits_are_probed_edited_repointed_and_deleted_with_their_parent() -> D
     Ok(())
 }
 
-// R-S6, R-Q1, R-Q6, R-W1, R-W11: budget Q-BSC-1, Q-BSC-2, Q-BSC-3, Q-BSC-4, Q-BSC-5, Q-BSC-9; §4.8 (foreign
-// keys are relied on at insert time), §4.9 (a child takes its parent's owner).
+// R-S6, R-Q1, R-Q6, R-W1, R-W11: budgets, sections and categories: foreign keys are relied on at insert time, and a
+// child takes its parent's owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn sections_and_categories_need_a_live_parent_that_the_group_owns() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6492,8 +6491,8 @@ async fn sections_and_categories_need_a_live_parent_that_the_group_owns() -> DbR
     )?;
     let carols = new_id(insert(&db, "budgets", data! {"user_id": home.carol, "name": "Carol's"}, &["*"], false).await?, "budget_id")?;
 
-    // Q-BSC-2 then Q-BSC-5: a child is created under a parent that is
-    // live and the group's, and takes the parent's owner, whoever asks.
+    // A child is created under a parent that is live and the group's, and
+    // takes the parent's owner, whoever asks.
     let add_section = |viewer: Uuid, budget: Uuid, name: &'static str| {
         let db = &db;
         async move {
@@ -6541,7 +6540,7 @@ async fn sections_and_categories_need_a_live_parent_that_the_group_owns() -> DbR
     assert_eq!(code(insert(&db, "categories", data! {"user_id": home.alice, "section_id": budget}, &[], false).await), ErrorCode::ForeignKeyViolation);
     assert_eq!(code(insert(&db, "sections", data! {"user_id": home.alice}, &[], false).await), ErrorCode::NotNullViolation);
 
-    // Q-BSC-1: the group's rows, all of them or one parent's.
+    // The group's rows, all of them or one parent's.
     let group = Filters::new(Scope::Group(home.bob));
     let names = |rows: Rows| {
         let mut names = texts_of(&rows, "name");
@@ -6559,10 +6558,9 @@ async fn sections_and_categories_need_a_live_parent_that_the_group_owns() -> DbR
     let section = find_one(&db, Query::table("sections").key([bills]), &group).await?.expect("the section");
     assert_eq!((section.get::<bool>("roll_over")?, section.get::<Date>("roll_over_start_date")?.to_string()), (true, "2026-01-01".to_string()));
 
-    // Q-BSC-9: one category is soft-deleted. Q-BSC-3 then still says the
-    // group owns it, which is what a label naming it is checked against;
-    // Q-BSC-4, the live rows by id, no longer has it. Both tables are
-    // asked at once.
+    // One category is soft-deleted. Read with tombstones, the group still
+    // owns it, which is what a label naming it is checked against; the live
+    // rows by id no longer have it. Both tables are asked at once.
     assert!(soft_delete(&db, "categories", power, Scope::Group(home.bob)).await?);
     assert!(!soft_delete(&db, "categories", power, Scope::Group(home.carol)).await?);
     let owned = |table: &'static str, ids: Vec<Uuid>| {
@@ -6575,7 +6573,7 @@ async fn sections_and_categories_need_a_live_parent_that_the_group_owns() -> DbR
     assert_eq!(live_ones.iter().map(|row| row.get("category_id")).collect::<DbResult<Vec<Uuid>>>()?, [films, rent]);
     // A child can still be created under a section whose sibling went.
     assert!(add_category(home.alice, bills, "Water").await?.is_some());
-    // Under a deleted section the app finds no parent. The foreign key
+    // Under a deleted section the caller finds no parent. The foreign key
     // would not have minded: a soft-deleted parent is still a row.
     assert!(soft_delete(&db, "sections", fun, Scope::Group(home.alice)).await?);
     assert_eq!(add_category(home.alice, fun, "Games").await?, None);
@@ -6583,10 +6581,10 @@ async fn sections_and_categories_need_a_live_parent_that_the_group_owns() -> DbR
     Ok(())
 }
 
-/// T4, `delete_budget`: the sections are read first, on the pool; then
-/// one transaction soft-deletes their categories, the sections and the
-/// budget, whose row count is the route's answer. `interrupted` makes a
-/// statement in the middle fail, as a lost connection or a bug would.
+/// Deleting a budget: the sections are read first, on the pool; then one
+/// transaction soft-deletes their categories, the sections and the budget,
+/// whose row count is the caller's answer. `interrupted` makes a statement
+/// in the middle fail, as a lost connection or a bug would.
 async fn delete_budget(db: &Client, viewer: Uuid, budget: Uuid, interrupted: bool) -> DbResult<bool> {
     let scope = Scope::Group(viewer);
     let sections: Vec<Uuid> = db
@@ -6606,8 +6604,8 @@ async fn delete_budget(db: &Client, viewer: Uuid, budget: Uuid, interrupted: boo
     .await
 }
 
-// R-X1, R-X2, R-X7, R-W6, R-S6: budget T4, T5 (Q-SYS-2, Q-BSC-8, Q-BSC-7), §3.1 (a transaction that fails
-// leaves nothing), §4.8 (the cascades the app relies on are its own soft-delete fan-outs).
+// R-X1, R-X2, R-X7, R-W6, R-S6: a transaction that fails leaves nothing; the cascades the application relies on are
+// its own soft-delete fan-outs.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_budget_soft_deletes_its_sections_and_categories_or_nothing_at_all() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6659,8 +6657,8 @@ async fn deleting_a_budget_soft_deletes_its_sections_and_categories_or_nothing_a
     };
     assert_eq!(counts().await?, (vec![2, 4, 8], 0));
 
-    // Someone outside the group deletes nothing: the budget's row count
-    // is zero, which the route answers with "not found".
+    // Someone outside the group deletes nothing: the row count is zero,
+    // which the caller answers with "not found".
     assert!(!delete_budget(&db, home.carol, home_budget, false).await?);
     assert_eq!(counts().await?, (vec![2, 4, 8], 0));
 
@@ -6701,7 +6699,7 @@ async fn deleting_a_budget_soft_deletes_its_sections_and_categories_or_nothing_a
     assert!(delete_budget(&db, home.alice, home_budget, false).await?);
     assert_eq!(counts().await?.0, [1, 2, 4]);
 
-    // T5, `delete_section`: its categories, then the section itself.
+    // Deleting a section: its categories, then the section itself.
     let (section, _) = tree[1].1[0];
     let deleted = db
         .transaction(|tx| async move {
@@ -6716,17 +6714,16 @@ async fn deleting_a_budget_soft_deletes_its_sections_and_categories_or_nothing_a
     Ok(())
 }
 
-/// What a write onto an existing account-balance snapshot may rewrite
-/// (Q-SNP-10): never its owner, its kind or its account.
+/// What a write onto an existing account-balance snapshot may rewrite:
+/// never its owner, its kind or its account.
 const BALANCE_SNAPSHOT_COLUMNS: &[&str] =
     &["snapshot_date", "is_deleted", "balances_available", "balances_current", "balances_limit", "balances_iso_currency_code"];
 
-/// The same for a holding snapshot (Q-SNP-12).
+/// The same for a holding snapshot.
 const HOLDING_SNAPSHOT_COLUMNS: &[&str] =
     &["snapshot_date", "is_deleted", "holding_security_id", "institution_price", "institution_value", "cost_basis", "quantity"];
 
-// R-W4, R-W6, R-T5, R-T9, R-Q1: budget Q-SNP-6, Q-SNP-10, Q-SNP-11, Q-SNP-12, Q-SNP-13, Q-SNP-14, Q-SNP-15,
-// Q-SNP-16; §1.16 (one row per entity and day; a write onto a tombstoned id revives it).
+// R-W4, R-W6, R-T5, R-T9, R-Q1: snapshots keep one row per entity and day; a write onto a tombstoned id revives it.
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_upserts_keep_one_row_per_day_and_revive_tombstones() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6734,8 +6731,8 @@ async fn snapshot_upserts_keep_one_row_per_day_and_revive_tombstones() -> DbResu
     let home = household(&db).await?;
     let write = |row: Data, allow: Option<&'static [&'static str]>| upsert(&db, "snapshots", row, allow, None);
 
-    // Q-SNP-10: the id is `<account>-<YYYYMMDD>`, so a second sync on
-    // the same day rewrites the day's row.
+    // The id is `<account>-<YYYYMMDD>`, so a second sync on the same day
+    // rewrites the day's row.
     let balance = |owner: Uuid, account: &'static str, at: &'static str, current: f64| {
         data! {
             "snapshot_id": "acc-1-20260305", "user_id": owner, "snapshot_date": at, "snapshot_type": "account_balance", "account_id": account,
@@ -6760,17 +6757,17 @@ async fn snapshot_upserts_keep_one_row_per_day_and_revive_tombstones() -> DbResu
         (home.alice, "acc-1".to_string(), dec("5"))
     );
 
-    // Q-SNP-14 deletes it; live reads no longer return it; the next
-    // sync's write brings it back, since `is_deleted` is on the list
-    // and the row always says `false`.
+    // A soft delete hides it from live reads; the next sync's write
+    // brings it back, since `is_deleted` is on the list and the row
+    // always says `false`.
     assert!(soft_delete(&db, "snapshots", "acc-1-20260305", Scope::Group(home.bob)).await?);
     assert!(!soft_delete(&db, "snapshots", "acc-1-20260305", Scope::Group(home.carol)).await?);
     assert!(db.query(find(Query::table("snapshots"), &Filters::new(Scope::Group(home.alice)))).await?.is_empty());
     let revived = write(balance(home.alice, "acc-1", "2026-03-05T22:00:00Z", 1300.0), Some(BALANCE_SNAPSHOT_COLUMNS)).await?.one()?;
     assert_eq!((revived.get::<Option<bool>>("is_deleted")?, revived.get::<Decimal>("balances_current")?), (Some(false), dec("1300")));
 
-    // Q-SNP-11: a security's price belongs to nobody, and its write does
-    // not name `is_deleted`: a deleted price row stays deleted.
+    // A security's price belongs to nobody, and its write does not name
+    // `is_deleted`: a deleted price row stays deleted.
     let price = |close: f64| {
         data! {
             "snapshot_id": "sec-1-20260305", "snapshot_date": "2026-03-05T00:00:00Z", "snapshot_type": "security", "security_id": "sec-1",
@@ -6790,8 +6787,8 @@ async fn snapshot_upserts_keep_one_row_per_day_and_revive_tombstones() -> DbResu
     assert!(find_one(&db, Query::table("snapshots").key(["sec-1-20260305"]), &Filters::new(Scope::Group(home.alice)).with_tombstones()).await?.is_none());
     assert!(find_one(&db, Query::table("snapshots").key(["sec-1-20260305"]), &Filters::new(Scope::Everyone).with_tombstones()).await?.is_some());
 
-    // Q-SNP-12: a holding's snapshot, with whichever amounts the sync
-    // has. A later write that has only the price leaves the others.
+    // A holding's snapshot, with whichever amounts the sync has. A later
+    // write that has only the price leaves the others.
     let holding = "holding-acc-1-sec-1-20260305";
     let base = |account: &'static str, at: &'static str| {
         data! {
@@ -6814,12 +6811,12 @@ async fn snapshot_upserts_keep_one_row_per_day_and_revive_tombstones() -> DbResu
     // account and security columns stay NULL.
     assert!(row.is_null("account_id")? && row.is_null("security_id")? && row.is_null("cost_basis")?);
 
-    // Q-SNP-6: one holding snapshot by id and kind, within the group.
+    // One holding snapshot by id and kind, within the group.
     let holding_kind = |viewer: Uuid| Filters::new(Scope::Group(viewer)).eq("snapshot_type", "holding");
     assert!(find_one(&db, Query::table("snapshots").key([holding]), &holding_kind(home.bob)).await?.is_some());
     assert!(find_one(&db, Query::table("snapshots").key([holding]), &holding_kind(home.carol)).await?.is_none());
     assert!(find_one(&db, Query::table("snapshots").key(["acc-1-20260305"]), &holding_kind(home.bob)).await?.is_none());
-    // Q-SNP-13: the fields a request named, patched within the group.
+    // The fields a request named, patched within the group.
     assert_eq!(update_status(&update(&db, "snapshots", holding, data! {"quantity": 12.5, "cost_basis": 2000}, Scope::Group(home.bob), vec![]).await?), 200);
     assert_eq!(update_status(&update(&db, "snapshots", holding, data! {"quantity": 0}, Scope::Group(home.carol), vec![]).await?), 304);
     let patched = stored(&db, "snapshots", holding).await?;
@@ -6828,8 +6825,8 @@ async fn snapshot_upserts_keep_one_row_per_day_and_revive_tombstones() -> DbResu
         (dec("12.5"), dec("2000"), dec("2501.23"))
     );
 
-    // Q-SNP-16: an account's snapshots go with it, through whichever
-    // column holds the account for their kind; Q-SNP-15 by id.
+    // An account's snapshots go with it, through whichever column holds the
+    // account for their kind; others are deleted by id.
     for (id, owner, kind, account) in [
         ("acc-2-20260305", home.alice, "account_balance", "acc-2"),
         ("holding-acc-2-sec-1-20260305", home.bob, "holding", "acc-2"),
@@ -6853,8 +6850,8 @@ async fn snapshot_upserts_keep_one_row_per_day_and_revive_tombstones() -> DbResu
     Ok(())
 }
 
-// R-Q9, R-Q11, R-Q4, R-Q8, R-Q6, R-T9, R-S4: budget Q-SNP-1, Q-SNP-2, Q-SNP-3, Q-SNP-7, Q-SNP-8, Q-SNP-9 and the
-// latest balance of each account; §2.14 (three chained keyset streams).
+// R-Q9, R-Q11, R-Q4, R-Q8, R-Q6, R-T9, R-S4: the latest balance of each account, the latest price of a security,
+// the prices written lately, and three chained keyset streams.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_latest_snapshot_is_read_per_account_and_per_security() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -6951,8 +6948,8 @@ async fn the_latest_snapshot_is_read_per_account_and_per_security() -> DbResult<
     assert_eq!(column::<Timestamp>(&per_account, "latest"), [ts("2026-03-03T06:00:00Z"), ts("2026-03-04T06:00:00Z")]);
     assert_eq!(column::<i64>(&per_account, "n"), [2, 2]);
 
-    // Q-SNP-8: the day of a security's latest live price. `MAX` over no
-    // rows is one row holding NULL; the app formats the instant in UTC.
+    // The day of a security's latest live price. `MAX` over no rows is one
+    // row holding NULL; the caller formats the instant in UTC.
     let latest_price_day = |security: &'static str| {
         let db = &db;
         async move {
@@ -6978,8 +6975,8 @@ async fn the_latest_snapshot_is_read_per_account_and_per_security() -> DbResult<
         .await?;
     assert_eq!(newest.expect("a live price").get::<String>("snapshot_id")?, "sec-1-20260304");
 
-    // Q-SNP-9: which of some securities had a price written in the last
-    // 22 hours, by the server's clock. Deleted rows count; a security
+    // Which of some securities had a price written in the last 22
+    // hours, by the server's clock. Deleted rows count; a security
     // written twice is listed once.
     let now = db.now().await?;
     backdate(&db, "snapshots", "sec-2-20260301", now.plus_secs(-23 * 3600)).await?;
@@ -6992,8 +6989,8 @@ async fn the_latest_snapshot_is_read_per_account_and_per_security() -> DbResult<
         .distinct();
     assert_eq!(texts_of(&db.query(recent).await?, "security_id"), ["sec-1", "sec-3"]);
 
-    // Q-SNP-7: the holding snapshots of one account for some securities,
-    // by time and then by id.
+    // The holding snapshots of one account for some securities, by time and
+    // then by id.
     let of_account = Query::table("snapshots")
         .index("idx_snapshots_holding_account_id", KeyRange::eq(["acc-a"]))
         .filter(col("user_id").in_list(sharing_user_ids(home.bob)))
@@ -7003,8 +7000,8 @@ async fn the_latest_snapshot_is_read_per_account_and_per_security() -> DbResult<
         .order_by(col("snapshot_id"));
     assert_eq!(texts_of(&db.query(of_account).await?, "snapshot_id"), ["hold-a-sec1-01", "hold-a-sec2-01", "hold-a-sec1-02"]);
 
-    // `GET /snapshots` chains three streams, each paged by id: the
-    // group's balances, the group's holding rows for its accounts, and
+    // A full read of the snapshots chains three streams, each paged by id:
+    // the group's balances, the group's holding rows for its accounts, and
     // the prices, which have no owner and are read without a scope.
     let group = Filters::new(Scope::Group(home.alice)).with_tombstones();
     let stream = |filters: Filters| {
@@ -7049,8 +7046,7 @@ async fn the_latest_snapshot_is_read_per_account_and_per_security() -> DbResult<
     Ok(())
 }
 
-// R-Q9, R-Q11, R-Q1, R-Q6, R-S4, R-T6: budget Q-SEC-1, Q-SEC-2, Q-SEC-3, Q-HLD-1, Q-HLD-2, Q-HLD-4, Q-HLD-6
-// (`SELECT DISTINCT s.*` over a join, which compares whole rows, JSON included).
+// R-Q9, R-Q11, R-Q1, R-Q6, R-S4, R-T6: `SELECT DISTINCT s.*` over a join, which compares whole rows, JSON included.
 #[tokio::test(flavor = "multi_thread")]
 async fn securities_behind_a_groups_holdings_are_distinct_whole_rows() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -7093,12 +7089,12 @@ async fn securities_behind_a_groups_holdings_are_distinct_whole_rows() -> DbResu
         )
         .await?;
     }
-    // Q-HLD-4: holdings deleted by id, within the group.
+    // Holdings deleted by id, within the group.
     assert_eq!(bulk_soft_delete(&db, "holdings", vec!["h3".into(), "h5".into(), "h6".into()], Scope::Group(home.alice)).await?, 2);
 
-    // Q-SEC-1: the securities any holding of the group points at, each
-    // once, as whole rows. Deleted holdings count on purpose: their
-    // history still needs the security.
+    // The securities any holding of the group points at, each once, as
+    // whole rows. Deleted holdings count on purpose: their history still
+    // needs the security.
     let held_by = |viewer: Uuid| {
         Query::table("securities").alias("s").join(
             Query::table("holdings")
@@ -7115,7 +7111,7 @@ async fn securities_behind_a_groups_holdings_are_distinct_whole_rows() -> DbResu
     assert_eq!(texts_of(&db.query(held_by(home.alice)).await?, "security_id"), ["sec-1", "sec-1", "sec-1", "sec-2", "sec-3"]);
     assert_eq!(texts_of(&db.query(held_by(home.carol).distinct()).await?, "security_id"), ["sec-3"]);
 
-    // Q-SEC-2: one by id, in a loop over the ids a caller has.
+    // One by id, in a loop over the ids a caller has.
     let mut names = Vec::new();
     for id in ["sec-2", "sec-9", "sec-4"] {
         if let Some(row) = find_one(&db, Query::table("securities").key([id]), &Filters::new(Scope::Everyone)).await? {
@@ -7124,9 +7120,9 @@ async fn securities_behind_a_groups_holdings_are_distinct_whole_rows() -> DbResu
     }
     assert_eq!(names, ["Total Bond", "International"]);
 
-    // Q-SEC-3: search by exact fields, newest first; the caller takes the
-    // first row, so the order decides between two rows of one ticker.
-    // The index keeps each ticker's rows by `updated`, descending.
+    // Search by exact fields, newest first; the caller takes the first row,
+    // so the order decides between two rows of one ticker. The index keeps
+    // each ticker's rows by `updated`, descending.
     let now = db.now().await?;
     backdate(&db, "securities", "sec-1", now.plus_secs(-7_200)).await?;
     backdate(&db, "securities", "sec-5", now.plus_secs(-3_600)).await?;
@@ -7147,7 +7143,7 @@ async fn securities_behind_a_groups_holdings_are_distinct_whole_rows() -> DbResu
     assert_eq!(texts_of(&searched, "security_id"), ["sec-1", "sec-5"]);
     assert_eq!(db.query(find(Query::table("securities"), &Filters::new(Scope::Everyone)).order_by(col("updated").desc())).await?.len(), 5);
 
-    // Q-HLD-1, Q-HLD-2: the group's live holdings, all or of some accounts.
+    // The group's live holdings, all or of some accounts.
     let group = Filters::new(Scope::Group(home.alice));
     assert_eq!(texts_of(&db.query(find(Query::table("holdings"), &group)).await?, "holding_id"), ["h1", "h2", "h4"]);
     let of_accounts = Query::table("holdings").index_ranges("idx_holdings_account_id", ["acc-a2", "acc-b", "acc-c"].map(|account| KeyRange::eq([account])));
@@ -7156,7 +7152,7 @@ async fn securities_behind_a_groups_holdings_are_distinct_whole_rows() -> DbResu
         texts_of(&db.query(find(Query::table("holdings"), &group.clone().any_of("account_id", ["acc-a2", "acc-b", "acc-c"]))).await?, "holding_id"),
         ["h2", "h4"]
     );
-    // Q-HLD-6: every security anyone still holds, for the price refresh.
+    // Every security anyone still holds, for the price refresh.
     let still_held = Query::table("holdings")
         .index("idx_holdings_security_id", KeyRange::all())
         .filter(live())
@@ -7167,10 +7163,9 @@ async fn securities_behind_a_groups_holdings_are_distinct_whole_rows() -> DbResu
     Ok(())
 }
 
-/// T19, a plan-statement import: the statement's rows in chunks of 1000
-/// that never overwrite (Q-INV-8), the fund mappings (Q-ACC-8), the old
-/// holding snapshots read and soft-deleted when replacing (Q-SNP-7,
-/// Q-SNP-15), the holdings (Q-HLD-3). Any failure fails the import.
+/// A plan-statement import: the statement's rows in chunks of 1000 that
+/// never overwrite, the fund mappings, the old holding snapshots read and
+/// soft-deleted when replacing, the holdings. Any failure fails the import.
 async fn import_plan_statement(
     db: &Client,
     owner: Uuid,
@@ -7208,8 +7203,7 @@ async fn import_plan_statement(
     .await
 }
 
-// R-W2, R-X1, R-X7, R-W5, R-T6, R-W11: budget T19 (Q-INV-8, Q-ACC-8, Q-SNP-7, Q-SNP-15, Q-HLD-3); §3.2 (a
-// transaction of thousands of statements' worth of rows, atomic).
+// R-W2, R-X1, R-X7, R-W5, R-T6, R-W11: a transaction of thousands of rows over many statements, atomic.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plan_statement_import_lands_whole_or_not_at_all() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -7301,11 +7295,11 @@ async fn a_plan_statement_import_lands_whole_or_not_at_all() -> DbResult<()> {
     Ok(())
 }
 
-/// Q-REJ-1: record that a category was rejected for a transaction, under
-/// the transaction's owner. The row to insert is selected from the
-/// transaction itself, so nothing is proposed for a transaction outside
-/// the viewer's group. An existing rejection is stamped again, unless it
-/// is recorded under someone else.
+/// Record that a category was rejected for a transaction, under the
+/// transaction's owner. The row to insert is selected from the transaction
+/// itself, so nothing is proposed for a transaction outside the viewer's
+/// group. An existing rejection is stamped again, unless it is recorded
+/// under someone else.
 fn record_rejection(viewer: Uuid, transaction: &str, category: Uuid) -> Insert {
     let proposed = Query::table("transactions")
         .alias("t")
@@ -7323,8 +7317,8 @@ fn record_rejection(viewer: Uuid, transaction: &str, category: Uuid) -> Insert {
         .returning(["transaction_id", "user_id", "category_id", "rejected_at"])
 }
 
-// R-W3, R-W4, R-W5, R-W10, R-S2, R-X1, R-Q4: budget Q-REJ-1, Q-REJ-2, Q-REJ-3, Q-REJ-4, Q-REJ-5, T9 (hardest
-// thing 4: `INSERT .. SELECT .. ON CONFLICT` on a composite primary key, with a conditional update).
+// R-W3, R-W4, R-W5, R-W10, R-S2, R-X1, R-Q4: `INSERT .. SELECT .. ON CONFLICT` on a composite primary key, with a
+// conditional update; rejections are listed, moved to another transaction and cleared.
 #[tokio::test(flavor = "multi_thread")]
 async fn rejections_are_recorded_under_the_transactions_owner_and_move_with_it() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -7382,8 +7376,8 @@ async fn rejections_are_recorded_under_the_transactions_owner_and_move_with_it()
     // logs it and moves on.
     assert_eq!(code(reject(home.alice, "pending-1", uuid(404)).await), ErrorCode::ForeignKeyViolation);
 
-    // Q-REJ-5: the rejections of some transactions, by transaction and
-    // then newest first.
+    // The rejections of some transactions, by transaction and then
+    // newest first.
     reject(home.alice, "pending-1", fun).await?;
     reject(home.alice, "posted-1", fun).await?;
     db.update(Update::table("rejected_categories").key([val("pending-1"), val(fun)]).set("rejected_at", ts("2001-06-01T00:00:00Z"))).await?;
@@ -7399,10 +7393,10 @@ async fn rejections_are_recorded_under_the_transactions_owner_and_move_with_it()
     assert_eq!(texts_of(&listed, "transaction_id"), ["pending-1", "pending-1", "posted-1"]);
     assert_eq!(column::<Uuid>(&listed, "category_id"), [food, fun, fun]);
 
-    // T9: the pending transaction was replaced by the posted one. Its
+    // The pending transaction was replaced by the posted one. Its
     // rejections are copied over, except the one the posted transaction
-    // already has, and the originals deleted, in one transaction. The
-    // count of rows copied is the function's answer.
+    // already has, and the originals deleted, in one transaction. The count
+    // of rows copied is the function's answer.
     reject(home.alice, "pending-1", fuel).await?;
     db.update(Update::table("rejected_categories").key([val("pending-1"), val(fuel)]).set("rejected_at", long_ago)).await?;
     let moved = db
@@ -7433,8 +7427,8 @@ async fn rejections_are_recorded_under_the_transactions_owner_and_move_with_it()
     assert_eq!(now_on_posted.first().unwrap().get::<Timestamp>("rejected_at")?, long_ago);
     assert!(db.query(Query::table("rejected_categories").range(KeyRange::eq(["pending-1"]))).await?.is_empty());
 
-    // Q-REJ-2: a rejection is cleared by the three of its columns, within
-    // the group; the row count is the answer.
+    // A rejection is cleared by the three of its columns, within the group;
+    // the row count is the answer.
     let clear = |viewer: Uuid, transaction: &'static str, category: Uuid| {
         db.delete(Delete::from("rejected_categories").key([val(transaction), val(category)]).filter(col("user_id").in_list(sharing_user_ids(viewer))))
     };
@@ -7447,11 +7441,11 @@ async fn rejections_are_recorded_under_the_transactions_owner_and_move_with_it()
     Ok(())
 }
 
-/// T3, `delete_item`: the item's accounts are read first, on the pool;
-/// then one transaction soft-deletes everything that hangs off those
-/// accounts, the pairs that name their transactions (after the
-/// transactions, which the order of the cascade depends on), the
-/// accounts and the item. The item's row count is the route's answer.
+/// Deleting an item: the item's accounts are read first, on the pool; then
+/// one transaction soft-deletes everything that hangs off those accounts,
+/// the pairs that name their transactions (after the transactions, which
+/// the order of the cascade depends on), the accounts and the item. The
+/// item's row count is the caller's answer.
 async fn delete_item(db: &Client, viewer: Uuid, item: &'static str) -> DbResult<u64> {
     let scope = Scope::Group(viewer);
     let accounts: Vec<String> = db
@@ -7479,8 +7473,7 @@ async fn delete_item(db: &Client, viewer: Uuid, item: &'static str) -> DbResult<
     .await
 }
 
-// R-X1, R-W6, R-Q10, R-Q6: budget T2, T3 (Q-TXN-21, Q-INV-12, Q-SPL-5, Q-SNP-16, Q-HLD-5, Q-PAR-8, Q-ACC-9,
-// Q-ITM-8, Q-ACC-3); §4.8 (item → accounts → everything under them).
+// R-X1, R-W6, R-Q10, R-Q6: a soft-delete cascade in one transaction: item → accounts → everything under them.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_an_item_soft_deletes_everything_under_its_accounts() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -7613,8 +7606,8 @@ async fn deleting_an_item_soft_deletes_everything_under_its_accounts() -> DbResu
     Ok(())
 }
 
-/// Budget's per-row write helpers swallow a failure and report it as
-/// that row's status, so one bad row does not stop a sync.
+/// A per-row write helper that swallows a failure and reports it as that
+/// row's status, so one bad row does not stop a sync.
 async fn upsert_status(db: &impl Db, table: &str, row: Data) -> u16 {
     match upsert(db, table, row, None, None).await {
         Ok(rows) => status(&rows),
@@ -7622,8 +7615,8 @@ async fn upsert_status(db: &impl Db, table: &str, row: Data) -> u16 {
     }
 }
 
-// R-X1, R-W11, R-X4: budget T18 (Q-TXN-15, Q-ITM-5), §3.1 ("a failed statement poisons the transaction"; when
-// every later error is swallowed too, the block reports success and stores nothing); hardest thing 3.
+// R-X1, R-W11, R-X4: a failed statement poisons the transaction: when every later error is swallowed too, nothing
+// is stored, and the commit says so.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_swallowed_statement_error_aborts_the_transaction_and_nothing_is_stored() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -7643,9 +7636,9 @@ async fn a_swallowed_statement_error_aborts_the_transaction_and_nothing_is_store
     assert_eq!(matching(&db, ann, val(true)).await?, ["s-1", "s-3", "s-4"]);
     bulk_hard_delete(&db, "transactions", vec!["s-1".into(), "s-3".into(), "s-4".into()]).await?;
 
-    // The same loop inside the SimpleFin sync's transaction. The second
-    // row fails and its error is swallowed as before; but from then on
-    // every statement is refused, each refusal swallowed in turn.
+    // The same loop inside a sync's transaction. The second row fails and
+    // its error is swallowed as before; but from then on every statement is
+    // refused, each refusal swallowed in turn.
     let tx = db.begin().await?;
     let mut statuses = Vec::new();
     for row in batch() {
@@ -7656,9 +7649,9 @@ async fn a_swallowed_statement_error_aborts_the_transaction_and_nothing_is_store
     assert_eq!(upsert_status(&tx, "items", data! {"item_id": "item-1", "user_id": ann, "cursor": "window-2"}).await, 500);
     assert_eq!(code(tx.query(Query::table("transactions")).await), ErrorCode::TransactionAborted);
     assert_eq!(code(tx.savepoint("too-late").await), ErrorCode::TransactionAborted);
-    // Postgres answered the `COMMIT` with a silent rollback. Here the
-    // commit says what happened; either way nothing was written, not
-    // even the row that had succeeded, and the window did not advance.
+    // Postgres answers the `COMMIT` with a silent rollback. Here the commit
+    // says what happened; either way nothing was written, not even the row
+    // that had succeeded, and the window did not advance.
     assert_eq!(code(tx.commit().await), ErrorCode::TransactionAborted);
     assert!(matching(&db, ann, val(true)).await?.is_empty());
     assert_eq!(stored(&db, "items", "item-1").await?.get::<String>("cursor")?, "window-1");
@@ -7696,9 +7689,8 @@ async fn a_swallowed_statement_error_aborts_the_transaction_and_nothing_is_store
     Ok(())
 }
 
-// R-S6, R-W10, R-W11, R-S2: budget §1.0 (the foreign-key summary), §4.8 (database cascades exist for an
-// operator deleting rows by hand; `RESTRICT` stops the rest; everything else that looks like a reference is
-// unenforced).
+// R-S6, R-W10, R-W11, R-S2: the foreign keys: database cascades exist for an operator deleting rows by hand;
+// `RESTRICT` stops the rest; everything else that looks like a reference is unenforced.
 #[tokio::test(flavor = "multi_thread")]
 async fn hard_deletes_cascade_from_transactions_categories_and_users_and_are_refused_elsewhere() -> DbResult<()> {
     let (_server, db) = fresh().await;
@@ -7726,8 +7718,8 @@ async fn hard_deletes_cascade_from_transactions_categories_and_users_and_are_ref
         db.insert(Insert::into("rejected_categories").set("transaction_id", transaction).set("user_id", home.alice).set("category_id", rejected)).await?;
     }
 
-    // `RESTRICT`: a parent with children cannot be deleted, whichever
-    // level it is on. The app never tries; it only ever soft-deletes.
+    // `RESTRICT`: a parent with children cannot be deleted, whichever level
+    // it is on. The application never tries; it only ever soft-deletes.
     assert_eq!(code(hard_delete(&db, "budgets", budget).await), ErrorCode::ForeignKeyViolation);
     assert_eq!(code(hard_delete(&db, "sections", section).await), ErrorCode::ForeignKeyViolation);
     assert_eq!(code(hard_delete(&db, "users", home.alice).await), ErrorCode::ForeignKeyViolation);
@@ -7746,7 +7738,7 @@ async fn hard_deletes_cascade_from_transactions_categories_and_users_and_are_ref
     // `CASCADE` from a user reaches their keys, membership, invitations
     // and rejections; a user who owns nothing else can be deleted.
     let dave = insert(&db, "users", data! {"username": "dave", "email": "dave@example.com"}, &[], false).await?.one()?.get::<Uuid>("user_id")?;
-    insert(&db, "api_keys", data! {"user_id": dave, "name": "key", "key_hash": "d".repeat(64), "key_prefix": "bk_d"}, &[], false).await?;
+    insert(&db, "api_keys", data! {"user_id": dave, "name": "key", "key_hash": "d".repeat(64), "key_prefix": "key_d"}, &[], false).await?;
     share(&db, uuid(0x7001), &[dave]).await?;
     invite(&db, dave, home.alice).await?;
     invite(&db, home.bob, dave).await?;
