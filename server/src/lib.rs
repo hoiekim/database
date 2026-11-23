@@ -74,6 +74,8 @@ pub(crate) struct State {
     pub connection_closed: Notify,
     /// Requests received, ever.
     pub requests: AtomicU64,
+    /// Each database's queue of writers (see `session::Turn`).
+    pub gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// A running server.
@@ -109,6 +111,7 @@ impl Server {
             open_connections: AtomicU64::new(0),
             connection_closed: Notify::new(),
             requests: AtomicU64::new(0),
+            gates: Mutex::new(HashMap::new()),
         });
         let (stop, stopping) = watch::channel(false);
         // While requests arrive, and once more after they stop, memory

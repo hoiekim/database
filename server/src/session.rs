@@ -9,6 +9,7 @@ use database_engine::db::{Database, ReadTxn, WriteTxn};
 use database_engine::dump::{self, Restore};
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::message::*;
+use database_protocol::query::{Access, Bound, InsertSource, Query};
 use database_protocol::time::now_micros;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -18,9 +19,14 @@ use tokio::sync::{mpsc, watch};
 use crate::access::{same, sha256};
 use crate::State;
 
+/// A writer's turn at a database: writers queue for it without holding
+/// a thread, and the one that has it finds the engine's own lock free.
+type Turn = tokio::sync::OwnedMutexGuard<()>;
+
 enum Txn {
     Read(ReadTxn),
-    Write(WriteTxn),
+    /// Dropped in this order: the transaction, then its turn.
+    Write(WriteTxn, Turn),
 }
 
 type RestoreTask = tokio::task::JoinHandle<DbResult<Vec<(String, Vec<u8>)>>>;
@@ -34,6 +40,8 @@ struct Session {
     database: Option<Arc<Database>>,
     admin: bool,
     txn: Option<Txn>,
+    /// The size of the request being answered.
+    request_bytes: usize,
     /// The named locks this connection holds.
     held: Vec<String>,
     restore: Option<(mpsc::Sender<Vec<u8>>, RestoreTask)>,
@@ -76,6 +84,10 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Vec<u8
     Ok(Some(frame))
 }
 
+/// How long a read may run on a thread that serves other connections
+/// too, before it is moved to one of its own.
+const QUICK: Duration = Duration::from_micros(250);
+
 /// The most a connection's sending buffer keeps between responses.
 const KEPT_BUFFER: usize = 256 * 1024;
 
@@ -98,7 +110,7 @@ async fn write_response(writer: &mut OwnedWriteHalf, buf: &mut Vec<u8>, response
 pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut stopping: watch::Receiver<bool>) {
     let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
-    let mut session = Session { id, state: state.clone(), name: String::new(), database: None, admin: false, txn: None, held: Vec::new(), restore: None };
+    let mut session = Session { id, state: state.clone(), name: String::new(), database: None, admin: false, txn: None, request_bytes: 0, held: Vec::new(), restore: None };
 
     // The greeting, within ten seconds.
     let hello = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut reader)).await;
@@ -121,7 +133,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
 
     loop {
         // A connection sitting on the write lock is given only so long.
-        let holding_writes = matches!(session.txn, Some(Txn::Write(_)));
+        let holding_writes = matches!(session.txn, Some(Txn::Write(..)));
         let patience = if holding_writes { state.config.idle_transaction } else { Duration::from_secs(u64::from(u32::MAX)) };
         let frame = tokio::select! {
             frame = tokio::time::timeout(patience, read_frame(&mut reader)) => frame,
@@ -134,6 +146,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
         state.requests.fetch_add(1, Ordering::Relaxed);
         let outcome = match decode_request(&frame) {
             Ok((request, timeout_ms)) => {
+                session.request_bytes = frame.len();
                 drop(frame);
                 let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
                 session.handle(request, deadline, &mut writer).await
@@ -164,25 +177,25 @@ fn run_in_txn(txn: &mut Txn, request: &Request, deadline: Option<Instant>) -> Db
         (Txn::Read(t), Request::Describe) => vec![Response::Tables(t.describe())],
         (Txn::Read(t), Request::Now) => vec![Response::Time(t.now())],
         (Txn::Read(_), _) => return Err(read_only()),
-        (Txn::Write(t), Request::Query(q)) => rows(t.query(q, deadline).map_err(|e| e.into_db())?),
-        (Txn::Write(t), Request::Insert(i)) => rows(t.insert(i, deadline).map_err(|e| e.into_db())?),
-        (Txn::Write(t), Request::Update(u)) => rows(t.update(u, deadline).map_err(|e| e.into_db())?),
-        (Txn::Write(t), Request::Delete(d)) => rows(t.delete(d, deadline).map_err(|e| e.into_db())?),
-        (Txn::Write(t), Request::Ddl(ddl)) => {
+        (Txn::Write(t, _), Request::Query(q)) => rows(t.query(q, deadline).map_err(|e| e.into_db())?),
+        (Txn::Write(t, _), Request::Insert(i)) => rows(t.insert(i, deadline).map_err(|e| e.into_db())?),
+        (Txn::Write(t, _), Request::Update(u)) => rows(t.update(u, deadline).map_err(|e| e.into_db())?),
+        (Txn::Write(t, _), Request::Delete(d)) => rows(t.delete(d, deadline).map_err(|e| e.into_db())?),
+        (Txn::Write(t, _), Request::Ddl(ddl)) => {
             t.ddl(ddl, deadline).map_err(|e| e.into_db())?;
             vec![Response::Ok]
         }
-        (Txn::Write(t), Request::Describe) => vec![Response::Tables(t.describe().map_err(|e| e.into_db())?)],
-        (Txn::Write(t), Request::Now) => vec![Response::Time(t.now())],
-        (Txn::Write(t), Request::Savepoint(name)) => {
+        (Txn::Write(t, _), Request::Describe) => vec![Response::Tables(t.describe().map_err(|e| e.into_db())?)],
+        (Txn::Write(t, _), Request::Now) => vec![Response::Time(t.now())],
+        (Txn::Write(t, _), Request::Savepoint(name)) => {
             t.savepoint(name).map_err(|e| e.into_db())?;
             vec![Response::Ok]
         }
-        (Txn::Write(t), Request::RollbackTo(name)) => {
+        (Txn::Write(t, _), Request::RollbackTo(name)) => {
             t.rollback_to(name).map_err(|e| e.into_db())?;
             vec![Response::Ok]
         }
-        (Txn::Write(t), Request::Release(name)) => {
+        (Txn::Write(t, _), Request::Release(name)) => {
             t.release(name).map_err(|e| e.into_db())?;
             vec![Response::Ok]
         }
@@ -190,20 +203,69 @@ fn run_in_txn(txn: &mut Txn, request: &Request, deadline: Option<Instant>) -> Db
     })
 }
 
-/// Runs one statement as its own transaction: a read on a snapshot, a
-/// write under the write lock, committed before it answers.
-fn run_alone(db: &Arc<Database>, request: &Request, deadline: Option<Instant>, lock_wait: Duration) -> DbResult<Vec<Response>> {
-    match request {
-        Request::Query(_) | Request::Describe => run_in_txn(&mut Txn::Read(db.begin_read()), request, deadline),
-        Request::Insert(_) | Request::Update(_) | Request::Delete(_) | Request::Ddl(_) => {
-            let mut txn = Txn::Write(db.begin_write(lock_wait, false).map_err(|e| e.into_db())?);
-            let responses = run_in_txn(&mut txn, request, deadline)?;
-            let Txn::Write(txn) = txn else { unreachable!() };
-            txn.commit().map_err(|e| e.into_db())?;
-            Ok(responses)
+fn is_write(request: &Request) -> bool {
+    matches!(request, Request::Insert(_) | Request::Update(_) | Request::Delete(_) | Request::Ddl(_))
+}
+
+/// Whether a statement is sure to be over in a moment, and so may run on
+/// a thread that serves other connections too: a few rows inserted, or
+/// rows updated by their keys, in a request of ordinary size. A delete is
+/// never counted so, for what it may take with it.
+fn brief(request: &Request, bytes: usize) -> bool {
+    let by_key = |q: &Query| {
+        q.joins.is_empty()
+            && matches!(&q.access, Access::Primary { ranges, .. }
+                if ranges.len() <= 8 && ranges.iter().all(|r| matches!((&r.lower, &r.upper), (Bound::Included(a), Bound::Included(b)) if a == b)))
+    };
+    bytes <= 64 * 1024
+        && match request {
+            Request::Insert(insert) => matches!(&insert.source, InsertSource::Values(rows) if rows.len() <= 8),
+            Request::Update(update) => by_key(&update.rows),
+            Request::Describe | Request::Now | Request::Savepoint(_) | Request::RollbackTo(_) | Request::Release(_) => true,
+            _ => false,
         }
-        _ => Err(DbError::invalid("that request needs a transaction")),
+}
+
+fn lock_timeout(wait: Duration) -> DbError {
+    DbError::new(ErrorCode::LockTimeout, format!("waited {wait:?} for the write lock"))
+}
+
+/// Takes the engine's write lock, which is free but for the moments a
+/// checkpoint or a check holds it: tried at once, and waited for on a
+/// thread of its own only then.
+async fn begin_write(db: &Arc<Database>, wait: Duration, interactive: bool) -> DbResult<WriteTxn> {
+    match db.begin_write(Duration::ZERO, interactive) {
+        Err(e) if matches!(&e, database_engine::error::Error::Db(e) if e.code == ErrorCode::LockTimeout) => {
+            let db = db.clone();
+            blocking(move || db.begin_write(wait, interactive)).await?.map_err(|e| e.into_db())
+        }
+        other => other.map_err(|e| e.into_db()),
     }
+}
+
+/// Waits, without holding a thread, until everything up to `version` is
+/// on disk and visible to readers.
+async fn durable(db: &Arc<Database>, version: u64) -> DbResult<()> {
+    let (tell, told) = tokio::sync::oneshot::channel();
+    let lead = db.when_durable(
+        version,
+        Box::new(move |outcome| {
+            let _ = tell.send(outcome);
+        }),
+    );
+    if lead {
+        // Nobody is syncing the log, so this thread does, once: in a
+        // quiet moment that is the whole of it, and the commit has not
+        // changed threads. If more commits came meanwhile, a thread of
+        // its own carries on for them.
+        if db.sync_waiters(1) {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || {
+                db.sync_waiters(usize::MAX);
+            });
+        }
+    }
+    told.await.map_err(|_| DbError::new(ErrorCode::Internal, "the commit's outcome was lost"))?
 }
 
 /// Hands a dump to the connection as it is produced.
@@ -278,15 +340,25 @@ impl Session {
                 let db = self.database()?;
                 self.txn = Some(if write {
                     let wait = Duration::from_millis(lock_wait_ms);
-                    Txn::Write(blocking(move || db.begin_write(wait, true)).await?.map_err(|e| e.into_db())?)
+                    let turn = self.turn(wait).await?;
+                    // It will show its owner what it reads before it
+                    // commits: all of that must be on disk first.
+                    durable(&db, db.latest_version()).await?;
+                    Txn::Write(begin_write(&db, wait, true).await?, turn)
                 } else {
                     Txn::Read(db.begin_read())
                 });
                 Ok(vec![Response::Ok])
             }
             Request::Commit => match self.txn.take() {
-                Some(Txn::Write(txn)) => {
-                    blocking(move || txn.commit()).await?.map_err(|e| e.into_db())?;
+                Some(Txn::Write(txn, turn)) => {
+                    let db = self.database()?;
+                    let committed = txn.commit_start().map_err(|e| e.into_db())?;
+                    // The next writer may start while this reaches the disk.
+                    drop(turn);
+                    if let Some(committed) = committed {
+                        durable(&db, committed.version()).await?;
+                    }
                     Ok(vec![Response::Ok])
                 }
                 Some(Txn::Read(_)) => Ok(vec![Response::Ok]),
@@ -308,23 +380,82 @@ impl Session {
             Request::Admin(admin) => self.admin(admin).await,
             statement => {
                 let db = self.database()?;
+                // A read is tried first on this thread, for a moment.
+                // Most take microseconds, and handing one to another
+                // thread would cost more than running it. One that proves
+                // long is begun again where it may take its time: a read
+                // changes nothing, so nothing is lost but the moment.
+                if let Request::Query(q) = &statement {
+                    let quick = Instant::now() + QUICK;
+                    if deadline.is_none_or(|d| d > quick) {
+                        let tried = match &mut self.txn {
+                            Some(Txn::Read(txn)) => txn.query_within(q, quick),
+                            Some(Txn::Write(txn, _)) => txn.query_within(q, quick),
+                            None => db.begin_read().query_within(q, quick),
+                        };
+                        if let Some(set) = tried.map_err(|e| e.into_db())? {
+                            return Ok(rows(set));
+                        }
+                    }
+                }
+                let brief = brief(&statement, self.request_bytes);
                 match self.txn.take() {
                     Some(mut txn) => {
-                        let (txn, result) = blocking(move || {
+                        let (txn, result) = if brief {
                             let result = run_in_txn(&mut txn, &statement, deadline);
                             (txn, result)
-                        })
-                        .await?;
+                        } else {
+                            blocking(move || {
+                                let result = run_in_txn(&mut txn, &statement, deadline);
+                                (txn, result)
+                            })
+                            .await?
+                        };
                         self.txn = Some(txn);
                         result
                     }
-                    None => {
-                        let lock_wait = self.state.config.lock_wait;
-                        blocking(move || run_alone(&db, &statement, deadline, lock_wait)).await?
+                    // A statement alone is its own transaction: a write
+                    // takes its turn, runs, and answers once it is on disk.
+                    None if is_write(&statement) => {
+                        let wait = self.state.config.lock_wait;
+                        let turn = self.turn(wait).await?;
+                        let mut txn = Txn::Write(begin_write(&db, wait, false).await?, turn);
+                        let (txn, result) = if brief {
+                            let result = run_in_txn(&mut txn, &statement, deadline);
+                            (txn, result)
+                        } else {
+                            blocking(move || {
+                                let result = run_in_txn(&mut txn, &statement, deadline);
+                                (txn, result)
+                            })
+                            .await?
+                        };
+                        let Txn::Write(txn, turn) = txn else { unreachable!() };
+                        let responses = match result {
+                            Ok(responses) => responses,
+                            Err(e) => {
+                                // Undone off this thread: it may have much to give back.
+                                blocking(move || drop(txn)).await?;
+                                return Err(e);
+                            }
+                        };
+                        let committed = txn.commit_start().map_err(|e| e.into_db())?;
+                        drop(turn);
+                        if let Some(committed) = committed {
+                            durable(&db, committed.version()).await?;
+                        }
+                        Ok(responses)
                     }
+                    None => blocking(move || run_in_txn(&mut Txn::Read(db.begin_read()), &statement, deadline)).await?,
                 }
             }
         }
+    }
+
+    /// Waits for this connection's turn to write to its database.
+    async fn turn(&self, wait: Duration) -> DbResult<Turn> {
+        let gate = self.state.gates.lock().unwrap().entry(self.name.clone()).or_default().clone();
+        tokio::time::timeout(wait, gate.lock_owned()).await.map_err(|_| lock_timeout(wait))
     }
 
     async fn lock(&mut self, name: String, wait: Duration) -> DbResult<Vec<Response>> {

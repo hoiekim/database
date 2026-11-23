@@ -83,6 +83,8 @@ pub struct Database {
     published: Mutex<Arc<Snapshot>>,
     /// Versions committed and not yet durable, oldest first.
     pending: Mutex<VecDeque<Arc<Snapshot>>>,
+    /// Commits whose owners asked to be told when they are durable.
+    waiters: Mutex<Waiters>,
     checkpointing: Mutex<()>,
     /// Set when the disk failed under a commit or a checkpoint. Nothing
     /// more is accepted: what is on disk is still consistent, and a
@@ -108,6 +110,37 @@ fn random_uuid() -> [u8; 16] {
         bytes[8..].copy_from_slice(&rng.next().to_le_bytes());
     }
     bytes
+}
+
+/// Called with a commit's fate, once, by whichever thread learns it.
+pub type Done = Box<dyn FnOnce(std::result::Result<(), DbError>) + Send>;
+
+struct Waiters {
+    list: Vec<(u64, Done)>,
+    /// Whether someone has taken on syncing the log for them.
+    syncing: bool,
+}
+
+/// A commit that is in the log, though perhaps not yet on disk. Readers
+/// cannot see it, and its owner must not be told of it, until `wait`
+/// returns or `Database::when_durable` calls back.
+#[must_use]
+pub struct Committed {
+    db: Arc<Database>,
+    version: u64,
+}
+
+impl Committed {
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Blocks until the commit is on disk and visible to every reader.
+    pub fn wait(self) -> Result<()> {
+        let synced = self.db.fatal(self.db.wal.sync_to(self.version))?;
+        self.db.publish_up_to(synced);
+        Ok(())
+    }
 }
 
 struct WriteGuard(Arc<Database>);
@@ -200,6 +233,7 @@ impl Database {
             latest: Mutex::new(snapshot.clone()),
             published: Mutex::new(snapshot),
             pending: Mutex::new(VecDeque::new()),
+            waiters: Mutex::new(Waiters { list: Vec::new(), syncing: false }),
             checkpointing: Mutex::new(()),
             failed: AtomicBool::new(false),
             options,
@@ -267,6 +301,72 @@ impl Database {
                 *published = snapshot;
             }
         }
+    }
+
+    /// The newest committed version, durable or not.
+    pub fn latest_version(&self) -> u64 {
+        self.latest.lock().unwrap().version
+    }
+
+    /// Arranges for `done` to be called once everything up to `version`
+    /// is on disk and visible to readers: at once if it already is.
+    ///
+    /// This is how a commit is awaited without holding a thread. Nothing
+    /// syncs the log on its own, so when this returns true the caller
+    /// has become the one to do it, and must call `sync_waiters`.
+    pub fn when_durable(&self, version: u64, done: Done) -> bool {
+        let mut waiters = self.waiters.lock().unwrap();
+        if self.published.lock().unwrap().version >= version {
+            drop(waiters);
+            done(Ok(()));
+            return false;
+        }
+        waiters.list.push((version, done));
+        !std::mem::replace(&mut waiters.syncing, true)
+    }
+
+    /// Syncs the log and tells the waiters it covered, up to `rounds`
+    /// times while some remain. Returns whether some still do: then the
+    /// caller must call this again (from a thread that may block for
+    /// long), for nobody else will.
+    pub fn sync_waiters(&self, rounds: usize) -> bool {
+        for _ in 0..rounds {
+            let target = {
+                let mut waiters = self.waiters.lock().unwrap();
+                match waiters.list.iter().map(|(version, _)| *version).max() {
+                    Some(target) => target,
+                    None => {
+                        waiters.syncing = false;
+                        return false;
+                    }
+                }
+            };
+            let outcome = self.fatal(self.wal.sync_to(target)).map_err(Error::into_db);
+            // Published first, then told: a waiter that arrives between
+            // the two finds its version published and is told at once.
+            if let Ok(synced) = &outcome {
+                self.publish_up_to(*synced);
+            }
+            let ready: Vec<(u64, Done)> = {
+                let mut waiters = self.waiters.lock().unwrap();
+                match &outcome {
+                    Ok(synced) => {
+                        let (ready, rest) = std::mem::take(&mut waiters.list).into_iter().partition(|(version, _)| version <= synced);
+                        waiters.list = rest;
+                        ready
+                    }
+                    Err(_) => std::mem::take(&mut waiters.list),
+                }
+            };
+            for (_, done) in ready {
+                done(outcome.clone().map(|_| ()));
+            }
+        }
+        let mut waiters = self.waiters.lock().unwrap();
+        if waiters.list.is_empty() {
+            waiters.syncing = false;
+        }
+        waiters.syncing
     }
 
     /// Starts a transaction that reads the newest durable version.
@@ -507,6 +607,16 @@ impl ReadTxn {
         exec::query(&ctx, q, &Scope::default())
     }
 
+    /// Tries a query for a moment: `None` if it has not finished by
+    /// `until`.
+    pub fn query_within(&self, q: &Query, until: Instant) -> Result<Option<RowSet>> {
+        match self.query(q, Some(until)) {
+            Ok(rows) => Ok(Some(rows)),
+            Err(Error::Db(e)) if e.code == ErrorCode::Timeout => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn describe(&self) -> Vec<TableDef> {
         self.snapshot.catalog.defs_in_order()
     }
@@ -576,6 +686,22 @@ impl WriteTxn {
         // A failed read changes nothing, but the caller may have acted on
         // an assumption it broke: fail the transaction as a write would.
         self.run(deadline, |tx| exec::query(&tx.ctx(), q, &Scope::default()))
+    }
+
+    /// Tries a query for a moment: `None` if it has not finished by
+    /// `until`. Nothing has changed then and the transaction has not
+    /// failed, so the caller may run the query again at leisure.
+    pub fn query_within(&mut self, q: &Query, until: Instant) -> Result<Option<RowSet>> {
+        let tx = self.tx()?;
+        tx.deadline = Some(until);
+        match exec::query(&tx.ctx(), q, &Scope::default()) {
+            Ok(rows) => Ok(Some(rows)),
+            Err(Error::Db(e)) if e.code == ErrorCode::Timeout => Ok(None),
+            Err(e) => {
+                self.failed = true;
+                Err(e)
+            }
+        }
     }
 
     pub fn insert(&mut self, ins: &Insert, deadline: Option<Instant>) -> Result<RowSet> {
@@ -651,7 +777,17 @@ impl WriteTxn {
 
     /// Commits. When this returns `Ok`, the changes are on disk and
     /// visible to every reader.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
+        match self.commit_start()? {
+            Some(committed) => committed.wait(),
+            None => Ok(()),
+        }
+    }
+
+    /// Commits as far as the log, and lets the next writer in. The
+    /// changes are final, but not yet on disk nor visible: see
+    /// `Committed`. `None` if the transaction wrote nothing.
+    pub fn commit_start(mut self) -> Result<Option<Committed>> {
         if self.failed {
             return Err(aborted());
         }
@@ -659,7 +795,7 @@ impl WriteTxn {
         let db = self.db.clone();
         if tx.writer.is_clean() && tx.log.buf.is_empty() {
             // Nothing was written: nothing to make durable.
-            return Ok(());
+            return Ok(None);
         }
         let version = self.base + 1;
         let Tx { writer, catalog, log, .. } = tx;
@@ -677,9 +813,7 @@ impl WriteTxn {
         db.commits_since_checkpoint.fetch_add(1, Ordering::Relaxed);
         // The next writer may start while this commit reaches the disk.
         self.guard.take();
-        let synced = db.fatal(db.wal.sync_to(version))?;
-        db.publish_up_to(synced);
-        Ok(())
+        Ok(Some(Committed { db, version }))
     }
 
     pub fn rollback(mut self) {

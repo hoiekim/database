@@ -13,8 +13,8 @@
 //!   index, in one place, and a search reads the pending rows as they are.
 //! - When enough are pending they become a **segment**: a small inverted
 //!   index of their own, in a tree of its own, written in key order.
-//! - When several segments of about one size have gathered they are
-//!   merged into one, which takes a single pass over each.
+//! - When four segments of about one size have gathered they are merged
+//!   into one, which takes a single pass over each.
 //!
 //! A search looks a word up in each segment, of which there are a few per
 //! size, and so a number that grows with the logarithm of the index.
@@ -51,7 +51,7 @@
 //! A score is how much a row matches a word: the word's count in each
 //! field times the field's weight, summed, in sixteenths.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use database_protocol::error::{DbError, ErrorCode};
@@ -82,6 +82,10 @@ pub fn set_pending_bytes(bytes: u64) {
     PENDING_BYTES.store(bytes, Ordering::Relaxed);
 }
 /// Segments are merged when this many of about one size have gathered.
+/// More would make writing cheaper in principle, as each entry is
+/// rewritten once per step of size, and searching dearer, as there are
+/// more segments to look in. Eight was tried: the bulk load in `bench/`
+/// was no faster for it, and searches were a little slower.
 const FANOUT: usize = 4;
 /// Sizes are told apart in steps of four times, from this many entries.
 const LEVEL_BASE: u64 = 8192;
@@ -471,15 +475,17 @@ fn flush<P: PagesMut>(p: &mut P, mut root: PageId, state: &mut State) -> Result<
         rows.push((pk.to_vec(), decode_words(stored)?));
         Ok(())
     })?;
-    // Every word's rows, word by word in key order, so that the segment's
-    // tree is written front to back.
+    // Every word's rows, gathered by word and then put in key order, so
+    // that the segment's tree is written front to back.
     let low = state.next;
-    let mut lists: BTreeMap<Vec<u8>, Vec<(u64, u32)>> = BTreeMap::new();
+    let mut by_word: HashMap<(&[u8], &str), Vec<(u64, u32)>> = HashMap::new();
     for (n, (_, words)) in rows.iter().enumerate() {
         for (term, score) in &words.terms {
-            lists.entry(word_key(&words.lead, term)).or_default().push((low + n as u64, *score));
+            by_word.entry((&words.lead, term)).or_default().push((low + n as u64, *score));
         }
     }
+    let mut lists: Vec<(Vec<u8>, Vec<(u64, u32)>)> = by_word.into_iter().map(|((lead, term), list)| (word_key(lead, term), list)).collect();
+    lists.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     btree::destroy(p, state.pending, &mut |_, _| Ok(()))?;
     state.pending = NO_PAGE;
     for (n, (pk, _)) in rows.iter().enumerate() {
@@ -832,6 +838,7 @@ mod tests {
     use super::*;
     use crate::btree::tests::MemPages;
     use crate::vfs::Rng;
+    use std::collections::BTreeMap;
 
     fn words(lead: u8, terms: &[(&str, u32)]) -> Words {
         let mut terms: Vec<(String, u32)> = terms.iter().map(|(t, s)| (t.to_string(), *s)).collect();
