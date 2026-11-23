@@ -1,0 +1,12 @@
+[package]
+name = "database-engine"
+description = "The storage engine: page file, write-ahead log, copy-on-write B+trees, tables and indexes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+database-protocol = { path = "../protocol" }
+crc32fast.workspace = true
+serde_json.workspace = true

@@ -1,1 +1,155 @@
 # database
+
+A small database server in Rust, for applications that would otherwise
+run a Postgres far larger than they need.
+
+It has no SQL. An application talks to it through a typed Rust client: a
+table, a query and a write are Rust values, and a query names the index
+it reads. That is what keeps it small: there is no parser, no planner
+and no optimizer, and the server does exactly what it is asked.
+
+```rust
+use database_client::*;
+
+let db = Client::connect_url("database://shop:secret@database:5454").await?;
+
+db.create_table_if_not_exists(
+    TableDef::new("mails")
+        .column(ColumnDef::new("mail_id", Type::Uuid).default_random_uuid())
+        .column(ColumnDef::new("user_id", Type::Uuid))
+        .column(ColumnDef::new("subject", Type::Text).default(""))
+        .column(ColumnDef::new("date", Type::Timestamp).default_now())
+        .column(ColumnDef::new("read", Type::Bool).default(false))
+        .primary_key(["mail_id"])
+        .index(IndexDef::new("mails_user_date").on(["user_id"]).on_desc("date").on(["mail_id"])),
+).await?;
+
+// The newest 50 mails of a user: 50 index entries read, 50 rows fetched.
+let page = db.query(
+    Query::table("mails").index("mails_user_date", KeyRange::eq([user_id])).limit(50),
+).await?;
+
+// Several statements as one: nothing else writes while this runs.
+db.transaction(|tx| async move {
+    let unread = tx.query_one(Query::table("mails").index("mails_user_date", KeyRange::eq([user_id]))
+        .select("n", count().filter(col("read").eq(false)))).await?.get::<i64>("n")?;
+    tx.update(Update::table("users").key([user_id]).set("unread", unread)).await?;
+    Ok::<_, DbError>(())
+}).await?;
+```
+
+## What it does
+
+- **What an ordinary web application asks of Postgres**, written down as
+  70 requirements (`docs/REQUIREMENTS.md`), each covered by tests that
+  cite it. Tables with defaults, checks and foreign keys; unique,
+  partial, expression and multi-valued indexes; joins, subqueries and
+  aggregates; upserts and compare-and-swap; JSON; exact decimals; trees;
+  full-text search with ranking and excerpts.
+- **ACID transactions.** A commit is on disk before the client hears of
+  it; a crash at any moment loses no acknowledged commit and keeps no
+  part of any other. Readers see a snapshot and never wait; one writer
+  runs at a time per database, so there are no row locks, no deadlocks
+  and nothing to retry.
+- **Backup and restore**, in place of `pg_dumpall`: `database dump`
+  streams every database from a consistent snapshot while the server
+  runs; `database restore` loads one, and changes nothing unless the
+  whole stream is good.
+- **Small.** One process, a 3 MB binary, 3 MB of memory when idle, a
+  page cache with a fixed budget, no background work when nothing
+  changes. Dependencies: an async runtime, a CRC, a JSON library.
+
+## What it does not
+
+SQL, a planner, stored functions, views, replication, TLS, parallel
+writers, regular expressions, collations. `docs/CLIENT.md` ends with the
+full list and what to do instead.
+
+## Compared with Postgres
+
+`bench/` runs hot paths common to web applications against this server
+and against Postgres 16 on the same data. Both sync every commit to
+disk; Postgres gets prepared statements and `shared_buffers=64MB`, this
+server its default 32 MB cache. One run on a 4-core machine:
+
+| | this | Postgres 16 |
+|---|---:|---:|
+| Memory idle | 3.3 MB | 46.3 MB |
+| Memory after the run | 99.4 MB | 155.0 MB |
+| CPU for the whole run | 90.0 s | 120.3 s |
+| Data files on disk | 626 MB | 1,152 MB |
+
+| Workload | this ÷ Postgres |
+|---|---:|
+| Count over 5,000 rows | 2.38× |
+| Full-text search | 2.28× |
+| Flag update by key | 2.06× |
+| Durable upsert (8 connections) | 1.07× |
+| Session lookup (16 connections) | 0.91× |
+| Session lookup (1 connection) | 0.89× |
+| Durable insert (16 connections) | 0.88× |
+| Durable insert (1 connection) | 0.82× |
+| Mailbox page: newest 50, with a preview of each body | 0.67× |
+| Unlogged upsert (8 connections) | 0.57× |
+| Bulk load of 100,000 mails | 0.39× |
+| Transaction of several requests (8 connections) | 0.32× |
+
+It uses less memory, CPU and disk, and is faster where it reads many
+rows, searches text or updates in place. It is within a fifth of
+Postgres, mostly just behind, on point lookups and durable writes. And
+it is well **behind** in four places, each a consequence of the design:
+
+- **A transaction of several requests** holds the database's one write
+  turn from `begin` to `commit`, round trips included.
+- **Unlogged upserts** from many connections queue for that same turn.
+- **A page of mails with a preview of each body** makes a second lookup
+  per mail, because large values live outside their rows.
+- **A bulk load** is one writer keeping a full-text index current at
+  every commit.
+
+`docs/PERFORMANCE.md` has the full table, what was traced and profiled
+to explain each gap, and the options for closing it with what each would
+cost.
+
+## Layout
+
+```text
+protocol/   values, expressions, queries, the wire format
+client/     the client applications depend on (`database-client`)
+engine/     pages, trees, the log, transactions, query execution
+server/     the server and the `database` command
+bench/      the benchmark above
+docs/       REQUIREMENTS.md   what the database has to do
+            CLIENT.md         the client's contract, and SQL-to-API
+            DESIGN.md         how it works and why
+            OPERATIONS.md     running it: settings, backup, restore
+            PERFORMANCE.md    measurements, their causes, and options
+```
+
+## Building and testing
+
+```sh
+cargo build --release          # target/release/database
+cargo test                     # everything: minutes to build, seconds to run
+CRASH_SEEDS=2000 cargo test -p database-engine --test recovery   # a longer hunt
+```
+
+The tests, by what they prove:
+
+| | |
+|---|---|
+| `server/tests/scenario_*.rs` | the requirements as four kinds of application use them (an identity service, a mail store, a document workspace, a personal-finance ledger), against a real server over TCP (236 tests) |
+| `server/tests/acid.rs` | atomicity, isolation, once-only races, savepoints, lock and statement timeouts |
+| `server/tests/durability.rs` | a server killed with `SIGKILL` under load, six times over, loses nothing acknowledged; memory stays bounded with data many times the cache |
+| `server/tests/operations.rs` | dump under load, restore, a damaged dump refused, passwords, restarts |
+| `engine/tests/recovery.rs` | a random workload on a simulated disk that loses power at any write, keeping, dropping or tearing each unsynced write; after every cut the database equals a model of what was committed |
+
+## Running
+
+```sh
+DATABASE_ADMIN_PASSWORD=... DATABASE_DATA=./data ./target/release/database serve
+DATABASE_ADMIN_PASSWORD=... DATABASE_PASSWORD=... ./target/release/database create shop
+```
+
+`docs/OPERATIONS.md` has the rest: the container image, backup and
+restore, memory.
