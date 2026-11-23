@@ -19,6 +19,13 @@
 //! pass for a record. Reading stops at the first record that does not
 //! check: that is the torn tail of a crash, and nothing after it was ever
 //! acknowledged.
+//!
+//! A file that grows with every record makes every sync slow: the file
+//! system must then commit the file's new length as well as its bytes,
+//! which here took four times as long as the bytes alone. So a busy log
+//! is grown ahead of its records, by zeros, in steps that double to a
+//! megabyte, and a record is then written over room the file already
+//! has. A record is never empty, so the zeros end the log for a reader.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -30,6 +37,11 @@ const MAGIC: &[u8; 8] = b"dbwal001";
 const HEADER_LEN: u64 = 36;
 /// No record is longer than this. A length beyond it is damage.
 const MAX_RECORD: u32 = 1 << 30;
+/// How far ahead of its records a log file is grown: nothing at first,
+/// so that a file which gets one record costs no more than the record,
+/// then from the least of these to the most, doubling.
+const GROW_LEAST: u64 = 16 * 1024;
+const GROW_MOST: u64 = 1024 * 1024;
 
 pub fn wal_path(dir: &Path, name: &str, generation: u64) -> PathBuf {
     dir.join(format!("{name}.wal-{generation:010}"))
@@ -62,6 +74,11 @@ struct Tail {
     file: Arc<dyn File>,
     generation: u64,
     offset: u64,
+    /// How long the file is: records are written before this where they
+    /// can be.
+    allocated: u64,
+    /// How far past a record the file is grown when next it must grow.
+    grow: u64,
     /// The newest version whose record is fully appended.
     appended: u64,
     /// The newest version that has a record at all.
@@ -102,7 +119,7 @@ impl Wal {
             dir: dir.to_path_buf(),
             name: name.to_string(),
             uuid,
-            tail: Mutex::new(Tail { file, generation, offset: HEADER_LEN, appended: version, last_record: version }),
+            tail: Mutex::new(Tail { file, generation, offset: HEADER_LEN, allocated: HEADER_LEN, grow: 0, appended: version, last_record: version }),
             synced: Mutex::new(Synced { version, syncing: false, failed: false }),
             wake: Condvar::new(),
             sync,
@@ -133,6 +150,7 @@ impl Wal {
     /// Appends the record that commits `version`. The caller holds the
     /// database's write lock, so appends never interleave.
     pub fn append(&self, version: u64, bytes: &[u8]) -> Result<()> {
+        debug_assert!(!bytes.is_empty(), "an empty record would read as the end of the log");
         if self.synced.lock().unwrap().failed {
             return Err(failed());
         }
@@ -141,11 +159,21 @@ impl Wal {
         frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         frame.extend_from_slice(&record_crc(tail.generation, tail.offset, bytes).to_le_bytes());
         frame.extend_from_slice(bytes);
-        if let Err(e) = tail.file.write_at(&frame, tail.offset) {
+        let end = tail.offset + frame.len() as u64;
+        let mut written = tail.file.write_at(&frame, tail.offset);
+        if written.is_ok() && end > tail.allocated {
+            // The file grew: grow it further, for the records to come.
+            if tail.grow > 0 {
+                written = tail.file.write_at(&vec![0u8; tail.grow as usize], end);
+            }
+            tail.allocated = end + tail.grow;
+            tail.grow = (tail.grow * 2).clamp(GROW_LEAST, GROW_MOST);
+        }
+        if let Err(e) = written {
             self.synced.lock().unwrap().failed = true;
             return Err(e.into());
         }
-        tail.offset += frame.len() as u64;
+        tail.offset = end;
         tail.appended = version;
         tail.last_record = version;
         Ok(())
@@ -220,6 +248,8 @@ impl Wal {
                 tail.file = file;
                 tail.generation = generation;
                 tail.offset = HEADER_LEN;
+                tail.allocated = HEADER_LEN;
+                tail.grow = 0;
                 Ok(generation)
             }
             Err(e) => {
@@ -277,7 +307,9 @@ pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation
         }
         let size = u32::from_le_bytes(prefix[..4].try_into().unwrap());
         let crc = u32::from_le_bytes(prefix[4..].try_into().unwrap());
-        if size > MAX_RECORD || offset + 8 + u64::from(size) > len {
+        // No record is empty: a length of zero is the room a file was
+        // grown by and not yet written over.
+        if size == 0 || size > MAX_RECORD || offset + 8 + u64::from(size) > len {
             return Ok(());
         }
         let mut bytes = vec![0u8; size as usize];
@@ -337,6 +369,38 @@ mod tests {
                 assert_eq!(r, &vec![i as u8 + 1; 600], "seed {seed}: records come back whole and in order");
             }
         }
+    }
+
+    #[test]
+    fn a_busy_log_is_grown_ahead_of_its_records() {
+        let vfs = MemVfs::new();
+        let wal = Wal::create(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 1, 0, true).unwrap();
+        let file = vfs.open(&wal_path(Path::new("/d"), "t", 1), false).unwrap();
+        // One record costs its own bytes and no more.
+        wal.append(1, &[1; 100]).unwrap();
+        assert_eq!(file.len().unwrap(), HEADER_LEN + 108);
+        // From the second on, the file is longer than what it holds, and
+        // its length changes for few of them.
+        let mut lengths = vec![file.len().unwrap()];
+        for v in 2..=3000u64 {
+            wal.append(v, &[v as u8; 700]).unwrap();
+            let len = file.len().unwrap();
+            assert!(len >= wal.size());
+            if len != *lengths.last().unwrap() {
+                lengths.push(len);
+            }
+        }
+        assert!(lengths.len() < 12, "the file changed length {} times", lengths.len());
+        wal.sync_to(3000).unwrap();
+        // The zeros beyond the last record end the log for a reader,
+        // before a crash and after one.
+        assert_eq!(records(&vfs, 1).len(), 3000);
+        assert_eq!(records(&vfs.crash_image(5), 1).len(), 3000);
+        // A new file starts small again.
+        wal.rotate().unwrap();
+        wal.append(3001, &[9; 10]).unwrap();
+        let next = vfs.open(&wal_path(Path::new("/d"), "t", 2), false).unwrap();
+        assert_eq!(next.len().unwrap(), HEADER_LEN + 18);
     }
 
     #[test]
