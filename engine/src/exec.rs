@@ -84,20 +84,38 @@ fn bound_prefix(ctx: &Ctx, scope: &Scope, exprs: &[Expr], parts: &KeyParts) -> R
 }
 
 /// A range as the first key to read and the first key not to: `None` for
-/// the tree's own ends. `Err(())`-like emptiness is `Ok(None)`.
+/// the tree's own ends. An empty range is `Ok(None)`.
 fn range_bytes(ctx: &Ctx, scope: &Scope, range: &KeyRange, parts: &KeyParts) -> Result<Option<(Option<Vec<u8>>, Option<Vec<u8>>)>> {
+    // The bytes of a bound, or `None` if it holds a NULL that is to
+    // match nothing, as a comparison with NULL does.
+    let prefix = |exprs: &[Expr]| -> Result<Option<Vec<u8>>> {
+        let values = exprs.iter().map(|e| eval(ctx, scope, e)).collect::<Result<Vec<_>>>()?;
+        if !range.nulls && values.iter().any(Value::is_null) {
+            return Ok(None);
+        }
+        encode_prefix(values, parts).map(Some)
+    };
     let start = match &range.lower {
         Bound::Unbounded => None,
-        Bound::Included(exprs) => Some(bound_prefix(ctx, scope, exprs, parts)?),
-        Bound::Excluded(exprs) => match keys::successor(&bound_prefix(ctx, scope, exprs, parts)?) {
+        Bound::Included(exprs) => match prefix(exprs)? {
+            Some(bytes) => Some(bytes),
+            None => return Ok(None),
+        },
+        Bound::Excluded(exprs) => match prefix(exprs)?.and_then(|bytes| keys::successor(&bytes)) {
             Some(next) => Some(next),
             None => return Ok(None),
         },
     };
     let end = match &range.upper {
         Bound::Unbounded => None,
-        Bound::Included(exprs) => keys::successor(&bound_prefix(ctx, scope, exprs, parts)?),
-        Bound::Excluded(exprs) => Some(bound_prefix(ctx, scope, exprs, parts)?),
+        Bound::Included(exprs) => match prefix(exprs)? {
+            Some(bytes) => keys::successor(&bytes),
+            None => return Ok(None),
+        },
+        Bound::Excluded(exprs) => match prefix(exprs)? {
+            Some(bytes) => Some(bytes),
+            None => return Ok(None),
+        },
     };
     if let (Some(s), Some(e)) = (&start, &end) {
         if s >= e {

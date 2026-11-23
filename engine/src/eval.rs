@@ -174,12 +174,13 @@ fn harmonize<'v>(a: &'v Value, b: &'v Value) -> Result<(Cow<'v, Value>, Cow<'v, 
             Value::Uuid(_) => Value::Uuid(parse_uuid(text).ok_or_else(|| bad("a uuid"))?),
             Value::Timestamp(_) => Value::Timestamp(time::parse_timestamp(text, 0).ok_or_else(|| bad("a timestamp"))?),
             Value::Date(_) => Value::Date(time::parse_date(text).ok_or_else(|| bad("a date"))?),
+            Value::Decimal(_) => Value::Decimal(text.trim().parse().map_err(|_| bad("a number"))?),
             _ => unreachable!(),
         })
     };
     Ok(match (a, b) {
-        (Value::Text(t), Value::Uuid(_) | Value::Timestamp(_) | Value::Date(_)) => (Cow::Owned(parse(t, b)?), Cow::Borrowed(b)),
-        (Value::Uuid(_) | Value::Timestamp(_) | Value::Date(_), Value::Text(t)) => (Cow::Borrowed(a), Cow::Owned(parse(t, a)?)),
+        (Value::Text(t), Value::Uuid(_) | Value::Timestamp(_) | Value::Date(_) | Value::Decimal(_)) => (Cow::Owned(parse(t, b)?), Cow::Borrowed(b)),
+        (Value::Uuid(_) | Value::Timestamp(_) | Value::Date(_) | Value::Decimal(_), Value::Text(t)) => (Cow::Borrowed(a), Cow::Owned(parse(t, a)?)),
         _ => (Cow::Borrowed(a), Cow::Borrowed(b)),
     })
 }

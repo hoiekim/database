@@ -616,12 +616,13 @@ fn put_ranges(w: &mut Writer, ranges: &[KeyRange]) {
     for range in ranges {
         put_bound(w, &range.lower);
         put_bound(w, &range.upper);
+        w.bool(range.nulls);
     }
 }
 
 fn get_ranges(r: &mut Reader) -> DbResult<Vec<KeyRange>> {
     let n = r.count()?;
-    (0..n).map(|_| Ok(KeyRange { lower: get_bound(r)?, upper: get_bound(r)? })).collect()
+    (0..n).map(|_| Ok(KeyRange { lower: get_bound(r)?, upper: get_bound(r)?, nulls: r.bool()? })).collect()
 }
 
 fn put_access(w: &mut Writer, a: &Access) {

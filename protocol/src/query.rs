@@ -113,10 +113,19 @@ pub enum Direction {
 /// `(user_id, date)`, the range from `Included([u])` to `Included([u])` is
 /// every entry of that user, and from `Excluded([u, d])` on is that user's
 /// and later users' entries after `d`.
+///
+/// A bound that holds a NULL names no key, as `= NULL` and `> NULL` are
+/// never true, so the range is empty: a missing value given as a key
+/// finds nothing instead of the rows whose key is missing. To read the
+/// rows whose key is NULL, say so with [`KeyRange::is`] or
+/// [`KeyRange::nulls`]. Keys that are NULL sort after all others, and a
+/// range open at its upper end runs through them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeyRange {
     pub lower: Bound,
     pub upper: Bound,
+    /// Whether a NULL in a bound stands for the keys that are NULL.
+    pub nulls: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,18 +141,32 @@ fn exprs<E: Into<Expr>>(values: impl IntoIterator<Item = E>) -> Vec<Expr> {
 
 impl KeyRange {
     pub fn all() -> KeyRange {
-        KeyRange { lower: Bound::Unbounded, upper: Bound::Unbounded }
+        KeyRange { lower: Bound::Unbounded, upper: Bound::Unbounded, nulls: false }
     }
 
     /// Every key that starts with these values. Given the whole key of a
     /// unique index, at most one row.
     pub fn eq<E: Into<Expr>>(prefix: impl IntoIterator<Item = E>) -> KeyRange {
         let prefix = exprs(prefix);
-        KeyRange { lower: Bound::Included(prefix.clone()), upper: Bound::Included(prefix) }
+        KeyRange { lower: Bound::Included(prefix.clone()), upper: Bound::Included(prefix), nulls: false }
+    }
+
+    /// Like [`KeyRange::eq`], but a NULL among the values finds the keys
+    /// that are NULL there: SQL's `IS NOT DISTINCT FROM`, and with a
+    /// literal NULL its `IS NULL`.
+    pub fn is<E: Into<Expr>>(prefix: impl IntoIterator<Item = E>) -> KeyRange {
+        KeyRange::eq(prefix).nulls()
     }
 
     pub fn new(lower: Bound, upper: Bound) -> KeyRange {
-        KeyRange { lower, upper }
+        KeyRange { lower, upper, nulls: false }
+    }
+
+    /// Makes a NULL in a bound stand for the keys that are NULL, instead
+    /// of emptying the range.
+    pub fn nulls(mut self) -> KeyRange {
+        self.nulls = true;
+        self
     }
 
     /// Keys starting with `prefix`, whose next part lies between the two
@@ -159,7 +182,7 @@ impl KeyRange {
             Bound::Included(rest) => Bound::Included(prefix.iter().cloned().chain(rest).collect()),
             Bound::Excluded(rest) => Bound::Excluded(prefix.iter().cloned().chain(rest).collect()),
         };
-        KeyRange { lower: extend(lower, false), upper: extend(upper, true) }
+        KeyRange { lower: extend(lower, false), upper: extend(upper, true), nulls: false }
     }
 }
 

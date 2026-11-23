@@ -762,7 +762,10 @@ impl Tx {
         if !table.indexes[i].def.unique {
             return Err(invalid(format!("index {target:?} is not unique, so nothing can conflict with it")));
         }
-        Ok(self.find_conflict(table, proposed, pk, Some(&[i]))?.map(|(_, holder)| holder))
+        // The proposed row is not stored, so whoever holds its key is in
+        // its way, the row with its own primary key included.
+        let _ = pk;
+        Ok(self.find_conflict(table, proposed, &[], Some(&[i]))?.map(|(_, holder)| holder))
     }
 
     /// The rows a query names for an update or delete, each once, in the
