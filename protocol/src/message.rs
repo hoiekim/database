@@ -401,7 +401,7 @@ pub fn decode_response(frame: &[u8]) -> DbResult<Response> {
             let n = r.varint()? as usize;
             // A row of no columns takes no bytes, so the count cannot be
             // checked against the frame; cap what is reserved up front.
-            let mut rows = Vec::with_capacity(n.min(r.remaining()));
+            let mut rows = Vec::with_capacity(n.min(crate::codec::RESERVE));
             for _ in 0..n {
                 let mut row = Vec::with_capacity(columns.len());
                 for _ in 0..columns.len() {
@@ -632,6 +632,28 @@ mod tests {
             let _ = decode_request(&bad);
             let _ = decode_response(&bad);
         }
+    }
+
+    #[test]
+    fn a_count_alone_never_sizes_an_allocation() {
+        // Find where a query's count of joins is written: the first byte
+        // that differs between no join and one.
+        let plain = encode_request(&Request::Query(Query::table("t")), 0);
+        let joined = encode_request(&Request::Query(Query::table("t").join(Query::table("u"))), 0);
+        let at = plain.iter().zip(&joined).position(|(a, b)| a != b).unwrap();
+        assert_eq!((plain[at], joined[at]), (0, 1));
+        // Claim two million joins, each of which would take 700 bytes in
+        // memory, over two megabytes of nothing. The count passes the
+        // check against the bytes left; the first join does not decode.
+        let mut frame = plain[..at].to_vec();
+        let mut count = crate::codec::Writer::new();
+        count.varint(2_000_000);
+        frame.extend_from_slice(&count.buf);
+        frame.extend(std::iter::repeat_n(0xEEu8, 2_100_000));
+        assert!(decode_request(&frame).is_err());
+        // Likewise rows that take no bytes at all.
+        let empty = encode_response(&Response::Rows { set: RowSet { columns: Vec::new(), rows: vec![Vec::new(); 3], affected: 3, total: None }, more: false });
+        assert!(matches!(decode_response(&empty), Ok(Response::Rows { set, .. }) if set.rows.len() == 3));
     }
 
     #[test]

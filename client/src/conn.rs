@@ -99,6 +99,13 @@ impl Conn {
     }
 
     async fn exchange(&mut self, request: &Request) -> DbResult<Response> {
+        // An earlier call that was abandoned midway (its future dropped
+        // by a timeout, say) left its answer unread on this connection:
+        // the next answer read would be that one. The connection is of
+        // no further use, and whatever transaction it carried is over.
+        if self.broken {
+            return Err(lost("an earlier request on this connection was abandoned before its answer was read"));
+        }
         self.send(request).await?;
         let mut merged: Option<RowSet> = None;
         loop {

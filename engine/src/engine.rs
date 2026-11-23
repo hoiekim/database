@@ -143,8 +143,8 @@ impl Engine {
         Ok(db)
     }
 
-    /// Removes a database and its files. Transactions still open on it
-    /// fail from here on.
+    /// Removes a database and its files. A transaction still open on it
+    /// fails at its next statement or at its commit.
     pub fn drop_database(&self, name: &str) -> Result<()> {
         let db = self.inner.dbs.lock().unwrap().remove(name).ok_or_else(|| Error::Db(DbError::not_found(format!("no database {name:?}"))))?;
         db.retire();

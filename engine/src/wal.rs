@@ -151,6 +151,14 @@ impl Wal {
     /// database's write lock, so appends never interleave.
     pub fn append(&self, version: u64, bytes: &[u8]) -> Result<()> {
         debug_assert!(!bytes.is_empty(), "an empty record would read as the end of the log");
+        // What a reader would take for damage must not be written: the
+        // commit fails here, whole, instead of being lost at recovery.
+        if bytes.len() > MAX_RECORD as usize {
+            return Err(Error::db(
+                database_protocol::error::ErrorCode::OutOfRange,
+                format!("the transaction's changes take {} bytes of log, and one transaction may take {MAX_RECORD}: commit it in parts", bytes.len()),
+            ));
+        }
         if self.synced.lock().unwrap().failed {
             return Err(failed());
         }
@@ -289,32 +297,58 @@ pub fn list_logs(vfs: &dyn Vfs, dir: &Path, name: &str) -> Result<Vec<u64>> {
     Ok(generations)
 }
 
+/// How the reading of a log file ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    /// At the end of what was written: the end of the file, or room the
+    /// file was grown by and never written over.
+    Clean,
+    /// At something that is not a whole record. In the newest file that
+    /// is the tail a crash tore, and nothing after it was acknowledged.
+    /// In any older file it is damage: the file was synced whole before
+    /// the next was begun.
+    Torn,
+}
+
 /// Reads one log file, calling `on_record` with each record that checks,
-/// in order. Stops quietly at the first that does not. A file whose
-/// header is missing, torn or of another data file holds nothing.
-pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+/// in order, and stops at the first that does not, saying how. A file
+/// whose header is missing or torn holds nothing and ends torn; a whole
+/// file of another data file holds nothing of this one's.
+pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<End> {
     let file = vfs.open(&wal_path(dir, name, generation), false)?;
     let len = file.len()?;
     let mut head = vec![0u8; HEADER_LEN as usize];
-    if len < HEADER_LEN || read_exact_at(&*file, &mut head, 0).is_err() || head != header(generation, uuid) {
-        return Ok(());
+    if len < HEADER_LEN || read_exact_at(&*file, &mut head, 0).is_err() {
+        return Ok(End::Torn);
+    }
+    if head != header(generation, uuid) {
+        // Whole, but another data file's: left from a database that had
+        // this name before. Anything else in a header's place is damage.
+        let whole = head[..8] == MAGIC[..] && crc32fast::hash(&head[..32]).to_le_bytes() == head[32..];
+        return Ok(if whole { End::Clean } else { End::Torn });
     }
     let mut offset = HEADER_LEN;
     loop {
+        if offset == len {
+            return Ok(End::Clean);
+        }
         let mut prefix = [0u8; 8];
         if offset + 8 > len || read_exact_at(&*file, &mut prefix, offset).is_err() {
-            return Ok(());
+            return Ok(End::Torn);
         }
         let size = u32::from_le_bytes(prefix[..4].try_into().unwrap());
         let crc = u32::from_le_bytes(prefix[4..].try_into().unwrap());
         // No record is empty: a length of zero is the room a file was
         // grown by and not yet written over.
-        if size == 0 || size > MAX_RECORD || offset + 8 + u64::from(size) > len {
-            return Ok(());
+        if size == 0 {
+            return Ok(if crc == 0 { End::Clean } else { End::Torn });
+        }
+        if size > MAX_RECORD || offset + 8 + u64::from(size) > len {
+            return Ok(End::Torn);
         }
         let mut bytes = vec![0u8; size as usize];
         if read_exact_at(&*file, &mut bytes, offset + 8).is_err() || record_crc(generation, offset, &bytes) != crc {
-            return Ok(());
+            return Ok(End::Torn);
         }
         on_record(&bytes)?;
         offset += 8 + u64::from(size);
@@ -401,6 +435,60 @@ mod tests {
         wal.append(3001, &[9; 10]).unwrap();
         let next = vfs.open(&wal_path(Path::new("/d"), "t", 2), false).unwrap();
         assert_eq!(next.len().unwrap(), HEADER_LEN + 18);
+    }
+
+    #[test]
+    fn a_reader_is_told_how_a_file_ended() {
+        let end = |vfs: &MemVfs| replay(vfs, Path::new("/d"), "t", &UUID, 1, &mut |_| Ok(())).unwrap();
+        let path = wal_path(Path::new("/d"), "t", 1);
+        let written = || {
+            let vfs = MemVfs::new();
+            let wal = Wal::create(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 1, 0, true).unwrap();
+            for v in 1..=5u64 {
+                wal.append(v, &[v as u8; 300]).unwrap();
+            }
+            wal.sync_to(5).unwrap();
+            vfs
+        };
+        // Whole, with the room it was grown by still zero after it.
+        let vfs = written();
+        assert!(vfs.open(&path, false).unwrap().len().unwrap() > HEADER_LEN + 5 * 308);
+        assert_eq!(end(&vfs), End::Clean);
+        // Cut exactly after a record: nothing says it was ever longer.
+        vfs.open(&path, false).unwrap().set_len(HEADER_LEN + 3 * 308).unwrap();
+        assert_eq!(end(&vfs), End::Clean);
+        // Cut inside a record, or inside the eight bytes before one.
+        vfs.open(&path, false).unwrap().set_len(HEADER_LEN + 2 * 308 + 100).unwrap();
+        assert_eq!(end(&vfs), End::Torn);
+        vfs.open(&path, false).unwrap().set_len(HEADER_LEN + 2 * 308 + 5).unwrap();
+        assert_eq!(end(&vfs), End::Torn);
+        // A record that no longer checks.
+        let vfs = written();
+        vfs.open(&path, false).unwrap().write_at(&[0xFF], HEADER_LEN + 308 + 50).unwrap();
+        assert_eq!(end(&vfs), End::Torn);
+        // A header that is not one.
+        let vfs = written();
+        vfs.open(&path, false).unwrap().write_at(&[0xFF; 4], 10).unwrap();
+        assert_eq!(end(&vfs), End::Torn);
+        // The whole log of another data file holds nothing of this one's,
+        // and is not damage: it is left from a database that had the
+        // name before.
+        let vfs = written();
+        assert_eq!(replay(&vfs, Path::new("/d"), "t", &[9; 16], 1, &mut |_| panic!("not its records")).unwrap(), End::Clean);
+    }
+
+    #[test]
+    fn a_record_too_long_to_read_back_is_not_written() {
+        let vfs = MemVfs::new();
+        let wal = Wal::create(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 1, 0, true).unwrap();
+        // Never touched, so the gigabyte costs no memory.
+        let huge = vec![0u8; MAX_RECORD as usize + 1];
+        assert!(matches!(wal.append(1, &huge), Err(Error::Db(e)) if e.code == database_protocol::error::ErrorCode::OutOfRange));
+        // The log is as it was, and takes the next commit.
+        assert_eq!(wal.size(), HEADER_LEN);
+        wal.append(1, &[7; 20]).unwrap();
+        assert_eq!(wal.sync_to(1).unwrap(), 1);
+        assert_eq!(records(&vfs, 1), [vec![7u8; 20]]);
     }
 
     #[test]

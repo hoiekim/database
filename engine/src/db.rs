@@ -139,7 +139,8 @@ impl Committed {
     pub fn wait(self) -> Result<()> {
         let synced = self.db.fatal(self.db.wal.sync_to(self.version))?;
         self.db.publish_up_to(synced);
-        Ok(())
+        // Synced into a file that was deleted meanwhile is not durable.
+        self.db.check_failed()
     }
 }
 
@@ -190,11 +191,23 @@ impl Database {
             tx.truncate(&table)?;
             changed = true;
         }
+        // A log file is synced whole before the next is begun, so only
+        // the newest can end in a torn record. Records in a file after
+        // one that ended torn mean commits were lost in between, and
+        // applying the later ones without them would give a database
+        // that never existed.
+        let mut torn: Option<u64> = None;
         for generation in &generations {
-            wal::replay(&*vfs, dir, name, &meta.uuid, *generation, &mut |record| {
+            let end = wal::replay(&*vfs, dir, name, &meta.uuid, *generation, &mut |record| {
+                if let Some(damaged) = torn {
+                    return Err(Error::corrupt(format!("log file {damaged} of database {name:?} is damaged before its end, and commits were made after it")));
+                }
                 changed = true;
                 tx.replay(record)
             })?;
+            if end == wal::End::Torn {
+                torn.get_or_insert(*generation);
+            }
         }
         let mut version = meta.version;
         let Tx { writer, catalog, .. } = tx;
@@ -270,6 +283,10 @@ impl Database {
     /// replaced.
     pub fn retire(&self) {
         self.failed.store(true, Ordering::Relaxed);
+        // A checkpoint already under way ends by deleting log files by
+        // name: it must be done before the name can be given to another
+        // database. None starts after this, the database having failed.
+        drop(self.checkpointing.lock().unwrap());
     }
 
     pub fn has_failed(&self) -> bool {
@@ -341,7 +358,7 @@ impl Database {
                     }
                 }
             };
-            let outcome = self.fatal(self.wal.sync_to(target)).map_err(Error::into_db);
+            let outcome = self.fatal(self.wal.sync_to(target)).and_then(|synced| self.check_failed().map(|()| synced)).map_err(Error::into_db);
             // Published first, then told: a waiter that arrives between
             // the two finds its version published and is told at once.
             if let Ok(synced) = &outcome {
@@ -778,10 +795,23 @@ impl WriteTxn {
     /// Commits. When this returns `Ok`, the changes are on disk and
     /// visible to every reader.
     pub fn commit(self) -> Result<()> {
+        let (db, base) = (self.db.clone(), self.base);
         match self.commit_start()? {
             Some(committed) => committed.wait(),
-            None => Ok(()),
+            // It wrote nothing, but what it read and may have answered
+            // from must be on disk before its owner is told anything.
+            None => {
+                let synced = db.fatal(db.wal.sync_to(base))?;
+                db.publish_up_to(synced);
+                db.check_failed()
+            }
         }
+    }
+
+    /// The version this transaction builds on: the newest committed when
+    /// it began, durable or not.
+    pub fn base(&self) -> u64 {
+        self.base
     }
 
     /// Commits as far as the log, and lets the next writer in. The
@@ -791,6 +821,8 @@ impl WriteTxn {
         if self.failed {
             return Err(aborted());
         }
+        // A database dropped or replaced meanwhile takes no more commits.
+        self.db.check_failed()?;
         let tx = self.tx.take().expect("present until the transaction ends");
         let db = self.db.clone();
         if tx.writer.is_clean() && tx.log.buf.is_empty() {

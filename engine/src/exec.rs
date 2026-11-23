@@ -40,8 +40,19 @@ pub struct Hit {
 /// The type and direction of each part of a key, for reading bounds.
 pub type KeyParts = Vec<(Option<Type>, bool)>;
 
+/// The type a key value or a bound is read as. A decimal is read as a
+/// decimal but not rounded to its column's scale: a stored value is at
+/// that scale already, and a bound must keep its digits, or `= 1.005`
+/// would find the row that holds 1.01.
+fn key_type(ty: &Type) -> Type {
+    match ty {
+        Type::Decimal(_) => Type::Decimal(None),
+        other => other.clone(),
+    }
+}
+
 pub fn pk_parts(table: &Table) -> KeyParts {
-    table.pk.iter().map(|i| (Some(table.cols[*i].def.ty.clone()), false)).collect()
+    table.pk.iter().map(|i| (Some(key_type(&table.cols[*i].def.ty)), false)).collect()
 }
 
 /// An index's keys followed by the primary key, which every entry ends
@@ -52,8 +63,15 @@ pub fn index_parts(table: &Table, index: usize) -> KeyParts {
         .keys
         .iter()
         .map(|key| {
+            // A plain column's type is known; so is the type of each
+            // item of a list column. An expression's is not, and its
+            // bounds are taken as they are given.
             let ty = match &key.expr {
-                Expr::Column(None, name) if !key.each => table.by_name.get(name).map(|i| table.cols[*i].def.ty.clone()),
+                Expr::Column(None, name) => table.by_name.get(name).and_then(|i| match (&table.cols[*i].def.ty, key.each) {
+                    (Type::List(item), true) => Some(key_type(item)),
+                    (_, true) => None,
+                    (ty, false) => Some(key_type(ty)),
+                }),
                 _ => None,
             };
             (ty, key.desc)
@@ -421,13 +439,16 @@ fn join_level(ctx: &Ctx, q: &Query, level: usize, scope: &Scope, base: &Hit, sto
     }
     let mut matches = 0u64;
     let full = Cell::new(false);
-    for_each_match(ctx, inner, scope, &full, &mut |joined, _| {
-        matches += 1;
-        join_level(ctx, q, level + 1, joined, base, stopped, f)?;
-        // Stop this join's read when the whole query is done, or when
-        // the join has given as many rows as it was asked for.
-        Ok(!stopped.get() && inner.limit.is_none_or(|limit| matches < limit))
-    })?;
+    // A join limited to no rows matches none: nothing is read for it.
+    if inner.limit != Some(0) {
+        for_each_match(ctx, inner, scope, &full, &mut |joined, _| {
+            matches += 1;
+            join_level(ctx, q, level + 1, joined, base, stopped, f)?;
+            // Stop this join's read when the whole query is done, or when
+            // the join has given as many rows as it was asked for.
+            Ok(!stopped.get() && inner.limit.is_none_or(|limit| matches < limit))
+        })?;
+    }
     if matches == 0 && join.kind == JoinKind::Left && !stopped.get() {
         let table = ctx.catalog.table(&inner.table)?.clone();
         let frame = [Frame { alias: inner.alias.as_deref().unwrap_or(&table.name), table: &table, row: None }];

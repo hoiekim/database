@@ -196,6 +196,16 @@ impl TableDef {
         self
     }
 
+    /// A foreign key to columns other than the primary key: they must be
+    /// the columns of a unique index of `ref_table`.
+    pub fn foreign_key_to<S: AsRef<str>, R: AsRef<str>>(mut self, columns: impl IntoIterator<Item = S>, ref_table: &str, ref_columns: impl IntoIterator<Item = R>, on_delete: OnDelete) -> TableDef {
+        let columns: Vec<String> = columns.into_iter().map(|c| c.as_ref().to_string()).collect();
+        let ref_columns: Vec<String> = ref_columns.into_iter().map(|c| c.as_ref().to_string()).collect();
+        let name = format!("{}_{}_fkey", self.name, columns.join("_"));
+        self.foreign_keys.push(ForeignKey { name, columns, ref_table: ref_table.to_string(), ref_columns, on_delete });
+        self
+    }
+
     pub fn check(mut self, name: &str, expr: Expr) -> TableDef {
         self.checks.push(Check { name: name.to_string(), expr });
         self

@@ -66,7 +66,7 @@ impl Config {
         for pair in query.split('&').filter(|p| !p.is_empty()) {
             let (key, value) = pair.split_once('=').ok_or_else(|| bad("a setting without a value"))?;
             let value = decode(value)?;
-            let seconds = || value.parse::<f64>().map(Duration::from_secs_f64).map_err(|_| bad("a time that is not a number"));
+            let seconds = || value.parse::<f64>().ok().and_then(|s| Duration::try_from_secs_f64(s).ok()).ok_or_else(|| bad("a time that is not a number of seconds"));
             match key {
                 "pool" => config.pool_size = value.parse().ok().filter(|n| *n > 0).ok_or_else(|| bad("pool must be a positive number"))?,
                 "connect_timeout" => config.connect_timeout = seconds()?,
@@ -113,7 +113,7 @@ mod tests {
         let admin = Config::from_url("database://adminpw@localhost").unwrap();
         assert_eq!((admin.database.as_str(), admin.password.as_str()), ("", "adminpw"));
 
-        for bad in ["postgres://a:b@h/d", "database://nohost", "database://a:b@:1/d", "database://a:b@h:x/d", "database://a:b@h/d?pool=0", "database://a:b@h/d?what=1", "database://a:%zz@h/d"] {
+        for bad in ["database://a:b@h/d?statement_timeout=-1", "database://a:b@h/d?lock_wait=NaN", "database://a:b@h/d?connect_timeout=1e400", "postgres://a:b@h/d", "database://nohost", "database://a:b@:1/d", "database://a:b@h:x/d", "database://a:b@h/d?pool=0", "database://a:b@h/d?what=1", "database://a:%zz@h/d"] {
             assert!(Config::from_url(bad).is_err(), "{bad}");
         }
     }

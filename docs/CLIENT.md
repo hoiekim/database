@@ -71,6 +71,13 @@ db.create_table_if_not_exists(
   changes can run inside a transaction and roll back with it.
 - The primary key's columns cannot be changed by an update: delete the
   row and insert it again.
+- `foreign_key(cols, table, on_delete)` points at the other table's
+  primary key; `foreign_key_to(cols, table, their_cols, on_delete)` at
+  the columns of one of its unique indexes. A key that rows point at
+  cannot be changed while they do, and a table whose rows survive a
+  restart cannot point at a `volatile()` one.
+- JSON may nest 100 levels deep, whether it comes from the client or is
+  built by an expression.
 
 ## Reading
 

@@ -63,7 +63,11 @@ async fn blocking<T>(f: impl FnOnce() -> T) -> DbResult<T> {
     Ok(tokio::task::block_in_place(f))
 }
 
-async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Vec<u8>>> {
+/// The largest frame taken from a connection that has not yet said who
+/// it is: room for a greeting and little else.
+const GREETING_FRAME: usize = 16 * 1024;
+
+async fn read_frame(reader: &mut OwnedReadHalf, largest: usize) -> std::io::Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match reader.read_exact(&mut len).await {
         Ok(_) => {}
@@ -71,7 +75,7 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Vec<u8
         Err(e) => return Err(e),
     }
     let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_FRAME {
+    if len > largest {
         return Err(std::io::Error::other("frame larger than allowed"));
     }
     // Room for an ordinary request at once; beyond that, grown as the
@@ -88,6 +92,14 @@ async fn read_frame(reader: &mut OwnedReadHalf) -> std::io::Result<Option<Vec<u8
 /// too, before it is moved to one of its own.
 const QUICK: Duration = Duration::from_micros(250);
 
+/// How many times longer than a writing transaction a reading one may
+/// sit idle before its connection is closed.
+const IDLE_READ_FACTOR: u32 = 10;
+
+/// How long one frame may take to send. A client that has stopped
+/// reading would otherwise hold a dump's snapshot, or a result, for ever.
+const SEND_PATIENCE: Duration = Duration::from_secs(300);
+
 /// The most a connection's sending buffer keeps between responses.
 const KEPT_BUFFER: usize = 256 * 1024;
 
@@ -100,7 +112,10 @@ async fn write_response(writer: &mut OwnedWriteHalf, buf: &mut Vec<u8>, response
     let mut frame = encode_response_onto(frame, response);
     let len = (frame.len() - 4) as u32;
     frame[..4].copy_from_slice(&len.to_le_bytes());
-    let sent = writer.write_all(&frame).await;
+    let sent = match tokio::time::timeout(SEND_PATIENCE, writer.write_all(&frame)).await {
+        Ok(sent) => sent,
+        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+    };
     if frame.capacity() <= KEPT_BUFFER {
         *buf = frame;
     }
@@ -113,7 +128,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
     let mut session = Session { id, state: state.clone(), name: String::new(), database: None, admin: false, txn: None, request_bytes: 0, held: Vec::new(), restore: None };
 
     // The greeting, within ten seconds.
-    let hello = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut reader)).await;
+    let hello = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut reader, GREETING_FRAME)).await;
     let greeted = match hello {
         Ok(Ok(Some(frame))) => match decode_request(&frame) {
             Ok((Request::Hello { version, database, password, .. }, _)) => session.greet(version, database, &password),
@@ -133,10 +148,15 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
 
     loop {
         // A connection sitting on the write lock is given only so long.
-        let holding_writes = matches!(session.txn, Some(Txn::Write(..)));
-        let patience = if holding_writes { state.config.idle_transaction } else { Duration::from_secs(u64::from(u32::MAX)) };
+        // One sitting on a snapshot is given longer, but not for ever:
+        // while it is held, no page freed since can be used again.
+        let patience = match session.txn {
+            Some(Txn::Write(..)) => state.config.idle_transaction,
+            Some(Txn::Read(_)) => state.config.idle_transaction.saturating_mul(IDLE_READ_FACTOR),
+            None => Duration::from_secs(u64::from(u32::MAX)),
+        };
         let frame = tokio::select! {
-            frame = tokio::time::timeout(patience, read_frame(&mut reader)) => frame,
+            frame = tokio::time::timeout(patience, read_frame(&mut reader, MAX_FRAME)) => frame,
             _ = stopping.changed() => break,
         };
         let frame = match frame {
@@ -162,7 +182,6 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
             break;
         }
     }
-    session.end();
 }
 
 fn rows(set: RowSet) -> Vec<Response> {
@@ -289,6 +308,12 @@ impl Write for ChunkWriter {
             self.out.blocking_send(std::mem::take(&mut self.buffer)).map_err(|_| std::io::Error::other("the client went away"))?;
         }
         Ok(())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -431,19 +456,24 @@ impl Session {
                             .await?
                         };
                         let Txn::Write(txn, turn) = txn else { unreachable!() };
+                        // What the statement read may be a commit still on
+                        // its way to the disk. Whatever it answers (rows, no
+                        // rows, an error such as a key already taken) rests
+                        // on that commit, so it waits for it like its own.
+                        let base = txn.base();
                         let responses = match result {
                             Ok(responses) => responses,
                             Err(e) => {
                                 // Undone off this thread: it may have much to give back.
                                 blocking(move || drop(txn)).await?;
+                                drop(turn);
+                                durable(&db, base).await?;
                                 return Err(e);
                             }
                         };
                         let committed = txn.commit_start().map_err(|e| e.into_db())?;
                         drop(turn);
-                        if let Some(committed) = committed {
-                            durable(&db, committed.version()).await?;
-                        }
+                        durable(&db, committed.map_or(base, |c| c.version())).await?;
                         Ok(responses)
                     }
                     None => blocking(move || run_in_txn(&mut Txn::Read(db.begin_read()), &statement, deadline)).await?,
@@ -493,7 +523,9 @@ impl Session {
         }
     }
 
-    /// Releases what the connection held when it ends.
+    /// Releases what the connection held when it ends. Called as the
+    /// session is dropped, so that it also runs if the task serving the
+    /// connection panics.
     fn end(&mut self) {
         // An open transaction rolls back as it is dropped.
         if let Some(txn) = self.txn.take() {
@@ -613,6 +645,14 @@ impl Session {
             return Ok(vec![Response::Error(admin_only())]);
         }
         let names = if own && !self.admin || (databases.is_empty() && self.database.is_some()) { vec![self.name.clone()] } else { databases };
+        // The connection's own database must still be the one it signed
+        // in to: a database restored over it since has another password,
+        // which this connection never gave.
+        if self.database.is_some() {
+            if let Err(e) = self.database() {
+                return Ok(vec![Response::Error(e)]);
+            }
+        }
         let state = self.state.clone();
         let (out, mut chunks) = mpsc::channel::<Vec<u8>>(4);
         let task = tokio::task::spawn_blocking(move || {

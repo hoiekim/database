@@ -7,6 +7,8 @@ use std::str::FromStr;
 
 /// The most digits kept after the point.
 pub const MAX_SCALE: u8 = 30;
+/// The most digits of a number read from text that are kept in all.
+const MAX_DIGITS: usize = 37;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Decimal {
@@ -78,19 +80,30 @@ impl Decimal {
         // a/10^sa ÷ b/10^sb = (a × 10^(scale + sb − sa)) / b, over 10^scale.
         let shift = i32::from(scale) + i32::from(other.scale) - i32::from(self.scale);
         let numerator = self.mantissa.checked_mul(pow10(shift as u32)?)?;
-        let (q, r) = (numerator / other.mantissa, numerator % other.mantissa);
+        // Checked: the least 128-bit number divided by -1 does not fit.
+        let (q, r) = (numerator.checked_div(other.mantissa)?, numerator.checked_rem(other.mantissa)?);
         // Round half away from zero.
         let round_up = r.unsigned_abs() * 2 >= other.mantissa.unsigned_abs();
         let sign = if (numerator < 0) != (other.mantissa < 0) { -1 } else { 1 };
         Some(Decimal { mantissa: if round_up { q + sign } else { q }, scale }.trimmed())
     }
 
+    /// `None` for the one number whose negation does not fit.
+    pub fn checked_neg(&self) -> Option<Decimal> {
+        Some(Decimal { mantissa: self.mantissa.checked_neg()?, scale: self.scale })
+    }
+
+    pub fn checked_abs(&self) -> Option<Decimal> {
+        Some(Decimal { mantissa: self.mantissa.checked_abs()?, scale: self.scale })
+    }
+
+    /// The negation, or the largest number if it does not fit.
     pub fn neg(&self) -> Decimal {
-        Decimal { mantissa: -self.mantissa, scale: self.scale }
+        self.checked_neg().unwrap_or(Decimal { mantissa: i128::MAX, scale: self.scale })
     }
 
     pub fn abs(&self) -> Decimal {
-        Decimal { mantissa: self.mantissa.abs(), scale: self.scale }
+        self.checked_abs().unwrap_or(Decimal { mantissa: i128::MAX, scale: self.scale })
     }
 
     /// Rounds to `scale` digits after the point, halves away from zero.
@@ -238,12 +251,24 @@ impl FromStr for Decimal {
         if whole.is_empty() && fraction.is_empty() {
             return Err(ParseDecimalError);
         }
+        if !whole.bytes().chain(fraction.bytes()).all(|c| c.is_ascii_digit()) {
+            return Err(ParseDecimalError);
+        }
+        // More digits after the point than can be kept are rounded away,
+        // halves away from zero, rather than refused: only a whole part
+        // too large is out of range.
+        let significant = whole.trim_start_matches('0').len();
+        let room = (MAX_DIGITS.saturating_sub(significant)).min(usize::from(MAX_SCALE));
+        let (fraction, round_up) = match fraction.as_bytes().get(room) {
+            Some(next) => (&fraction[..room], *next >= b'5'),
+            None => (fraction, false),
+        };
         let mut mantissa: i128 = 0;
         for c in whole.bytes().chain(fraction.bytes()) {
-            if !c.is_ascii_digit() {
-                return Err(ParseDecimalError);
-            }
             mantissa = mantissa.checked_mul(10).and_then(|m| m.checked_add(i128::from(c - b'0'))).ok_or(ParseDecimalError)?;
+        }
+        if round_up {
+            mantissa = mantissa.checked_add(1).ok_or(ParseDecimalError)?;
         }
         let mut scale = fraction.len() as i32 - exponent;
         if scale < 0 {
@@ -275,6 +300,28 @@ mod tests {
         for bad in ["", ".", "-", "1.2.3", "abc", "1e", "0x10"] {
             assert!(bad.parse::<Decimal>().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_edges_of_128_bits_are_errors_not_panics() {
+        let least = Decimal::new(i128::MIN, 0);
+        assert!(least.checked_div(&d("-1")).is_none());
+        assert!(least.checked_neg().is_none() && least.checked_abs().is_none());
+        assert_eq!(least.neg().mantissa(), i128::MAX);
+        assert!(Decimal::new(i128::MAX, 0).checked_add(&d("1")).is_none());
+        assert!(d("1").checked_div(&d("0")).is_none());
+    }
+
+    #[test]
+    fn digits_beyond_what_fits_are_rounded_away() {
+        // Forty digits after the point: kept to thirty, rounded.
+        assert_eq!("0.1234567890123456789012345678905555555555".parse::<Decimal>().unwrap().to_string(), "0.123456789012345678901234567891");
+        assert_eq!("-2.00000000000000000000000000000049".parse::<Decimal>().unwrap(), d("-2"));
+        // A long whole part leaves less room after the point.
+        let long: Decimal = "12345678901234567890123456789012345.123456".parse().unwrap();
+        assert_eq!(long.to_string(), "12345678901234567890123456789012345.12");
+        // A whole part too long for 128 bits is still refused.
+        assert!("1234567890123456789012345678901234567890".parse::<Decimal>().is_err());
     }
 
     #[test]

@@ -469,6 +469,42 @@ impl Tx {
         Ok(())
     }
 
+    /// Refuses a change to a key that rows of another table point at. A
+    /// foreign key may name a unique index instead of the primary key, and
+    /// those columns, unlike a primary key's, can be updated: not while
+    /// something depends on the value they had.
+    fn check_children_keep_their_parent(&self, table: &Table, old: &Row, new: &Row, changed: &[usize]) -> Result<()> {
+        if changed.is_empty() {
+            return Ok(());
+        }
+        for (child, fks) in self.catalog.children_of(&table.name) {
+            for fk in &fks {
+                let refs: Vec<usize> = fk.ref_columns.iter().map(|c| table.col(c)).collect::<Result<_>>()?;
+                if !refs.iter().any(|i| changed.contains(i)) {
+                    continue;
+                }
+                let ctx = self.ctx();
+                let values = |row: &Row| -> Result<Vec<Value>> {
+                    let frame = Frame { alias: &table.name, table, row: Some(row) };
+                    refs.iter().map(|i| frame_value(&ctx, &frame, *i)).collect()
+                };
+                let (was, now) = (values(old)?, values(new)?);
+                if was.iter().any(Value::is_null) || was.iter().zip(&now).all(|(a, b)| a.same(b)) {
+                    continue;
+                }
+                if !self.children_pointing_at(&child, fk, &[was])?.is_empty() {
+                    return Err(violation(
+                        ErrorCode::ForeignKeyViolation,
+                        &table.name,
+                        &fk.name,
+                        format!("a row of {:?} is still pointed at by rows of {:?}, so its key cannot change", table.name, child.name),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The unique index a row would break, and the row that holds the
     /// key. `only` limits the search to some indexes.
     fn find_conflict(&self, table: &Table, values: &Row, pk: &[u8], only: Option<&[usize]>) -> Result<Option<(String, Vec<u8>)>> {
@@ -520,6 +556,7 @@ impl Tx {
             return Err(Self::unique_error(&table, &index));
         }
         self.check_parents(&table, &new, Some(&changed))?;
+        self.check_children_keep_their_parent(&table, &old, &new, &changed)?;
         self.apply_update(name, pk, &fitted)
     }
 

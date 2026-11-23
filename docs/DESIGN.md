@@ -170,8 +170,11 @@ passes 8 MiB or dirty pages pass their limit, and at a clean stop.
 
 Opening a database: read both meta pages and take the newer valid one;
 empty the volatile tables; replay every log record after it, stopping at
-the first record that is incomplete or fails its CRC (it was never
-acknowledged); checkpoint. Replay runs the same functions that executed
+the first record that is incomplete or fails its CRC; checkpoint. In the
+newest log file such a record is the tail a crash tore, and it was never
+acknowledged. In an older file it is damage, since a file is synced
+whole before the next is begun: if commits follow it in a later file,
+the database refuses to open rather than apply them over the gap. Replay runs the same functions that executed
 the statements the first time, so there is one code path to trust.
 
 `engine/tests/recovery.rs` runs a random workload over a simulated file
@@ -200,9 +203,16 @@ time as current.
   savepoint was taken.
 - `now()` is read once when the transaction begins.
 
+A statement on its own reads the newest commit, which may still be on
+its way to the disk. Whatever it then answers, rows or none or an error
+such as a key already taken, rests on that commit, so the answer waits
+for it as it would for a commit of its own.
+
 A writer that would wait longer than `lock_wait` gets `LockTimeout`. A
-connection that holds a transaction open and goes quiet for a minute has
-it rolled back, so a stuck client cannot stop all writes.
+connection that holds a writing transaction open and goes quiet for a
+minute has it rolled back, so a stuck client cannot stop all writes. One
+that sits on a reading transaction is closed after ten: while a snapshot
+is held, no page freed since can be used again.
 
 ## Executing requests (`exec.rs`, `eval.rs`, `write.rs`)
 
@@ -295,9 +305,10 @@ database, so it is consistent however long it takes and writers are not
 held up.
 
 A restore reads the stream into new databases under temporary names,
-row by row through the normal write path (so every index is rebuilt and
-every constraint checked), and only when the whole stream has been read
-and verified are they renamed into place. A stream that is cut short or
+row by row, rebuilding every index as it goes. The rows are taken as
+they were dumped: each record's checksum is verified, but unique keys,
+foreign keys and checks are not tested again. Only when the whole stream
+has been read and verified are the databases renamed into place. A stream that is cut short or
 damaged leaves the server as it was.
 
 ## Limits worth knowing
@@ -306,6 +317,7 @@ damaged leaves the server as it was.
 |---|---|
 | A key (primary or index, all parts together) | 1,900 bytes |
 | A value | 256 MiB per request frame |
+| One transaction's changes | 1 GiB of log; a larger one fails at commit and must be made in parts |
 | Text cut into words for a full-text index | the first 1,000,000 bytes; words over 64 bytes are skipped |
 | Nesting of expressions and JSON | 100 levels |
 | Writers | one at a time per database; a transaction of several requests holds its turn between them |

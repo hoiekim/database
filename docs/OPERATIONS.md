@@ -5,7 +5,7 @@ One binary, `database`, is the server and the tool that talks to it.
 ```text
 database serve                       run the server
 database ping                        exit 0 if the server answers
-database create <name>               create a database; password from DATABASE_PASSWORD or --password
+database create <name>               create a database; its password from DATABASE_PASSWORD
 database drop <name>
 database password <name>             change a database's password
 database list
@@ -46,7 +46,9 @@ nothing else.
 
 The `Dockerfile` at the root of this repository builds an image whose
 command is `database serve` and whose health check is `database ping`.
-With Docker Compose:
+The server runs in it as user 1000, so a directory mounted at `/data`
+must be writable by that user (`chown 1000 ./data`): one that Docker
+creates for a bind mount belongs to root. With Docker Compose:
 
 ```yaml
 services:

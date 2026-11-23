@@ -3,7 +3,7 @@
 //! ```text
 //! database serve                       run the server
 //! database ping                        exit 0 if the server answers
-//! database create <name>               create a database; its password from DATABASE_PASSWORD or --password
+//! database create <name>               create a database; its password from DATABASE_PASSWORD
 //! database drop <name>
 //! database password <name>             change a database's password
 //! database list
@@ -108,8 +108,13 @@ fn one_name(args: &[String], usage: &str) -> Result<String, String> {
     }
 }
 
+/// A database's password comes from the environment only: an argument
+/// would show in the process list for as long as the command runs.
 fn new_password(args: &mut Vec<String>) -> Result<String, String> {
-    take_option(args, "--password").or_else(|| env("DATABASE_PASSWORD")).ok_or_else(|| "give the database's password in DATABASE_PASSWORD or with --password".to_string())
+    if take_option(args, "--password").is_some() || take_flag(args, "--password") {
+        return Err("a password on the command line shows in the process list: give it in DATABASE_PASSWORD".to_string());
+    }
+    env("DATABASE_PASSWORD").ok_or_else(|| "give the database's password in DATABASE_PASSWORD".to_string())
 }
 
 async fn run(command: &str, mut args: Vec<String>) -> Result<(), String> {
@@ -119,7 +124,7 @@ async fn run(command: &str, mut args: Vec<String>) -> Result<(), String> {
         "create" => {
             let if_not_exists = take_flag(&mut args, "--if-not-exists");
             let password = new_password(&mut args)?;
-            let name = one_name(&args, "create [--if-not-exists] [--password <password>] <name>")?;
+            let name = one_name(&args, "create [--if-not-exists] <name>")?;
             let client = admin().await?;
             if if_not_exists {
                 client.admin().create_database_if_not_exists(&name, &password).await.map_err(text)
@@ -130,7 +135,7 @@ async fn run(command: &str, mut args: Vec<String>) -> Result<(), String> {
         "drop" => admin().await?.admin().drop_database(&one_name(&args, "drop <name>")?).await.map_err(text),
         "password" => {
             let password = new_password(&mut args)?;
-            admin().await?.admin().set_password(&one_name(&args, "password [--password <password>] <name>")?, &password).await.map_err(text)
+            admin().await?.admin().set_password(&one_name(&args, "password <name>")?, &password).await.map_err(text)
         }
         "list" => {
             for name in admin().await?.admin().list_databases().await.map_err(text)? {

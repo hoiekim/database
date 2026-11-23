@@ -16,6 +16,12 @@ use crate::value::{Type, Value};
 /// input may come from anyone who can reach the port.
 const MAX_DEPTH: u32 = 100;
 
+/// The most elements a decoder reserves room for before it has read
+/// them. A count is checked against the bytes left in the message, but an
+/// element can take hundreds of times the room in memory that it takes on
+/// the wire, so a count alone must never size an allocation.
+pub const RESERVE: usize = 1024;
+
 fn malformed(what: &str) -> DbError {
     DbError::new(ErrorCode::InvalidRequest, format!("malformed message: {what}"))
 }
@@ -278,8 +284,8 @@ pub fn get_value_tagged(r: &mut Reader, tag: u8) -> DbResult<Value> {
         TAG_DECIMAL => {
             let scale = r.u8()?;
             let mantissa = i128::from_le_bytes(r.take(16)?.try_into().unwrap());
-            if scale > crate::decimal::MAX_SCALE {
-                return Err(malformed("decimal scale out of range"));
+            if scale > crate::decimal::MAX_SCALE || mantissa == i128::MIN {
+                return Err(malformed("decimal out of range"));
             }
             Value::Decimal(Decimal::new(mantissa, scale))
         }
@@ -303,9 +309,13 @@ pub fn get_value_tagged(r: &mut Reader, tag: u8) -> DbResult<Value> {
     })
 }
 
-/// Parses JSON however deep it nests, without overflowing the stack.
+/// Parses JSON, refusing what nests deeper than `MAX_JSON_DEPTH`: the
+/// same limit every other way of making a JSON value keeps, so that what
+/// can be stored can always be read back.
 pub fn parse_json(text: &[u8]) -> DbResult<serde_json::Value> {
-    serde_json::from_slice(text).map_err(|e| DbError::new(ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))
+    let json: serde_json::Value = serde_json::from_slice(text).map_err(|e| DbError::new(ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
+    crate::value::check_json_depth(&json)?;
+    Ok(json)
 }
 
 pub fn put_type(w: &mut Writer, t: &Type) {
@@ -737,7 +747,7 @@ pub fn get_query(r: &mut Reader) -> DbResult<Query> {
     let alias = r.opt_str()?;
     let access = get_access(r)?;
     let n = r.count()?;
-    let mut joins = Vec::with_capacity(n);
+    let mut joins = Vec::with_capacity(n.min(RESERVE));
     for _ in 0..n {
         let kind = match r.u8()? {
             0 => JoinKind::Inner,
@@ -751,7 +761,7 @@ pub fn get_query(r: &mut Reader) -> DbResult<Query> {
     let group_by = get_exprs(r)?;
     let having = get_opt_expr(r)?;
     let n = r.count()?;
-    let mut order_by = Vec::with_capacity(n);
+    let mut order_by = Vec::with_capacity(n.min(RESERVE));
     for _ in 0..n {
         let expr = get_expr(r)?;
         let desc = r.bool()?;
@@ -948,7 +958,7 @@ pub fn get_table(r: &mut Reader) -> DbResult<TableDef> {
     let n = r.count()?;
     let indexes = (0..n).map(|_| get_index(r)).collect::<DbResult<_>>()?;
     let n = r.count()?;
-    let mut foreign_keys = Vec::with_capacity(n);
+    let mut foreign_keys = Vec::with_capacity(n.min(RESERVE));
     for _ in 0..n {
         foreign_keys.push(ForeignKey {
             name: r.str()?,

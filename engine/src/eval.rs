@@ -343,7 +343,7 @@ pub fn eval(ctx: &Ctx, scope: &Scope, expr: &Expr) -> Result<Value> {
             Value::Null => Value::Null,
             Value::Int(n) => Value::Int(n.checked_neg().ok_or_else(|| arithmetic("integer overflow"))?),
             Value::Float(f) => Value::Float(-f),
-            Value::Decimal(d) => Value::Decimal(d.neg()),
+            Value::Decimal(d) => Value::Decimal(d.checked_neg().ok_or_else(|| arithmetic("decimal overflow"))?),
             other => return Err(mismatch(format!("cannot negate {}", other.type_name()))),
         },
         Expr::Call(func, args) => call(ctx, scope, *func, args)?,
@@ -382,6 +382,10 @@ pub fn eval(ctx: &Ctx, scope: &Scope, expr: &Expr) -> Result<Value> {
 /// Whether a list holds a value: `None` when it does not but holds a
 /// NULL (or the value is NULL), so the answer is unknown.
 fn contains(list: &[Value], value: &Value) -> Result<Option<bool>> {
+    // Nothing is in an empty list, not even NULL: `NULL NOT IN ()` is true.
+    if list.is_empty() {
+        return Ok(Some(false));
+    }
     if value.is_null() {
         return Ok(None);
     }
@@ -467,6 +471,13 @@ pub fn arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value> {
 }
 
 /// Any value as JSON.
+/// A JSON value just built around others, if it has not grown deeper
+/// than a JSON value may be: what could not be read back is never made.
+fn shallow(json: Json) -> Result<Value> {
+    database_protocol::value::check_json_depth(&json)?;
+    Ok(Value::Json(json))
+}
+
 pub fn to_json(value: &Value) -> Json {
     match value {
         Value::Null => Json::Null,
@@ -519,8 +530,10 @@ pub fn cast(value: Value, to: &Type) -> Result<Value> {
         (Type::Int, Value::Int(n)) => Value::Int(n),
         (Type::Int, Value::Bool(b)) => Value::Int(b.into()),
         (Type::Int, Value::Float(f)) => {
+            // 2^63 itself does not fit; as a float it is exact, and the
+            // largest float below it does.
             let r = f.round();
-            if !r.is_finite() || r < -9.3e18 || r > 9.3e18 {
+            if !(r >= -9_223_372_036_854_775_808.0 && r < 9_223_372_036_854_775_808.0) {
                 return Err(Error::db(ErrorCode::OutOfRange, format!("{f} does not fit in an integer")));
             }
             Value::Int(r as i64)
@@ -780,18 +793,18 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
                 _ => Vec::new(),
             }));
         }
-        Func::JsonArray => return Ok(Value::Json(Json::Array(a.iter().map(to_json).collect()))),
+        Func::JsonArray => return shallow(Json::Array(a.iter().map(to_json).collect())),
         Func::JsonObject => {
             arity(a.len() % 2 == 0)?;
             let mut map = serde_json::Map::new();
             for pair in a.chunks(2) {
                 map.insert(text_arg(&pair[0], "a JSON object key")?.to_string(), to_json(&pair[1]));
             }
-            return Ok(Value::Json(Json::Object(map)));
+            return shallow(Json::Object(map));
         }
         Func::ToJson => {
             arity(a.len() == 1)?;
-            return Ok(Value::Json(to_json(&a[0])));
+            return shallow(to_json(&a[0]));
         }
         Func::JsonGet | Func::JsonGetText => {
             arity(!a.is_empty())?;
@@ -905,7 +918,7 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
                 (Value::Float(f), Func::Ceil) => Value::Float(f.ceil()),
                 (Value::Float(f), Func::Floor) => Value::Float(f.floor()),
                 (Value::Float(f), _) => Value::Float(if *f > 0.0 { 1.0 } else if *f < 0.0 { -1.0 } else { 0.0 }),
-                (Value::Decimal(d), Func::Abs) => Value::Decimal(d.abs()),
+                (Value::Decimal(d), Func::Abs) => Value::Decimal(d.checked_abs().ok_or_else(|| arithmetic("decimal overflow"))?),
                 (Value::Decimal(d), Func::Sign) => Value::Int(d.mantissa().signum() as i64),
                 (Value::Decimal(d), _) => {
                     let whole = Decimal::new(d.mantissa().div_euclid(10i128.pow(u32::from(d.scale()))), 0);
@@ -962,7 +975,7 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
                 "minute" => Value::Int(seconds / 60 % 60),
                 "second" => Value::Float((of_day % (60 * time::SECOND_MICROS)) as f64 / 1e6),
                 "dow" => Value::Int((i64::from(days) + 4).rem_euclid(7)),
-                "epoch" => Value::Float((i64::from(days) * time::DAY_MICROS + of_day) as f64 / 1e6),
+                "epoch" => Value::Float(f64::from(days) * 86_400.0 + of_day as f64 / 1e6),
                 other => return Err(invalid(format!("date_part does not know {other:?}"))),
             }
         }

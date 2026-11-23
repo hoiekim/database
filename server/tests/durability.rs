@@ -60,6 +60,7 @@ impl Process {
     }
 
     /// The server's resident memory, in bytes.
+    #[cfg(target_os = "linux")]
     fn resident(&self) -> u64 {
         let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).unwrap();
         let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
@@ -180,6 +181,8 @@ async fn nothing_acknowledged_is_lost_when_the_server_is_killed() -> DbResult<()
 
 // R-O5: the server's memory stays near its cache budget however much
 // data passes through it.
+// It reads the server's resident size from /proc, which only Linux has.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_stays_bounded_while_data_grows() -> DbResult<()> {
     let dir = TempDir::new();

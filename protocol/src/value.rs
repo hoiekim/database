@@ -130,8 +130,8 @@ impl Value {
             (Uuid(a), Uuid(b)) => a.cmp(b),
             (Timestamp(a), Timestamp(b)) => a.cmp(b),
             (Date(a), Date(b)) => a.cmp(b),
-            (Date(a), Timestamp(b)) => (i64::from(*a) * time::DAY_MICROS).cmp(b),
-            (Timestamp(a), Date(b)) => a.cmp(&(i64::from(*b) * time::DAY_MICROS)),
+            (Date(a), Timestamp(b)) => day_as_timestamp(*a).cmp(b),
+            (Timestamp(a), Date(b)) => a.cmp(&day_as_timestamp(*b)),
             (Json(a), Json(b)) => compare_json(a, b),
             (List(a), List(b)) => {
                 for (x, y) in a.iter().zip(b) {
@@ -228,12 +228,17 @@ impl Value {
             (Value::Text(s), Type::Timestamp) => {
                 Value::Timestamp(time::parse_timestamp(&s, 0).ok_or_else(|| DbError::type_mismatch(format!("not a timestamp: {s:?}")))?)
             }
-            (Value::Date(d), Type::Timestamp) => Value::Timestamp(i64::from(d) * time::DAY_MICROS),
+            (Value::Date(d), Type::Timestamp) => {
+                Value::Timestamp(time::day_start(d).ok_or_else(|| DbError::new(ErrorCode::OutOfRange, "that date is beyond what a timestamp can hold"))?)
+            }
             (v @ Value::Date(_), Type::Date) => v,
             (Value::Text(s), Type::Date) => {
                 Value::Date(time::parse_date(&s).ok_or_else(|| DbError::type_mismatch(format!("not a date: {s:?}")))?)
             }
-            (Value::Json(j), Type::Json) => Value::Json(normalize_json(j)),
+            (Value::Json(j), Type::Json) => {
+                check_json_depth(&j)?;
+                Value::Json(normalize_json(j))
+            }
             (Value::List(items), Type::List(of)) => {
                 Value::List(items.into_iter().map(|v| v.coerce(of)).collect::<DbResult<_>>()?)
             }
@@ -261,11 +266,44 @@ fn compare_numbers(a: &Value, b: &Value) -> Ordering {
         (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
         (Value::Decimal(x), Value::Int(y)) => x.cmp(&Decimal::from(*y)),
         (Value::Int(x), Value::Decimal(y)) => Decimal::from(*x).cmp(y),
-        _ => {
-            let (x, y) = (a.as_f64().unwrap_or(f64::NAN), b.as_f64().unwrap_or(f64::NAN));
-            x.total_cmp(&y)
-        }
+        _ => compare_floats(a.as_f64().unwrap_or(f64::NAN), b.as_f64().unwrap_or(f64::NAN)),
     }
+}
+
+/// Floats in numeric order, with zero and minus zero equal, as they are
+/// as keys; NaN, which has no place in that order, sorts after everything.
+fn compare_floats(x: f64, y: f64) -> Ordering {
+    x.partial_cmp(&y).unwrap_or_else(|| x.is_nan().cmp(&y.is_nan()))
+}
+
+/// Midnight of a date as a timestamp, for comparing the two. A date too
+/// far off for a timestamp compares as beyond every timestamp.
+fn day_as_timestamp(days: i32) -> i64 {
+    time::day_start(days).unwrap_or(if days < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// How deep a JSON value may nest. The parser refuses more, and so does
+/// every other way of making one, so that whatever is stored can be read.
+pub const MAX_JSON_DEPTH: usize = 100;
+
+/// How many arrays and objects deep a JSON value goes, counting no
+/// further than the limit.
+fn json_depth(v: &Json, limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    match v {
+        Json::Array(items) => 1 + items.iter().map(|item| json_depth(item, limit - 1)).max().unwrap_or(0),
+        Json::Object(map) => 1 + map.values().map(|item| json_depth(item, limit - 1)).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+pub fn check_json_depth(v: &Json) -> DbResult<()> {
+    if json_depth(v, MAX_JSON_DEPTH + 1) > MAX_JSON_DEPTH {
+        return Err(DbError::new(ErrorCode::OutOfRange, format!("JSON nested more than {MAX_JSON_DEPTH} levels deep")));
+    }
+    Ok(())
 }
 
 fn json_rank(v: &Json) -> u8 {
@@ -286,7 +324,7 @@ pub fn compare_json(a: &Json, b: &Json) -> Ordering {
         (Json::Bool(x), Json::Bool(y)) => x.cmp(y),
         (Json::Number(x), Json::Number(y)) => match (x.as_i64(), y.as_i64()) {
             (Some(x), Some(y)) => x.cmp(&y),
-            _ => x.as_f64().unwrap_or(f64::NAN).total_cmp(&y.as_f64().unwrap_or(f64::NAN)),
+            _ => compare_floats(x.as_f64().unwrap_or(f64::NAN), y.as_f64().unwrap_or(f64::NAN)),
         },
         (Json::String(x), Json::String(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Json::Array(x), Json::Array(y)) => {
@@ -758,6 +796,36 @@ impl<T: FromValue> FromValue for Vec<T> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn zero_and_minus_zero_are_equal_and_nan_sorts_last() {
+        assert_eq!(Value::Float(-0.0).compare(&Value::Float(0.0)).unwrap(), Some(Ordering::Equal));
+        assert_eq!(Value::Float(0.0).compare(&Value::Int(0)).unwrap(), Some(Ordering::Equal));
+        assert_eq!(Value::Float(f64::NAN).compare(&Value::Float(f64::INFINITY)).unwrap(), Some(Ordering::Greater));
+        assert_eq!(Value::Float(f64::NAN).compare(&Value::Float(f64::NAN)).unwrap(), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn json_nests_only_so_deep_however_it_is_made() {
+        let nested = |depth: usize| (0..depth).fold(json!(1), |inner, _| json!([inner]));
+        assert!(check_json_depth(&nested(MAX_JSON_DEPTH)).is_ok());
+        assert!(check_json_depth(&nested(MAX_JSON_DEPTH + 1)).is_err());
+        assert!(Value::Json(nested(MAX_JSON_DEPTH)).coerce(&Type::Json).is_ok());
+        assert_eq!(Value::Json(nested(MAX_JSON_DEPTH + 1)).coerce(&Type::Json).unwrap_err().code, ErrorCode::OutOfRange);
+        // The parser keeps the same limit: what is stored can be read.
+        let text = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(crate::codec::parse_json(text(MAX_JSON_DEPTH).as_bytes()).is_ok());
+        assert!(crate::codec::parse_json(text(MAX_JSON_DEPTH + 1).as_bytes()).is_err());
+        assert!(crate::codec::parse_json(text(5_000).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_date_beyond_a_timestamps_reach_is_an_error_not_a_wrong_instant() {
+        assert_eq!(Value::Date(i32::MAX).coerce(&Type::Timestamp).unwrap_err().code, ErrorCode::OutOfRange);
+        assert_eq!(Value::Date(i32::MAX).compare(&Value::Timestamp(i64::MAX - 1)).unwrap(), Some(Ordering::Greater));
+        assert_eq!(Value::Date(i32::MIN).compare(&Value::Timestamp(i64::MIN + 1)).unwrap(), Some(Ordering::Less));
+        assert_eq!(Value::Date(1).coerce(&Type::Timestamp).unwrap(), Value::Timestamp(time::DAY_MICROS));
+    }
 
     #[test]
     fn numbers_of_different_kinds_compare_by_value() {

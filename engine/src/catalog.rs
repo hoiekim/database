@@ -84,6 +84,18 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::Db(DbError::invalid(message))
 }
 
+/// Checks that a column's type can be stored: a decimal has at most 38
+/// digits, and no more after the point than a decimal can keep.
+fn check_type(column: &str, ty: &Type) -> Result<()> {
+    match ty {
+        Type::Decimal(Some((precision, scale))) if *precision == 0 || *precision > 38 || scale > precision || *scale > database_protocol::decimal::MAX_SCALE => {
+            Err(invalid(format!("column {column:?}: decimal({precision}, {scale}) is not a size a decimal can have")))
+        }
+        Type::List(item) => check_type(column, item),
+        _ => Ok(()),
+    }
+}
+
 pub fn check_name(kind: &str, name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 128 || name.contains(['.', '\0']) || name.chars().any(char::is_control) {
         return Err(invalid(format!("{name:?} is not a valid {kind} name")));
@@ -194,6 +206,7 @@ impl TableMeta {
         if def.auto_increment && def.ty != Type::Int {
             return Err(invalid(format!("column {:?} numbers rows, so it must be an int", def.name)));
         }
+        check_type(&def.name, &def.ty)?;
         if let Some(default) = &def.default {
             check_stored_expr("a default", default, true)?;
             if !columns_read(default).is_empty() {
@@ -276,6 +289,11 @@ impl TableMeta {
         }
         if parent.unique_key(&fk.ref_columns).is_none() {
             return Err(invalid(format!("foreign key {:?} must point at the primary key or a unique index of {:?}", fk.name, fk.ref_table)));
+        }
+        // A volatile table is empty after a restart: rows that outlive
+        // one cannot be made to depend on its rows.
+        if parent.volatile && !self.volatile {
+            return Err(invalid(format!("foreign key {:?} points at {:?}, whose rows do not survive a restart, from a table whose rows do", fk.name, fk.ref_table)));
         }
         for (child, parent_col) in fk.columns.iter().zip(&fk.ref_columns) {
             let c = &self.cols[self.col(child)?].def;

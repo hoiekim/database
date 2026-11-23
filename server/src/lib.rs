@@ -153,9 +153,17 @@ impl Server {
                 let stopping = stopping.clone();
                 state.open_connections.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    session::serve(stream, state.clone(), id, stopping).await;
-                    state.open_connections.fetch_sub(1, Ordering::Relaxed);
-                    state.connection_closed.notify_waiters();
+                    // Counted down as this is dropped, so also if serving
+                    // the connection panics.
+                    struct Open(Arc<State>);
+                    impl Drop for Open {
+                        fn drop(&mut self) {
+                            self.0.open_connections.fetch_sub(1, Ordering::Relaxed);
+                            self.0.connection_closed.notify_waiters();
+                        }
+                    }
+                    let _open = Open(state.clone());
+                    session::serve(stream, state, id, stopping).await;
                 });
             }
         });

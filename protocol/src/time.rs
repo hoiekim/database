@@ -4,6 +4,14 @@
 pub const SECOND_MICROS: i64 = 1_000_000;
 pub const DAY_MICROS: i64 = 86_400 * SECOND_MICROS;
 
+/// The first microsecond of a day, counted in days since the epoch.
+/// `None` for a day so far off that its microseconds do not fit: a date
+/// reaches five million years either way, a timestamp three hundred
+/// thousand.
+pub fn day_start(days: i32) -> Option<i64> {
+    i64::from(days).checked_mul(DAY_MICROS)
+}
+
 pub fn now_micros() -> i64 {
     system_micros(std::time::SystemTime::now())
 }
@@ -132,12 +140,12 @@ fn parse_written_date(text: &str) -> Option<i32> {
 /// a day that does not exist.
 pub fn parse_timestamp(text: &str, default_offset_secs: i32) -> Option<i64> {
     let text = text.trim();
-    let midnight = |days: i32| i64::from(days) * DAY_MICROS - i64::from(default_offset_secs) * SECOND_MICROS;
+    let midnight = |days: i32| day_start(days)?.checked_sub(i64::from(default_offset_secs) * SECOND_MICROS);
     let Some((days, rest)) = ymd(text.as_bytes()) else {
-        return parse_written_date(text).map(midnight);
+        return parse_written_date(text).and_then(midnight);
     };
     if rest.is_empty() {
-        return Some(midnight(days));
+        return midnight(days);
     }
     let rest = eat(rest, b'T').or_else(|| eat(rest, b't')).or_else(|| eat(rest, b' '))?;
     let (hour, rest) = digits(rest, 2)?;
@@ -186,7 +194,7 @@ pub fn parse_timestamp(text: &str, default_offset_secs: i32) -> Option<i64> {
         _ => return None,
     };
     let of_day = i64::from(hour * 3600 + minute * 60 + second) * SECOND_MICROS + micros;
-    Some(i64::from(days) * DAY_MICROS + of_day - offset_secs * SECOND_MICROS)
+    day_start(days)?.checked_add(of_day)?.checked_sub(offset_secs * SECOND_MICROS)
 }
 
 #[cfg(test)]
