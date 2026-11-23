@@ -27,11 +27,11 @@ use crate::catalog::{plain_columns, Catalog, Table, TableMeta};
 use crate::error::{Error, Result};
 use crate::eval::{eval, frame_value, holds, Ctx, Frame, Scope};
 use crate::exec::{self, encode_prefix, entry_pk, fetch, for_each_match, index_parts, pk_parts};
+use crate::fts;
 use crate::keys;
 use crate::page::{put_varint, PageId, NO_PAGE};
 use crate::row::{self, Row};
 use crate::store::Writer;
-use crate::text;
 
 const OP_INSERT: u8 = 1;
 const OP_UPDATE: u8 = 2;
@@ -44,7 +44,6 @@ const OP_CREATE_INDEX: u8 = 8;
 const OP_DROP_INDEX: u8 = 9;
 
 /// Words longer than this are not indexed for search: they are not words.
-const MAX_TERM: usize = 64;
 
 /// A writing transaction's working state.
 pub struct Tx {
@@ -79,6 +78,24 @@ struct Entry {
 
 fn row_scope<'a>(frame: &'a [Frame<'a>]) -> Scope<'a> {
     Scope { frames: frame, ..Scope::default() }
+}
+
+/// What a statement returns, with `ALL` spelled out as the table's
+/// columns.
+fn returned(table: &Table, items: &[Select]) -> Vec<Select> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if item.name == ALL && item.expr == Expr::Column(None, ALL.to_string()) {
+            out.extend(table.cols.iter().filter(|c| !c.dropped).map(|c| Select { name: c.def.name.clone(), expr: Expr::Column(None, c.def.name.clone()) }));
+        } else {
+            out.push(item.clone());
+        }
+    }
+    out
+}
+
+fn is_full_text(table: &Table, i: usize) -> bool {
+    matches!(table.indexes[i].def.kind, IndexKind::FullText { .. })
 }
 
 /// The entries `row` has in index `i` of `table`.
@@ -138,34 +155,8 @@ fn index_entries(ctx: &Ctx, table: &Table, i: usize, row: &Row, pk: &[u8]) -> Re
                 out.push(Entry { key, value, unique: (def.unique && !has_null).then_some(offset) });
             }
         }
-        IndexKind::FullText { config, fields } => {
-            let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-            for field in fields {
-                match eval(ctx, &scope, &field.expr)? {
-                    Value::Null => {}
-                    Value::Text(text) => {
-                        for (term, count) in text::terms(&text, *config) {
-                            if term.len() <= MAX_TERM {
-                                *scores.entry(term).or_insert(0.0) += field.weight as f32 * count as f32;
-                            }
-                        }
-                    }
-                    other => return Err(Error::Db(DbError::type_mismatch(format!("index {:?} expects text, got {}", def.name, other.type_name())))),
-                }
-            }
-            for (prefix, _) in prefixes {
-                for (term, score) in &scores {
-                    let mut key = prefix.clone();
-                    keys::encode(&mut key, &Value::Text(term.clone()), false);
-                    let offset = key.len();
-                    key.extend_from_slice(pk);
-                    let mut value = Vec::new();
-                    put_varint(&mut value, offset as u64);
-                    value.extend_from_slice(&score.to_le_bytes());
-                    out.push(Entry { key, value, unique: None });
-                }
-            }
-        }
+        // A full-text index is not a tree of entries: see `fts`.
+        IndexKind::FullText { .. } => {}
     }
     Ok(out)
 }
@@ -227,9 +218,16 @@ impl Tx {
         let table = self.table(name)?;
         let pk = pk_of(&table, values)?;
         let stored = Row::from_values(values);
-        let entries: Vec<Vec<Entry>> = {
+        let (entries, words) = {
             let ctx = self.ctx();
-            (0..table.indexes.len()).map(|i| index_entries(&ctx, &table, i, &stored, &pk)).collect::<Result<_>>()?
+            let entries: Vec<Vec<Entry>> = (0..table.indexes.len()).map(|i| index_entries(&ctx, &table, i, &stored, &pk)).collect::<Result<_>>()?;
+            let mut words = Vec::new();
+            for i in (0..table.indexes.len()).filter(|i| is_full_text(&table, *i)) {
+                if let Some(w) = fts::words_of(&ctx, &table, i, &stored)? {
+                    words.push((i, w));
+                }
+            }
+            (entries, words)
         };
         let mut cols: Vec<Vec<u8>> = values.iter().map(row::encode_value).collect();
         let (mut blobs, mut next_blob) = (table.blobs, table.next_blob);
@@ -243,6 +241,9 @@ impl Tx {
             for entry in entries {
                 index_roots[i] = btree::put(&mut self.writer, index_roots[i], &entry.key, &entry.value)?.0;
             }
+        }
+        for (i, words) in &words {
+            index_roots[*i] = fts::add(&mut self.writer, index_roots[*i], &pk, words)?;
         }
         if self.logging && !table.volatile {
             self.log.u8(OP_INSERT);
@@ -286,15 +287,25 @@ impl Tx {
         let new = Row::parse(row::assemble(&cols))?;
         // Only the indexes that read a changed column can change.
         let touched: Vec<usize> = (0..table.indexes.len()).filter(|i| table.indexes[*i].reads.iter().any(|c| changes.iter().any(|(ch, _)| ch == c))).collect();
-        let (before, after) = {
+        let (before, after, reworded) = {
             let ctx = self.ctx();
             let mut before = Vec::new();
             let mut after = Vec::new();
+            let mut reworded = Vec::new();
             for i in &touched {
                 before.push(index_entries(&ctx, &table, *i, &old, pk)?);
                 after.push(index_entries(&ctx, &table, *i, &new, pk)?);
+                if is_full_text(&table, *i) {
+                    // Written again with the words it had, a row stays
+                    // as it is in the index.
+                    let was = fts::words_of(&ctx, &table, *i, &old)?;
+                    let now = fts::words_of(&ctx, &table, *i, &new)?;
+                    if was != now {
+                        reworded.push((*i, now));
+                    }
+                }
             }
-            (before, after)
+            (before, after, reworded)
         };
         let (mut blobs, mut next_blob) = (table.blobs, table.next_blob);
         for (i, _) in changes {
@@ -315,6 +326,12 @@ impl Tx {
                 if !before.iter().any(|b| b.key == entry.key && b.value == entry.value) {
                     index_roots[*i] = btree::put(&mut self.writer, index_roots[*i], &entry.key, &entry.value)?.0;
                 }
+            }
+        }
+        for (i, words) in &reworded {
+            index_roots[*i] = fts::remove(&mut self.writer, index_roots[*i], pk)?;
+            if let Some(words) = words {
+                index_roots[*i] = fts::add(&mut self.writer, index_roots[*i], pk, words)?;
             }
         }
         if self.logging && !table.volatile {
@@ -356,6 +373,9 @@ impl Tx {
         for (i, entries) in entries.iter().enumerate() {
             for entry in entries {
                 index_roots[i] = btree::delete(&mut self.writer, index_roots[i], &entry.key)?.0;
+            }
+            if is_full_text(&table, i) {
+                index_roots[i] = fts::remove(&mut self.writer, index_roots[i], pk)?;
             }
         }
         let mut blobs = table.blobs;
@@ -651,7 +671,8 @@ impl Tx {
             (_, Some(rows)) => rows.len(),
             _ => 0,
         };
-        let columns: Vec<String> = ins.returning.iter().map(|s| s.name.clone()).collect();
+        let returning = returned(&table, &ins.returning);
+        let columns: Vec<String> = returning.iter().map(|s| s.name.clone()).collect();
         let mut out = Vec::new();
         let mut affected = 0;
         for n in 0..count {
@@ -741,13 +762,13 @@ impl Tx {
                 }
             };
             affected += 1;
-            if !ins.returning.is_empty() {
+            if !returning.is_empty() {
                 let table = self.table(&ins.table)?;
                 let ctx = self.ctx();
                 let stored = fetch(&ctx, &table, &pk)?.ok_or_else(|| Error::corrupt("a row vanished after it was written"))?;
                 let frame = [Frame { alias: &table.name, table: &table, row: Some(&stored) }];
                 let scope = Scope { frames: &frame, old: old.as_ref(), excluded: Some(&values), ..Scope::default() };
-                out.push(ins.returning.iter().map(|s| eval(&ctx, &scope, &s.expr)).collect::<Result<Vec<_>>>()?);
+                out.push(returning.iter().map(|s| eval(&ctx, &scope, &s.expr)).collect::<Result<Vec<_>>>()?);
             }
         }
         Ok(RowSet { columns, rows: out, affected, total: None })
@@ -807,13 +828,14 @@ impl Tx {
         let name = upd.rows.table.clone();
         let table = self.table(&name)?;
         let cols: Vec<usize> = upd.set.iter().map(|a| table.col(&a.column)).collect::<Result<_>>()?;
-        let columns: Vec<String> = upd.returning.iter().map(|s| s.name.clone()).collect();
+        let returning = returned(&table, &upd.returning);
+        let columns: Vec<String> = returning.iter().map(|s| s.name.clone()).collect();
         // First find every row and work out its new values and what to
         // return, all read from the rows as they are now; then write.
         let targets = self.targets(&upd.rows, &mut |ctx, scope, hit| {
             let changes: Vec<(usize, Value)> =
                 cols.iter().zip(&upd.set).map(|(i, a)| Ok((*i, Self::fit_column(&table, *i, eval(ctx, scope, &a.value)?)?))).collect::<Result<_>>()?;
-            let returned = if upd.returning.is_empty() {
+            let returned = if returning.is_empty() {
                 Vec::new()
             } else {
                 // The row as it will be, in front of the scope it was
@@ -828,7 +850,7 @@ impl Tx {
                 let alias = upd.rows.alias.as_deref().unwrap_or(&table.name);
                 let frame = [Frame { alias, table: &table, row: Some(&new) }];
                 let after = Scope { frames: &frame, old: Some(&hit.row), outer: Some(scope), ..Scope::default() };
-                upd.returning.iter().map(|s| eval(ctx, &after, &s.expr)).collect::<Result<Vec<_>>>()?
+                returning.iter().map(|s| eval(ctx, &after, &s.expr)).collect::<Result<Vec<_>>>()?
             };
             Ok((changes, returned))
         })?;
@@ -840,7 +862,7 @@ impl Tx {
             }
             self.update_row(&name, &pk, changes)?;
             affected += 1;
-            if !upd.returning.is_empty() {
+            if !returning.is_empty() {
                 out.push(returned);
             }
         }
@@ -849,11 +871,12 @@ impl Tx {
 
     pub fn delete(&mut self, del: &Delete) -> Result<RowSet> {
         let name = del.rows.table.clone();
-        let columns: Vec<String> = del.returning.iter().map(|s| s.name.clone()).collect();
-        let targets = self.targets(&del.rows, &mut |ctx, scope, _| del.returning.iter().map(|s| eval(ctx, scope, &s.expr)).collect::<Result<Vec<_>>>())?;
+        let returning = returned(&*self.table(&name)?, &del.returning);
+        let columns: Vec<String> = returning.iter().map(|s| s.name.clone()).collect();
+        let targets = self.targets(&del.rows, &mut |ctx, scope, _| returning.iter().map(|s| eval(ctx, scope, &s.expr)).collect::<Result<Vec<_>>>())?;
         let (pks, rows): (Vec<Vec<u8>>, Vec<Vec<Value>>) = targets.into_iter().unzip();
         let affected = self.delete_rows(&name, &pks)?;
-        Ok(RowSet { columns, rows: if del.returning.is_empty() { Vec::new() } else { rows }, affected, total: None })
+        Ok(RowSet { columns, rows: if returning.is_empty() { Vec::new() } else { rows }, affected, total: None })
     }
 
     // ----------------------------------------------------------- schema
@@ -882,6 +905,18 @@ impl Tx {
         btree::destroy(&mut self.writer, root, &mut |_, _| Ok(()))
     }
 
+    /// Frees every page of a table's indexes.
+    fn destroy_indexes(&mut self, table: &Table) -> Result<()> {
+        for (i, root) in table.index_roots.iter().enumerate() {
+            if is_full_text(table, i) {
+                fts::destroy(&mut self.writer, *root)?;
+            } else {
+                self.destroy_tree(*root)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn drop_table(&mut self, name: &str, if_exists: bool) -> Result<()> {
         let Some(table) = self.catalog.tables.get(name).cloned() else {
             return if if_exists { Ok(()) } else { Err(Error::Db(DbError::not_found(format!("no table {name:?}")))) };
@@ -891,9 +926,7 @@ impl Tx {
         }
         self.destroy_tree(table.root)?;
         self.destroy_tree(table.blobs)?;
-        for root in &table.index_roots {
-            self.destroy_tree(*root)?;
-        }
+        self.destroy_indexes(&table)?;
         self.catalog.tables.remove(name);
         self.log_op(OP_DROP_TABLE, |w| w.str(name));
         Ok(())
@@ -904,9 +937,7 @@ impl Tx {
         let table = self.table(name)?;
         self.destroy_tree(table.root)?;
         self.destroy_tree(table.blobs)?;
-        for root in &table.index_roots {
-            self.destroy_tree(*root)?;
-        }
+        self.destroy_indexes(&table)?;
         drop(table);
         let t = self.table_mut(name);
         t.root = NO_PAGE;
@@ -1020,11 +1051,15 @@ impl Tx {
             if n % 256 == 255 {
                 self.ctx().check_deadline()?;
             }
-            let entries = {
+            let (entries, words) = {
                 let ctx = self.ctx();
                 let stored = fetch(&ctx, &table, &pk)?.ok_or_else(|| Error::corrupt("a row vanished while its table was indexed"))?;
-                index_entries(&ctx, &table, i, &stored, &pk)?
+                let words = if is_full_text(&table, i) { fts::words_of(&ctx, &table, i, &stored)? } else { None };
+                (index_entries(&ctx, &table, i, &stored, &pk)?, words)
             };
+            if let Some(words) = words {
+                root = fts::add(&mut self.writer, root, &pk, &words)?;
+            }
             for entry in entries {
                 if let Some(offset) = entry.unique {
                     // The tree under construction is the index so far.
@@ -1054,7 +1089,11 @@ impl Tx {
         let Some(i) = table.indexes.iter().position(|x| x.def.name == index) else {
             return if if_exists { Ok(()) } else { Err(Error::Db(DbError::not_found(format!("table {name:?} has no index {index:?}")))) };
         };
-        self.destroy_tree(table.index_roots[i])?;
+        if is_full_text(&table, i) {
+            fts::destroy(&mut self.writer, table.index_roots[i])?;
+        } else {
+            self.destroy_tree(table.index_roots[i])?;
+        }
         self.change_meta(name, |meta, _| {
             meta.indexes.remove(i);
             Ok(())

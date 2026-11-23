@@ -26,7 +26,10 @@ const WAIT: Duration = Duration::from_secs(5);
 
 fn options() -> EngineOptions {
     // Small limits, so that pages are written early, evicted and read
-    // back, and checkpoints happen, within a short test.
+    // back, and checkpoints happen, within a short test; and full-text
+    // segments of a handful of rows, so that they are made, merged and
+    // cleaned of dead rows all the time.
+    database_engine::fts::set_pending_bytes(400);
     EngineOptions { cache_bytes: 64 * 8192, db: Options { sync: true, limits: Limits { max_dirty: 24, max_private: 24 }, checkpoint_bytes: 64 * 1024 } }
 }
 

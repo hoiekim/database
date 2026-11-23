@@ -45,6 +45,13 @@ pub struct Select {
     pub expr: Expr,
 }
 
+/// In a `returning`: every column of the row, under its own name.
+pub const ALL: &str = "*";
+
+fn all_columns() -> Vec<Select> {
+    vec![Select { name: ALL.to_string(), expr: Expr::Column(None, ALL.to_string()) }]
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Order {
     pub expr: Expr,
@@ -214,6 +221,12 @@ pub enum JoinKind {
 }
 
 impl Query {
+    /// One row of no table, to compute what needs none:
+    /// `Query::row().select("taken", exists(..)).select("at", now())`.
+    pub fn row() -> Query {
+        Query::table("")
+    }
+
     /// Every row of a table, in primary key order, until narrowed.
     pub fn table(name: &str) -> Query {
         Query {
@@ -572,6 +585,12 @@ impl Insert {
         self.returning.push(Select { name: name.to_string(), expr: expr.into() });
         self
     }
+
+    /// Returns every column of each row, as SQL's `RETURNING *`.
+    pub fn returning_all(mut self) -> Insert {
+        self.returning = all_columns();
+        self
+    }
 }
 
 /// Changes the rows a query finds. The query's table is the one updated;
@@ -636,6 +655,12 @@ impl Update {
         self.returning.push(Select { name: name.to_string(), expr: expr.into() });
         self
     }
+
+    /// Returns every column of each row, as SQL's `RETURNING *`.
+    pub fn returning_all(mut self) -> Update {
+        self.returning = all_columns();
+        self
+    }
 }
 
 /// Removes the rows a query finds from the query's table.
@@ -685,6 +710,12 @@ impl Delete {
 
     pub fn returning_expr(mut self, name: &str, expr: impl Into<Expr>) -> Delete {
         self.returning.push(Select { name: name.to_string(), expr: expr.into() });
+        self
+    }
+
+    /// Returns every column of each row, as SQL's `RETURNING *`.
+    pub fn returning_all(mut self) -> Delete {
+        self.returning = all_columns();
         self
     }
 }

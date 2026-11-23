@@ -751,6 +751,20 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
                 _ => Vec::new(),
             }));
         }
+        Func::JsonTexts => {
+            arity(a.len() == 1)?;
+            return Ok(Value::List(match &a[0] {
+                Value::Json(Json::Array(items)) => items
+                    .iter()
+                    .map(|j| match j {
+                        Json::Null => Value::Null,
+                        Json::String(s) => Value::Text(s.clone()),
+                        other => Value::Text(database_protocol::value::json_text(other)),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }));
+        }
         Func::JsonPluck => {
             arity(a.len() == 2)?;
             let key = text_arg(&a[1], "json_pluck")?;
@@ -1084,7 +1098,7 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
                 words(&a[6])?,
             ))
         }
-        Func::Now | Func::RandomUuid | Func::Coalesce | Func::Least | Func::Greatest | Func::NullIf | Func::ListConcat | Func::JsonElems | Func::JsonPluck
+        Func::Now | Func::RandomUuid | Func::Coalesce | Func::Least | Func::Greatest | Func::NullIf | Func::ListConcat | Func::JsonElems | Func::JsonTexts | Func::JsonPluck
         | Func::JsonArray | Func::JsonObject | Func::ToJson | Func::JsonGet | Func::JsonGetText => unreachable!("handled above"),
     })
 }

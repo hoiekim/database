@@ -315,3 +315,84 @@ async fn a_misbehaving_client_gets_an_error_and_harms_nothing() -> DbResult<()> 
     db.admin().check().await?;
     Ok(())
 }
+
+// R-Q17, R-O4: a full-text index large enough to be kept in many parts,
+// which are merged as it grows and cleaned as rows are deleted and
+// rewritten, answers exactly as reading every row would; and still does
+// after a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_search_index_agrees_with_reading_every_row() -> DbResult<()> {
+    let (server, db) = fresh().await;
+    db.create_table(
+        TableDef::new("notes")
+            .column(ColumnDef::new("id", Type::Int))
+            .column(ColumnDef::new("owner", Type::Int))
+            .column(ColumnDef::new("body", Type::Text))
+            .primary_key(["id"])
+            .index(IndexDef::new("notes_search").on(["owner"]).full_text(TextConfig::Simple, [(col("body"), 1.0)])),
+    )
+    .await?;
+    // A small generator, so the test needs nothing but itself.
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |below: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % below
+    };
+    let body = |next: &mut dyn FnMut(u64) -> u64| (0..180).map(|_| format!("w{}", next(900))).collect::<Vec<_>>().join(" ");
+    let mut model: std::collections::BTreeMap<i64, (i64, String)> = std::collections::BTreeMap::new();
+    for chunk in 0..25i64 {
+        let mut insert = Insert::into("notes").columns(["id", "owner", "body"]);
+        for n in 0..100 {
+            let (id, owner, text) = (chunk * 100 + n, n % 3, body(&mut next));
+            insert = insert.values([val(id), val(owner), val(text.as_str())]);
+            model.insert(id, (owner, text));
+        }
+        db.insert(insert).await?;
+    }
+
+    async fn agrees(db: &Client, model: &std::collections::BTreeMap<i64, (i64, String)>) -> DbResult<()> {
+        for (owner, query, prefix) in [(0, "w7", false), (1, "w7 w13", false), (2, "w899", false), (0, "w12", true), (1, "w1 w88", true), (2, "nothing", false)] {
+            let wanted: Vec<&str> = query.split(' ').collect();
+            let expected: Vec<i64> = model
+                .iter()
+                .filter(|(_, (o, text))| *o == owner && wanted.iter().all(|w| text.split(' ').any(|t| if prefix { t.starts_with(w) } else { t == *w })))
+                .map(|(id, _)| *id)
+                .collect();
+            let search = Query::table("notes").search("notes_search", [owner], query);
+            let search = if prefix { search.match_prefix() } else { search };
+            let mut found: Vec<i64> = column(&db.query(search.columns(["id"])).await?, "id");
+            found.sort();
+            assert_eq!(found, expected, "owner {owner}, {query:?}, prefix {prefix}");
+        }
+        Ok(())
+    }
+    agrees(&db, &model).await?;
+
+    // A third of the rows go, and a third are rewritten.
+    db.delete(Delete::from("notes").filter((col("id") % 3).eq(0))).await?;
+    model.retain(|id, _| id % 3 != 0);
+    for (id, (_, text)) in model.iter_mut().filter(|(id, _)| *id % 3 == 1) {
+        *text = body(&mut next);
+        db.update(Update::table("notes").key([*id]).set("body", text.as_str())).await?;
+    }
+    agrees(&db, &model).await?;
+    // A row written again with the words it had stays as it is.
+    let (id, (_, text)) = model.iter().next().unwrap();
+    db.update(Update::table("notes").key([*id]).set("body", text.as_str())).await?;
+    agrees(&db, &model).await?;
+    let report = db.admin().check().await?;
+    assert!(report.contains(&format!("table notes: {} rows, 1 indexes", model.len())), "{report}");
+    db.close();
+
+    let server = TestServer::start_with(server.restart_dir().await, |_| {}).await;
+    let db = Client::connect_url(&server.url("test")).await?;
+    agrees(&db, &model).await?;
+    // Emptied, the index gives its room back.
+    db.delete(Delete::from("notes")).await?;
+    model.clear();
+    agrees(&db, &model).await?;
+    db.admin().check().await?;
+    Ok(())
+}

@@ -459,22 +459,111 @@ pub fn walk<P: Pages + ?Sized>(
     rec(p, root, None, on_page, on_entry)
 }
 
+// -------------------------------------------------------------- building
+
+/// Builds a tree from entries given in rising key order, writing each
+/// page once and leaving every page but the last of its level full. Far
+/// cheaper than as many `put`s, each of which rewrites a page.
+#[derive(Default)]
+pub struct Builder {
+    /// The page being filled at each level, leaves first.
+    levels: Vec<Level>,
+    last: Vec<u8>,
+}
+
+#[derive(Default)]
+struct Level {
+    cells: Vec<Vec<u8>>,
+    used: usize,
+    /// The lowest key under the page being filled.
+    low: Vec<u8>,
+}
+
+impl Builder {
+    pub fn new() -> Builder {
+        Builder::default()
+    }
+
+    pub fn push<P: PagesMut>(&mut self, p: &mut P, key: &[u8], value: &[u8]) -> Result<()> {
+        check_sizes(key, value)?;
+        if !self.levels.is_empty() && key <= self.last.as_slice() {
+            return Err(Error::corrupt("a tree was built from keys out of order"));
+        }
+        self.last.clear();
+        self.last.extend_from_slice(key);
+        self.add(p, 0, None, leaf_cell(key, value), key)
+    }
+
+    /// Adds a cell to a level, first writing out the level's page if the
+    /// cell does not fit in it. `child` is given for a branch's cell, and
+    /// `low` is the lowest key under the cell.
+    fn add<P: PagesMut>(&mut self, p: &mut P, level: usize, child: Option<PageId>, mut cell: Vec<u8>, low: &[u8]) -> Result<()> {
+        if self.levels.len() == level {
+            self.levels.push(Level::default());
+        }
+        if self.levels[level].used + cell.len() + 2 > CAPACITY {
+            self.write(p, level)?;
+        }
+        let at = &mut self.levels[level];
+        if at.cells.is_empty() {
+            at.low = low.to_vec();
+            // The first key of a branch is never read: store it empty.
+            if let Some(child) = child {
+                cell = branch_cell(child, &[]);
+            }
+        }
+        at.used += cell.len() + 2;
+        at.cells.push(cell);
+        Ok(())
+    }
+
+    /// Writes the page a level is filling and tells the level above.
+    fn write<P: PagesMut>(&mut self, p: &mut P, level: usize) -> Result<PageId> {
+        let at = &mut self.levels[level];
+        let cells: Vec<&[u8]> = at.cells.iter().map(|c| c.as_slice()).collect();
+        let id = p.alloc(build(if level == 0 { KIND_LEAF } else { KIND_BRANCH }, &cells))?;
+        let low = std::mem::take(&mut at.low);
+        at.cells.clear();
+        at.used = 0;
+        self.add(p, level + 1, Some(id), branch_cell(id, &low), &low)?;
+        Ok(id)
+    }
+
+    /// The tree's root: `NO_PAGE` if nothing was pushed.
+    pub fn finish<P: PagesMut>(mut self, p: &mut P) -> Result<PageId> {
+        if self.levels.is_empty() {
+            return Ok(NO_PAGE);
+        }
+        let mut level = 0;
+        loop {
+            // A page that is all there is of the top level is the root.
+            let id = self.write(p, level)?;
+            if level + 2 == self.levels.len() && self.levels[level + 1].cells.len() == 1 {
+                return Ok(id);
+            }
+            level += 1;
+        }
+    }
+}
+
 // --------------------------------------------------------------- cursor
 
 /// A position in a tree that can step to the next or previous entry. It
 /// reads the tree as of the root it was given, whatever is written after.
-pub struct Cursor<'p, P: Pages + ?Sized> {
-    pages: &'p P,
+///
+/// It holds no borrow of the pages: each move is handed them. So a tree
+/// can be read through one of these while another tree is written.
+pub struct Scan {
     root: PageId,
     /// The pages from the root down to a leaf, each with the index of the
-    /// cell the cursor is at or went down through. Empty when the cursor
-    /// is off either end.
+    /// cell the scan is at or went down through. Empty when the scan is
+    /// off either end.
     path: Vec<(Page, usize)>,
 }
 
-impl<'p, P: Pages + ?Sized> Cursor<'p, P> {
-    pub fn new(pages: &'p P, root: PageId) -> Self {
-        Cursor { pages, root, path: Vec::new() }
+impl Scan {
+    pub fn new(root: PageId) -> Scan {
+        Scan { root, path: Vec::new() }
     }
 
     pub fn valid(&self) -> bool {
@@ -494,9 +583,9 @@ impl<'p, P: Pages + ?Sized> Cursor<'p, P> {
         self.leaf().map(|(node, i)| node.value(i))
     }
 
-    fn descend(&mut self, mut id: PageId, pick: &dyn Fn(Node) -> usize) -> Result<()> {
+    fn descend<P: Pages + ?Sized>(&mut self, pages: &P, mut id: PageId, pick: &dyn Fn(Node) -> usize) -> Result<()> {
         loop {
-            let page = self.pages.page(id)?;
+            let page = pages.page(id)?;
             let node = Node::new(&page, id)?;
             let i = pick(node);
             let next = (!node.is_leaf()).then(|| node.child(i));
@@ -508,52 +597,52 @@ impl<'p, P: Pages + ?Sized> Cursor<'p, P> {
         }
     }
 
-    pub fn first(&mut self) -> Result<()> {
+    pub fn first<P: Pages + ?Sized>(&mut self, pages: &P) -> Result<()> {
         self.path.clear();
         if self.root != NO_PAGE {
-            self.descend(self.root, &|_| 0)?;
+            self.descend(pages, self.root, &|_| 0)?;
         }
         Ok(())
     }
 
-    pub fn last(&mut self) -> Result<()> {
+    pub fn last<P: Pages + ?Sized>(&mut self, pages: &P) -> Result<()> {
         self.path.clear();
         if self.root != NO_PAGE {
-            self.descend(self.root, &|node| node.len() - 1)?;
+            self.descend(pages, self.root, &|node| node.len() - 1)?;
         }
         Ok(())
     }
 
     /// Moves to the first entry whose key is `key` or greater.
-    pub fn seek(&mut self, key: &[u8]) -> Result<()> {
+    pub fn seek<P: Pages + ?Sized>(&mut self, pages: &P, key: &[u8]) -> Result<()> {
         self.path.clear();
         if self.root == NO_PAGE {
             return Ok(());
         }
-        self.descend(self.root, &|node| if node.is_leaf() { node.search(key).0 } else { node.child_for(key) })?;
+        self.descend(pages, self.root, &|node| if node.is_leaf() { node.search(key).0 } else { node.child_for(key) })?;
         let (node, i) = self.leaf().unwrap();
         if i == node.len() {
             // Past this leaf's last entry: the next leaf's first, if any.
             self.path.last_mut().unwrap().1 = i - 1;
-            self.next()?;
+            self.next(pages)?;
         }
         Ok(())
     }
 
     /// Moves to the last entry whose key is below `key`, or is `key` itself
     /// when `inclusive`.
-    pub fn seek_back(&mut self, key: &[u8], inclusive: bool) -> Result<()> {
-        self.seek(key)?;
+    pub fn seek_back<P: Pages + ?Sized>(&mut self, pages: &P, key: &[u8], inclusive: bool) -> Result<()> {
+        self.seek(pages, key)?;
         if !self.valid() {
-            return self.last();
+            return self.last(pages);
         }
         if !(inclusive && self.key() == Some(key)) {
-            self.prev()?;
+            self.prev(pages)?;
         }
         Ok(())
     }
 
-    pub fn next(&mut self) -> Result<()> {
+    pub fn next<P: Pages + ?Sized>(&mut self, pages: &P) -> Result<()> {
         let Some((page, i)) = self.path.last_mut() else { return Ok(()) };
         if *i + 1 < (Node { page }).len() {
             *i += 1;
@@ -565,14 +654,14 @@ impl<'p, P: Pages + ?Sized> Cursor<'p, P> {
             if *i + 1 < node.len() {
                 *i += 1;
                 let child = node.child(*i);
-                return self.descend(child, &|_| 0);
+                return self.descend(pages, child, &|_| 0);
             }
             self.path.pop();
         }
         Ok(())
     }
 
-    pub fn prev(&mut self) -> Result<()> {
+    pub fn prev<P: Pages + ?Sized>(&mut self, pages: &P) -> Result<()> {
         let Some((_, i)) = self.path.last_mut() else { return Ok(()) };
         if *i > 0 {
             *i -= 1;
@@ -583,11 +672,62 @@ impl<'p, P: Pages + ?Sized> Cursor<'p, P> {
             if *i > 0 {
                 *i -= 1;
                 let child = (Node { page }).child(*i);
-                return self.descend(child, &|node| node.len() - 1);
+                return self.descend(pages, child, &|node| node.len() - 1);
             }
             self.path.pop();
         }
         Ok(())
+    }
+}
+
+/// A [`Scan`] together with the pages it reads.
+pub struct Cursor<'p, P: Pages + ?Sized> {
+    pages: &'p P,
+    scan: Scan,
+}
+
+impl<'p, P: Pages + ?Sized> Cursor<'p, P> {
+    pub fn new(pages: &'p P, root: PageId) -> Self {
+        Cursor { pages, scan: Scan::new(root) }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.scan.valid()
+    }
+
+    pub fn key(&self) -> Option<&[u8]> {
+        self.scan.key()
+    }
+
+    pub fn value(&self) -> Option<&[u8]> {
+        self.scan.value()
+    }
+
+    pub fn first(&mut self) -> Result<()> {
+        self.scan.first(self.pages)
+    }
+
+    pub fn last(&mut self) -> Result<()> {
+        self.scan.last(self.pages)
+    }
+
+    /// Moves to the first entry whose key is `key` or greater.
+    pub fn seek(&mut self, key: &[u8]) -> Result<()> {
+        self.scan.seek(self.pages, key)
+    }
+
+    /// Moves to the last entry whose key is below `key`, or is `key` itself
+    /// when `inclusive`.
+    pub fn seek_back(&mut self, key: &[u8], inclusive: bool) -> Result<()> {
+        self.scan.seek_back(self.pages, key, inclusive)
+    }
+
+    pub fn next(&mut self) -> Result<()> {
+        self.scan.next(self.pages)
+    }
+
+    pub fn prev(&mut self) -> Result<()> {
+        self.scan.prev(self.pages)
     }
 }
 
@@ -837,6 +977,45 @@ pub(crate) mod tests {
         assert!(!empty.valid());
         empty.seek_back(b"x", true).unwrap();
         assert!(!empty.valid());
+    }
+
+    #[test]
+    fn a_built_tree_reads_like_one_made_of_puts() {
+        let mut rng = Rng::new(3);
+        for count in [0usize, 1, 2, 7, 300, 5_000, 40_000] {
+            let mut p = MemPages::new();
+            let mut model = BTreeMap::new();
+            while model.len() < count {
+                // Keys and values of every size, some as large as fit.
+                let mut key = random_key(&mut rng, 1 << 40);
+                if rng.chance(50) {
+                    key.resize(MAX_KEY - rng.below(40) as usize, 7);
+                }
+                let room = max_value(key.len());
+                let value = if rng.chance(20) { vec![1u8; room] } else { vec![2u8; rng.below(room.min(60) as u64 + 1) as usize] };
+                model.insert(key, value);
+            }
+            let mut builder = Builder::new();
+            for (key, value) in &model {
+                builder.push(&mut p, key, value).unwrap();
+            }
+            let root = builder.finish(&mut p).unwrap();
+            assert_eq!(root == NO_PAGE, count == 0);
+            check(&p, root, &model);
+            // It is a tree like any other from here on.
+            let mut root = root;
+            for (key, _) in model.iter().step_by(3) {
+                root = delete(&mut p, root, key).unwrap().0;
+            }
+            let rest: BTreeMap<Vec<u8>, Vec<u8>> = model.iter().enumerate().filter(|(n, _)| n % 3 != 0).map(|(_, (k, v))| (k.clone(), v.clone())).collect();
+            check(&p, root, &rest);
+            destroy(&mut p, root, &mut |_, _| Ok(())).unwrap();
+            assert!(p.pages.is_empty());
+        }
+        let mut p = MemPages::new();
+        let mut builder = Builder::new();
+        builder.push(&mut p, b"b", b"").unwrap();
+        assert!(builder.push(&mut p, b"a", b"").is_err(), "keys must rise");
     }
 
     #[test]

@@ -167,6 +167,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// should not become a million index entries.
 pub const MAX_INDEXED_BYTES: usize = 1_000_000;
 
+/// In order, to be searched by halving.
 const STOP_WORDS: &[&str] = &[
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at", "be", "because", "been", "before",
     "being", "below", "between", "both", "but", "by", "can", "did", "do", "does", "doing", "don", "down", "during", "each", "few", "for", "from",
@@ -220,7 +221,7 @@ fn normalize(word: &str, config: TextConfig) -> String {
     match config {
         TextConfig::Simple => lower,
         TextConfig::English => {
-            if STOP_WORDS.contains(&lower.as_str()) {
+            if STOP_WORDS.binary_search(&lower.as_str()).is_ok() {
                 String::new()
             } else {
                 stem(&lower)
@@ -493,6 +494,14 @@ mod tests {
 
     fn like(text: &str, pattern: &str) -> bool {
         Like::new(pattern, false).matches(text)
+    }
+
+    #[test]
+    fn stop_words_are_in_order() {
+        assert!(STOP_WORDS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(normalize("The", TextConfig::English), "");
+        assert_eq!(normalize("Yourselves", TextConfig::English), "");
+        assert_eq!(normalize("theory", TextConfig::English), "theori");
     }
 
     #[test]

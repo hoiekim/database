@@ -10,6 +10,7 @@ pub mod engine;
 pub mod error;
 pub mod eval;
 pub mod exec;
+pub mod fts;
 pub mod keys;
 pub mod page;
 pub mod row;

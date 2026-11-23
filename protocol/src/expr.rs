@@ -203,6 +203,10 @@ pub enum Func {
     JsonObject = 64,
     /// Any value as JSON.
     ToJson = 65,
+    /// An array's items as a list of text: a string as it is, a null as
+    /// NULL, anything else as its JSON text. An empty list for NULL or
+    /// anything that is not an array.
+    JsonTexts = 66,
 
     // Lists.
     ListLen = 80,
@@ -274,6 +278,7 @@ impl Func {
             63 => JsonArray,
             64 => JsonObject,
             65 => ToJson,
+            66 => JsonTexts,
             80 => ListLen,
             81 => ListOverlaps,
             82 => ListConcat,
@@ -684,6 +689,10 @@ impl Expr {
     }
     pub fn json_pluck(self, key: &str) -> Expr {
         self.call2(Func::JsonPluck, key)
+    }
+    /// A JSON array's items as a list of text.
+    pub fn json_texts(self) -> Expr {
+        self.call1(Func::JsonTexts)
     }
     pub fn list_overlaps(self, other: impl Into<Expr>) -> Expr {
         self.call2(Func::ListOverlaps, other)

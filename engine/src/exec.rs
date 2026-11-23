@@ -8,6 +8,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 use database_protocol::error::{DbError, ErrorCode};
 use database_protocol::expr::{AggFunc, ArithOp, Expr, SubqueryKind};
@@ -17,12 +18,11 @@ use database_protocol::schema::IndexKind;
 use database_protocol::value::{Type, Value};
 
 use crate::btree::{self, Cursor};
-use crate::catalog::Table;
+use crate::catalog::{Table, TableMeta};
 use crate::error::{Error, Result};
 use crate::eval::{self, eval, holds, AggValues, Ctx, Frame, Scope};
 use crate::keys;
 use crate::row::Row;
-use crate::text;
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::Db(DbError::invalid(message))
@@ -343,18 +343,13 @@ fn walk_tree(
     Ok(true)
 }
 
-/// The score a full-text index entry holds, after the key offset.
-fn entry_score(value: &[u8]) -> f64 {
-    let mut pos = 0;
-    let _ = crate::page::get_varint(value, &mut pos);
-    value.get(pos..pos + 4).map_or(0.0, |b| f64::from(f32::from_le_bytes(b.try_into().unwrap())))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn search(ctx: &Ctx, table: &Table, outer: &Scope, index: &str, prefix: &[Expr], query: &Expr, match_prefix: bool, on_hit: &mut dyn FnMut(&Hit) -> Result<bool>) -> Result<bool> {
     let i = table.index(index)?;
     let def = &table.indexes[i].def;
-    let IndexKind::FullText { config, .. } = &def.kind else { return Err(invalid(format!("index {index:?} is not a full-text index"))) };
+    if !matches!(def.kind, IndexKind::FullText { .. }) {
+        return Err(invalid(format!("index {index:?} is not a full-text index")));
+    }
     if prefix.len() != def.keys.len() {
         return Err(invalid(format!("a search of {index:?} must give its {} leading keys", def.keys.len())));
     }
@@ -363,35 +358,13 @@ fn search(ctx: &Ctx, table: &Table, outer: &Scope, index: &str, prefix: &[Expr],
         Value::Text(s) => s,
         other => return Err(Error::Db(DbError::type_mismatch(format!("a search query is text, not {}", other.type_name())))),
     };
-    let lead = bound_prefix(ctx, outer, prefix, &index_parts(table, i))?;
-    let mut matched: Option<HashMap<Vec<u8>, f64>> = None;
-    for term in text::query_terms(&query, *config) {
-        let mut start = lead.clone();
-        if match_prefix {
-            keys::encode_text_prefix(&mut start, &term);
-        } else {
-            keys::encode(&mut start, &Value::Text(term), false);
-        }
-        let end = keys::successor(&start);
-        let mut found: HashMap<Vec<u8>, f64> = HashMap::new();
-        walk_range(ctx, table.index_roots[i], Some(&start), end.as_deref(), false, &mut |key, value| {
-            let pk = entry_pk(key, value)?;
-            // Only rows that had every word so far can still match.
-            if matched.as_ref().is_none_or(|m| m.contains_key(pk)) {
-                *found.entry(pk.to_vec()).or_insert(0.0) += entry_score(value);
-            }
-            Ok(true)
-        })?;
-        if let Some(previous) = &matched {
-            for (pk, score) in &mut found {
-                *score += previous[pk];
-            }
-        }
-        matched = Some(found);
+    // A leading key that is NULL equals no row's.
+    let lead = prefix.iter().map(|e| eval(ctx, outer, e)).collect::<Result<Vec<_>>>()?;
+    if lead.iter().any(Value::is_null) {
+        return Ok(true);
     }
-    let mut rows: Vec<(Vec<u8>, f64)> = matched.unwrap_or_default().into_iter().collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    for (n, (pk, rank)) in rows.into_iter().enumerate() {
+    let lead = encode_prefix(lead, &index_parts(table, i))?;
+    for (n, (pk, rank)) in crate::fts::search(ctx, table, i, &lead, &query, match_prefix)?.into_iter().enumerate() {
         if n % 256 == 255 {
             ctx.check_deadline()?;
         }
@@ -403,13 +376,34 @@ fn search(ctx: &Ctx, table: &Table, outer: &Scope, index: &str, prefix: &[Expr],
     Ok(true)
 }
 
+/// The table a query reads. A query of no table reads one that has no
+/// columns and a single row, so that what it selects is computed once.
+fn table_of(ctx: &Ctx, name: &str) -> Result<Arc<Table>> {
+    static NONE: OnceLock<Arc<Table>> = OnceLock::new();
+    if !name.is_empty() {
+        return Ok(ctx.catalog.table(name)?.clone());
+    }
+    Ok(NONE
+        .get_or_init(|| {
+            let meta = TableMeta { id: 0, name: String::new(), cols: Vec::new(), by_name: HashMap::new(), pk: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), volatile: true };
+            Arc::new(Table::empty(meta))
+        })
+        .clone())
+}
+
 /// Calls `f` for each row of `q` that survives its joins and its filter,
 /// with the scope the row is read in and the hit on the query's own
 /// table. `f` returns false to stop; `stopped` is then set, to tell that
 /// apart from a join that merely reached its limit.
 pub fn for_each_match(ctx: &Ctx, q: &Query, outer: &Scope, stopped: &Cell<bool>, f: &mut dyn FnMut(&Scope, &Hit) -> Result<bool>) -> Result<()> {
-    let table = ctx.catalog.table(&q.table)?.clone();
+    let table = table_of(ctx, &q.table)?;
     let alias = q.alias.as_deref().unwrap_or(&table.name);
+    if q.table.is_empty() {
+        let hit = Hit { pk: Vec::new(), row: Row::from_values(&[]), depth: None, rank: None };
+        let frame = [Frame { alias, table: &table, row: Some(&hit.row) }];
+        let scope = Scope { frames: &frame, outer: Some(outer), ..Scope::default() };
+        return join_level(ctx, q, 0, &scope, &hit, stopped, f);
+    }
     scan(ctx, &table, alias, &q.access, outer, &mut |hit| {
         let frame = [Frame { alias, table: &table, row: Some(&hit.row) }];
         let scope = Scope { frames: &frame, depth: hit.depth, rank: hit.rank, outer: Some(outer), ..Scope::default() };
@@ -551,7 +545,7 @@ fn project(ctx: &Ctx, q: &Query, scope: &Scope, table: &Table, all: &Option<Vec<
 
 /// Runs a query to its rows.
 pub fn query(ctx: &Ctx, q: &Query, outer: &Scope) -> Result<RowSet> {
-    let table = ctx.catalog.table(&q.table)?.clone();
+    let table = table_of(ctx, &q.table)?;
     if q.is_aggregate() {
         return aggregate(ctx, q, outer);
     }

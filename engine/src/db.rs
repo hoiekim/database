@@ -379,6 +379,10 @@ impl Database {
             }
             // Each index: exactly the entries the rows call for.
             for (i, index) in table.indexes.iter().enumerate() {
+                if matches!(index.def.kind, database_protocol::schema::IndexKind::FullText { .. }) {
+                    crate::fts::verify(&ctx, table, i, &mut |id| claim(id, &index.def.name))?;
+                    continue;
+                }
                 let mut entries = 0u64;
                 btree::walk(pages, table.index_roots[i], &mut |id| claim(id, &index.def.name), &mut |key, value| {
                     entries += 1;
