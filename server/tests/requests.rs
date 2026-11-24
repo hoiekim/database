@@ -528,6 +528,29 @@ async fn a_first_statement_that_fails_leaves_a_transaction_to_end_not_a_statemen
         assert_eq!(balance(&db, 1).await?, 3, "the update did not run alone");
     }
 
+    // The first statement is refused by the client itself, before it is
+    // sent: it is larger than a frame may be. The server has heard of no
+    // transaction, so the client must not take one for begun: the next
+    // statement begins it, and is undone with it.
+    for commit in [false, true] {
+        let result: DbResult<()> = db
+            .exclusive(|tx| async move {
+                let e = tx.query(Query::table("accounts").filter(col("id").ne(val("x".repeat(257 * 1024 * 1024))))).await.unwrap_err();
+                assert_eq!(e.code, ErrorCode::InvalidRequest, "{e}");
+                tx.update(Update::table("accounts").key([1]).set("balance", col("balance") + 10)).await?;
+                assert_eq!(balance(&tx, 1).await?, 13, "inside the transaction");
+                if commit {
+                    Ok(())
+                } else {
+                    Err(DbError::invalid("on second thoughts"))
+                }
+            })
+            .await;
+        assert_eq!(result.is_ok(), commit);
+        assert_eq!(balance(&db, 1).await?, if commit { 13 } else { 3 }, "the update stands or falls with its transaction");
+    }
+    db.update(Update::table("accounts").key([1]).set("balance", 3)).await?;
+
     // By hand. What is not a statement cannot begin a transaction, and
     // leaves a dead one all the same, until it is ended.
     let e = db.call(Request::BeginWith { kind: TxnKind::Optimistic, lock_wait_ms: 0, statement: Box::new(Request::Commit) }).await.unwrap_err();

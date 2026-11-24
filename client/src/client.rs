@@ -690,7 +690,8 @@ impl Db for Transaction {
         let mut state = self.inner.state.lock().await;
         let TxState { conn, pending } = &mut *state;
         let conn = conn.as_mut().ok_or_else(ended)?;
-        let request = match pending.take() {
+        let begin = pending.take();
+        let request = match begin {
             // Its first statement: the server begins the transaction and
             // runs the statement in it. Whatever it answers, the
             // connection then carries a transaction that has to be
@@ -702,6 +703,14 @@ impl Db for Transaction {
             None => request,
         };
         let result = conn.conn().call(request).await;
+        if result.is_err() && begin.is_some() && conn.conn().never_left() {
+            // Refused here, before it was sent (it was too large to
+            // send): the server has begun nothing. The transaction is
+            // still to begin, with whatever statement comes next; were
+            // it taken for begun, that statement would go out alone.
+            *pending = begin;
+            conn.held = false;
+        }
         self.inner.note(result)
     }
 }
