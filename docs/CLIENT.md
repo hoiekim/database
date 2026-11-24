@@ -17,6 +17,12 @@ in the URL). Clone it freely. Everything that reads or writes is a method
 of the `Db` trait, which `Client` and `Transaction` both implement, so a
 function can take `db: &impl Db` and run either way.
 
+An application on the server's own host can connect through the
+server's Unix domain socket instead of TCP, which saves every request
+its trip through the network stack: add
+`?socket=/run/database/database.sock` (the server's `DATABASE_SOCKET`)
+to the URL. The host and port are then not used.
+
 ## Tables
 
 ```rust
@@ -320,7 +326,51 @@ Errors are `DbError { code, message, constraint, table }`:
 | `LockTimeout`, `Timeout` | Waited too long for the write lock; the statement ran too long |
 | `TransactionAborted` | The transaction already failed or ended |
 | `Conflict` | An optimistic transaction was told something that a commit made beside it has since changed. Nothing of it took effect; `db.transaction(..)` runs it again by itself |
+| `Unmet` | A statement of a batch did not affect the number of rows the batch said it must (`Batch::expect`). Nothing of the batch took effect |
 | `Connection` | The connection broke; whether the statement took effect is unknown |
+
+## Prepared statements
+
+A statement that runs often is built once, with `param(n)` where its
+values go, and run with `execute`:
+
+```rust
+// Once, when the application starts.
+let by_token = Prepared::new(
+    Query::table("sessions").alias("s")
+        .index("sessions_token_hash_key", KeyRange::eq([param(0)]))
+        .join(Query::table("users").alias("u").key([col("s.user_id")]))
+        .filter(col("s.expires_at").gt(now()))
+        .select("username", col("u.username")),
+);
+let touch = Prepared::new(Update::table("sessions").key([param(0)]).set("seen", now()).set("ip", param(1)));
+
+// For each request.
+let user = db.execute(&by_token, [hash]).await?.opt();
+db.execute(&touch, [Value::from(id), Value::from(ip)]).await?;
+```
+
+- A `Prepared` is a query, an insert, an update or a delete. Each
+  connection sends it to the server once; the server keeps it as it was
+  decoded, and after that only its number and the values travel. That is
+  a good part of what a small request costs on both sides (`PERFORMANCE.md`
+  has the figures), so prepare whatever an application runs for every
+  request.
+- `param(n)` is the `n`th value given to `execute`, counting from 0, and
+  may stand wherever an expression may: a key, a bound, a filter, an
+  assigned or inserted value. The values are of one type per call
+  (`[a, b]`); give `Value`s to mix types.
+- It belongs to no client, connection or transaction: clone it, share
+  it, keep it in a `static`. `tx.execute(..)` runs it inside a
+  transaction, `Batch::add_prepared` in a batch.
+- A value is checked as it would be if it were written into the
+  statement: the wrong type is `TypeMismatch`, too few values
+  `InvalidRequest`.
+- A connection keeps 256 statements, of up to 64 kB each as sent and a
+  megabyte together. Past that the one used longest ago makes way and
+  is sent again when next used, which the caller does not see. A
+  statement built anew for every call is never worth preparing, and one
+  larger than 64 kB is refused: send it as it is.
 
 ## Transactions
 
@@ -350,6 +400,19 @@ Dropping a transaction rolls it back.
   write. What `work` must not do is anything but talk to the database
   through `tx`: whatever else it does (a message sent, a counter kept in
   memory) is done once per run.
+- **A transaction begins with its first statement.** `transaction`,
+  `exclusive` and `read` send nothing until `work` runs a statement,
+  and the begin travels with that statement: what the transaction sees
+  of the database is as of then, and one that runs no statement costs
+  nothing. (`begin()`, `begin_optimistic()` and `begin_read()` begin at
+  once: the transaction exists when they return.)
+- **Where conflicts are the rule, a transaction goes straight to the
+  write lock.** How many runs beside other writers it gets is
+  `optimistic_runs`, 2 unless set (`?optimistic_runs=1` in the URL, or
+  0 to take the lock from the start). And while more than a third of a
+  client's transactions conflict on their first run, as when many of
+  them change the same row, a second run would mostly conflict again:
+  one that conflicts then becomes the only writer at once.
 - **`db.exclusive(work)`, or `db.begin()`, has the database to itself.**
   It waits for any other writer to finish, then holds the write lock
   until it ends; what it reads is the latest committed state and cannot
@@ -389,6 +452,45 @@ Dropping a transaction rolls it back.
   `tx.savepoint("s")`, then on failure `tx.rollback_to("s")` and carry
   on. `tx.release("s")` forgets it.
 
+### A transaction in one request
+
+A transaction whose statements need nothing from each other's answers
+can be sent whole:
+
+```rust
+let results = db.batch(
+    Batch::new()
+        .add(Update::table("accounts").key([from]).filter(col("balance").ge(amount)).set("balance", col("balance") - amount))
+        .expect(1)
+        .add(Update::table("accounts").key([to]).set("balance", col("balance") + amount))
+        .expect(1)
+        .add(Insert::into("ledger").set("from_id", from).set("to_id", to).set("amount", amount).returning(["id"])),
+).await?;
+let entry: i64 = results[2].first().unwrap().get("id")?;
+```
+
+- The statements run in order as one transaction: all of them take
+  effect or none does, nothing else is written between them, each sees
+  what those before it did, and they are on disk when `batch` returns.
+  The result is one `Rows` per statement.
+- It is one round trip where `transaction` makes one per statement, and
+  it runs once, as the database's only writer for the moment it takes:
+  there is nothing to check at a commit and nothing to run again. The
+  same transfer as a `transaction` is six requests.
+- **`expect(n)`** makes the statement before it a condition of the rest:
+  if it does not affect exactly `n` rows (a query: return `n` rows), the
+  batch ends there with `ErrorCode::Unmet` and nothing of it remains.
+  That covers what a transaction usually reads for: "only if the
+  account holds enough", "only if this row is still there". A decision
+  that needs a value in the application is still a `transaction`.
+- A statement that fails ends the batch the same way, with the error it
+  would give alone; the message says which statement it was.
+- `add_prepared(&prepared, [values])` adds a prepared statement.
+- A batch of queries alone reads one moment of the database, like
+  `db.read(..)`, and holds nobody up.
+- A batch holds queries, inserts, updates and deletes. A schema change
+  goes in a `transaction` or `exclusive`.
+
 ## Named locks
 
 ```rust
@@ -423,6 +525,9 @@ dropped or the process dies. It occupies one pooled connection.
 | `INSERT .. ON CONFLICT (k) DO UPDATE SET n = t.n + 1 RETURNING n` | `.on_conflict_update(index).update("n", col("n") + 1).returning(["n"])` |
 | `pg_advisory_lock(k)` (session) | `db.lock(name)` |
 | `pg_advisory_xact_lock(k)` | nothing: a transaction's result is as if it had run alone; `db.exclusive(..)` to hold the database while it runs |
+| `PREPARE` / a driver's statement cache, `$1` | `Prepared::new(statement)` with `param(0)`, run with `db.execute(&prepared, [values])` |
+| `BEGIN; UPDATE ..; UPDATE ..; INSERT ..; COMMIT` sent as one string, or a pipeline | `db.batch(Batch::new().add(..).add(..))` |
+| `UPDATE .. WHERE balance >= $1` and checking the row count before going on | `.filter(..)` on the update and `.expect(1)` after it in a batch |
 | `a @> '[{"address": "x"}]'` | an `on_each(col("a").json_pluck("address"))` index, read with `KeyRange::eq([.., "x"])`; or `col("a").json_contains(json)` as a filter |
 | `WITH RECURSIVE` over `parent_id` | `ancestors` / `descendants` |
 | `to_tsvector` / `@@` / `ts_rank` / `ts_headline` | a full-text index, `search`, `Expr::Rank`, `Func::Headline` |

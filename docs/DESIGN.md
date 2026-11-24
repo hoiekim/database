@@ -15,9 +15,10 @@ bench/      the same workloads against this and against Postgres
 ```
 
 An application holds a `Client`. A request is a Rust value (`Query`, `Insert`,
-`TableDef`, ..) encoded into one frame and sent over TCP. The server
-decodes it and calls the engine, which runs it against one database's
-files and returns rows.
+`TableDef`, ..) encoded into one frame and sent over TCP, or over a Unix
+domain socket to a server on the same host. The server decodes it and
+calls the engine, which runs it against one database's files and returns
+rows.
 
 ## What was left out, and what that bought
 
@@ -331,11 +332,50 @@ Postgres took 53, and a durable insert 400 µs against 170. So:
   A commit that put nothing in the log (it changed only tables that
   need not survive a crash) is published at once.
 
+**What a small request costs is mostly not the engine**: the trip
+through the network stack, decoding the request into a tree of
+expressions, and for a transaction one round trip per statement. Three
+things cut that, each a request kind of its own (`message.rs`):
+
+- A **prepared statement** is kept by the connection, decoded, under a
+  number its client chose; run again, the request is that number and
+  the values for the statement's parameters (`Expr::Param`), which the
+  evaluator reads from its context. Nothing is substituted into the
+  tree, so nothing is rebuilt. The client sends the statement with the
+  first request that names it on a connection, so preparing is not a
+  round trip of its own. A connection keeps 256, letting go of the one
+  used longest ago; asked for one it let go it says so, having run
+  nothing, and the client sends it again. A session lookup's request
+  went from 54,700 instructions in the server to 37,800.
+- A **transaction begins with its first statement** (`BeginWith`): one
+  request, answered as the statement. If the transaction cannot begin,
+  the connection is left with a dead one that can only be ended, as
+  after a failed statement, so that whatever the client sends next
+  cannot run outside the transaction it was meant for.
+- A **batch** is a whole transaction in one request, for statements
+  that need no answers from each other. It runs as one job in the
+  gate, like a brief write: it has the turn while it runs, so there is
+  no fork, nothing to compare at a commit and nothing to run twice. A
+  statement can carry the number of rows it must affect, and the batch
+  is undone if it does not: a condition without a round trip. The
+  answer is each statement's result in order, or one error.
+
+A fork run again by the server (see "Transactions") runs each kept
+statement with the values it had the first time: they are part of what
+the connection keeps of a step.
+
 A connection says which database it wants and proves it with that
 database's password (stored as a salted hash; the admin password comes
 from the environment and may do anything). The protocol is not
 encrypted: the server is meant for a private network, such as the one
 between an application's containers.
+
+Given a path, the server also listens on a **Unix domain socket**
+there. A connection is served the same whichever way it came (the
+session is written over any pair of byte streams), and is asked for the
+same password; what differs is that the file's permissions decide who
+may connect at all, and that each request and answer skip the loopback
+network's work, about 15 µs of the 50 a point lookup takes.
 
 Named locks live in the server, per database and name, owned by a
 connection and released when it closes.

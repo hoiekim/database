@@ -45,6 +45,9 @@ pub enum Expr {
     List(Vec<Expr>),
     Agg { func: AggFunc, arg: Option<Box<Expr>>, filter: Option<Box<Expr>>, distinct: bool },
     Subquery(Box<Query>, SubqueryKind),
+    /// In a prepared statement: the value given for this place each time
+    /// the statement is run, counting from 0. See `Request::Prepared`.
+    Param(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,6 +377,13 @@ pub fn val(v: impl Into<Value>) -> Expr {
 
 pub fn null() -> Expr {
     Expr::Value(Value::Null)
+}
+
+/// In a prepared statement: the `n`th value it is run with, counting from
+/// 0. The statement is then sent once and run many times with different
+/// values, as SQL's `$1` is.
+pub fn param(n: u32) -> Expr {
+    Expr::Param(n)
 }
 
 /// The server's clock. See `Func::Now`.
@@ -761,7 +771,7 @@ impl Expr {
                     e.visit(f);
                 }
             }
-            Expr::Value(_) | Expr::Column(..) | Expr::Excluded(_) | Expr::Old(_) | Expr::Depth | Expr::Rank | Expr::Subquery(..) => {}
+            Expr::Value(_) | Expr::Column(..) | Expr::Excluded(_) | Expr::Old(_) | Expr::Depth | Expr::Rank | Expr::Subquery(..) | Expr::Param(_) => {}
         }
     }
 }

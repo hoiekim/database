@@ -3,8 +3,11 @@
 //! A connection carries frames: a four-byte little-endian length, then
 //! that many bytes. The client's first frame is `Request::Hello`. After
 //! that each request gets one response, in order, except that a dump
-//! answers with `Chunk` frames until `Ok`, and a large result with several
-//! `Rows` frames, all but the last marked `more`.
+//! answers with `Chunk` frames until `Ok`, a large result with several
+//! `Rows` frames, all but the last marked `more`, and a batch with one
+//! result for each of its statements.
+
+use std::sync::Arc;
 
 use crate::codec::*;
 use crate::error::{DbError, DbResult, ErrorCode};
@@ -12,9 +15,17 @@ use crate::query::{Delete, Insert, Query, Update};
 use crate::schema::{ColumnDef, IndexDef, TableDef};
 use crate::value::Value;
 
-/// Bumped when a frame's meaning changes. The server refuses a client
-/// that speaks another version, in the answer to its `Hello`.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// What a client says it speaks, in its `Hello`: bumped when a frame's
+/// meaning changes, or when the client comes to send something an older
+/// server would not know (version 3: `Prepared`, `BeginWith`, `Batch`,
+/// `Expr::Param`).
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The oldest version a server still answers. Everything a client of
+/// that version sends means what it meant, so a server is upgraded
+/// before its clients and serves both meanwhile. A client newer than the
+/// server is refused, in the answer to its `Hello`.
+pub const OLDEST_PROTOCOL_VERSION: u32 = 2;
 
 /// The largest frame either side accepts. A row holding a text of tens
 /// of megabytes must fit.
@@ -67,7 +78,58 @@ pub enum Request {
     /// The server's clock.
     Now,
     Admin(Admin),
+    /// Runs a statement the connection keeps, with `params` for its
+    /// `Expr::Param`s: a query, an insert, an update or a delete.
+    ///
+    /// A connection is sent the statement the first time it is asked for
+    /// an `id`, and keeps it under that number; after that the number
+    /// alone names it, and the statement is neither sent nor decoded
+    /// again. A connection keeps only so many (see `KEPT_STATEMENTS`), the
+    /// ones used longest ago making way: asked for a number it does not
+    /// keep, it answers `ErrorCode::NotPrepared`, having run nothing, and
+    /// the client sends the statement again.
+    Prepared { id: u64, statement: Option<Arc<Request>>, params: Vec<Value> },
+    /// `Begin`, and the transaction's first statement run in it, as one
+    /// request: answered as the statement is.
+    ///
+    /// Whatever the answer, a transaction is open afterwards and has to
+    /// be ended. If it could not begin, or the statement failed, it is
+    /// one that can only be rolled back, so that nothing sent after it
+    /// runs outside the transaction it was meant for.
+    BeginWith { kind: TxnKind, lock_wait_ms: u64, statement: Box<Request> },
+    /// Statements run one after another as one transaction, sent whole:
+    /// for a transaction whose statements do not depend on each other's
+    /// answers. All of them take effect or none does; nothing else is
+    /// written between them; it is durable when it is answered.
+    ///
+    /// The answer is one result for each statement, in order, or a single
+    /// error if one failed: nothing of the batch then remains.
+    Batch(Vec<BatchItem>),
 }
+
+/// One statement of a `Request::Batch`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchItem {
+    /// A query, an insert, an update or a delete, as it is or prepared.
+    pub statement: Request,
+    /// How many rows it must affect (a query: return) for the batch to
+    /// go on. Any other number ends the batch with `ErrorCode::Unmet`,
+    /// undone: the way to make a later statement depend on an earlier
+    /// one, as in "debit this account if it holds enough, and only then
+    /// credit that one".
+    pub expect: Option<u64>,
+}
+
+/// How many prepared statements a connection keeps.
+pub const KEPT_STATEMENTS: usize = 256;
+
+/// The largest statement a connection keeps, as it is encoded. A larger
+/// one is refused: it is sent as an ordinary request each time.
+pub const KEPT_STATEMENT_BYTES: usize = 64 * 1024;
+
+/// How much a connection keeps in all, as encoded: beyond this too the
+/// statements used longest ago make way.
+pub const KEPT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ddl {
@@ -133,8 +195,36 @@ pub enum Response {
 /// A request and how long the server may spend on it, in milliseconds
 /// (0 for no limit beyond the server's own).
 pub fn encode_request(request: &Request, timeout_ms: u64) -> Vec<u8> {
-    let mut w = Writer::new();
+    encode_request_onto(Vec::new(), request, timeout_ms)
+}
+
+/// Encodes a request after whatever `buf` already holds, so that a
+/// connection can keep one buffer for all it sends.
+pub fn encode_request_onto(buf: Vec<u8>, request: &Request, timeout_ms: u64) -> Vec<u8> {
+    let mut w = Writer { buf };
     w.varint(timeout_ms);
+    put_request(&mut w, request);
+    w.buf
+}
+
+fn put_kind(w: &mut Writer, kind: TxnKind) {
+    w.u8(match kind {
+        TxnKind::Read => 0,
+        TxnKind::Exclusive => 1,
+        TxnKind::Optimistic => 2,
+    });
+}
+
+fn get_kind(r: &mut Reader) -> DbResult<TxnKind> {
+    Ok(match r.u8()? {
+        0 => TxnKind::Read,
+        1 => TxnKind::Exclusive,
+        2 => TxnKind::Optimistic,
+        other => return Err(DbError::invalid(format!("no kind of transaction is numbered {other}"))),
+    })
+}
+
+fn put_request(w: &mut Writer, request: &Request) {
     match request {
         Request::Hello { version, database, password, client } => {
             w.u8(1);
@@ -146,11 +236,7 @@ pub fn encode_request(request: &Request, timeout_ms: u64) -> Vec<u8> {
         Request::Ping => w.u8(2),
         Request::Begin { kind, lock_wait_ms } => {
             w.u8(3);
-            w.u8(match kind {
-                TxnKind::Read => 0,
-                TxnKind::Exclusive => 1,
-                TxnKind::Optimistic => 2,
-            });
+            put_kind(w, *kind);
             w.varint(*lock_wait_ms);
         }
         Request::Commit => w.u8(4),
@@ -169,23 +255,23 @@ pub fn encode_request(request: &Request, timeout_ms: u64) -> Vec<u8> {
         }
         Request::Query(q) => {
             w.u8(9);
-            put_query(&mut w, q);
+            put_query(w, q);
         }
         Request::Insert(i) => {
             w.u8(10);
-            put_insert(&mut w, i);
+            put_insert(w, i);
         }
         Request::Update(u) => {
             w.u8(11);
-            put_update(&mut w, u);
+            put_update(w, u);
         }
         Request::Delete(d) => {
             w.u8(12);
-            put_delete(&mut w, d);
+            put_delete(w, d);
         }
         Request::Ddl(ddl) => {
             w.u8(13);
-            put_ddl(&mut w, ddl);
+            put_ddl(w, ddl);
         }
         Request::Describe => w.u8(14),
         Request::Lock { name, wait_ms } => {
@@ -200,50 +286,104 @@ pub fn encode_request(request: &Request, timeout_ms: u64) -> Vec<u8> {
         Request::Now => w.u8(17),
         Request::Admin(admin) => {
             w.u8(18);
-            put_admin(&mut w, admin);
+            put_admin(w, admin);
+        }
+        Request::Prepared { id, statement, params } => {
+            w.u8(19);
+            w.varint(*id);
+            match statement {
+                Some(statement) => {
+                    w.u8(1);
+                    put_request(w, statement);
+                }
+                None => w.u8(0),
+            }
+            w.varint(params.len() as u64);
+            for value in params {
+                put_value(w, value);
+            }
+        }
+        Request::BeginWith { kind, lock_wait_ms, statement } => {
+            w.u8(20);
+            put_kind(w, *kind);
+            w.varint(*lock_wait_ms);
+            put_request(w, statement);
+        }
+        Request::Batch(items) => {
+            w.u8(21);
+            w.varint(items.len() as u64);
+            for item in items {
+                put_request(w, &item.statement);
+                match item.expect {
+                    Some(rows) => {
+                        w.u8(1);
+                        w.varint(rows);
+                    }
+                    None => w.u8(0),
+                }
+            }
         }
     }
-    w.buf
 }
 
 pub fn decode_request(frame: &[u8]) -> DbResult<(Request, u64)> {
     let mut r = Reader::new(frame);
     let timeout_ms = r.varint()?;
+    let request = get_request(&mut r, 0)?;
+    r.finish()?;
+    Ok((request, timeout_ms))
+}
+
+/// How deep requests may hold requests: a batch or a `BeginWith` holds
+/// statements, and a prepared one of those holds the statement itself.
+const MAX_REQUEST_DEPTH: u32 = 2;
+
+/// Reads one request, `depth` requests inside the frame's own. What may
+/// hold what, beyond how deep, is the server's to say.
+fn get_request(r: &mut Reader, depth: u32) -> DbResult<Request> {
+    if depth > MAX_REQUEST_DEPTH {
+        return Err(DbError::invalid("malformed message: requests nested too deeply"));
+    }
     let request = match r.u8()? {
         1 => Request::Hello { version: r.u32()?, database: r.str()?, password: r.str()?, client: r.str()? },
         2 => Request::Ping,
-        3 => {
-            let kind = match r.u8()? {
-                0 => TxnKind::Read,
-                1 => TxnKind::Exclusive,
-                2 => TxnKind::Optimistic,
-                other => {
-                    return Err(DbError::invalid(format!(
-                        "no kind of transaction is numbered {other}"
-                    )))
-                }
-            };
-            Request::Begin { kind, lock_wait_ms: r.varint()? }
-        }
+        3 => Request::Begin { kind: get_kind(r)?, lock_wait_ms: r.varint()? },
         4 => Request::Commit,
         5 => Request::Rollback,
         6 => Request::Savepoint(r.str()?),
         7 => Request::RollbackTo(r.str()?),
         8 => Request::Release(r.str()?),
-        9 => Request::Query(get_query(&mut r)?),
-        10 => Request::Insert(get_insert(&mut r)?),
-        11 => Request::Update(get_update(&mut r)?),
-        12 => Request::Delete(get_delete(&mut r)?),
-        13 => Request::Ddl(get_ddl(&mut r)?),
+        9 => Request::Query(get_query(r)?),
+        10 => Request::Insert(get_insert(r)?),
+        11 => Request::Update(get_update(r)?),
+        12 => Request::Delete(get_delete(r)?),
+        13 => Request::Ddl(get_ddl(r)?),
         14 => Request::Describe,
         15 => Request::Lock { name: r.str()?, wait_ms: r.varint()? },
         16 => Request::Unlock { name: r.str()? },
         17 => Request::Now,
-        18 => Request::Admin(get_admin(&mut r)?),
+        18 => Request::Admin(get_admin(r)?),
+        19 => {
+            let id = r.varint()?;
+            let statement = if r.bool()? { Some(Arc::new(get_request(r, depth + 1)?)) } else { None };
+            let n = r.count()?;
+            let params = (0..n).map(|_| get_value(r)).collect::<DbResult<_>>()?;
+            Request::Prepared { id, statement, params }
+        }
+        20 => Request::BeginWith { kind: get_kind(r)?, lock_wait_ms: r.varint()?, statement: Box::new(get_request(r, depth + 1)?) },
+        21 => {
+            let n = r.count()?;
+            let mut items = Vec::with_capacity(n.min(RESERVE));
+            for _ in 0..n {
+                let statement = get_request(r, depth + 1)?;
+                let expect = if r.bool()? { Some(r.varint()?) } else { None };
+                items.push(BatchItem { statement, expect });
+            }
+            Request::Batch(items)
+        }
         _ => return Err(DbError::new(ErrorCode::InvalidRequest, "unknown request")),
     };
-    r.finish()?;
-    Ok((request, timeout_ms))
+    Ok(request)
 }
 
 fn put_ddl(w: &mut Writer, ddl: &Ddl) {
@@ -621,6 +761,16 @@ mod tests {
             Request::Admin(Admin::RestoreBegin { replace: true }),
             Request::Admin(Admin::RestoreChunk(vec![1, 2, 3])),
             Request::Admin(Admin::RestoreEnd),
+            Request::Prepared { id: 7, statement: Some(Arc::new(Request::Query(Query::table("t").key([param(0)]).filter(col("a").lt(param(1)))))), params: vec![Value::Int(1), Value::Text("x".into())] },
+            Request::Prepared { id: u64::MAX, statement: None, params: Vec::new() },
+            Request::BeginWith { kind: TxnKind::Optimistic, lock_wait_ms: 30_000, statement: Box::new(Request::Query(sample_query())) },
+            Request::BeginWith { kind: TxnKind::Read, lock_wait_ms: 0, statement: Box::new(Request::Prepared { id: 7, statement: None, params: vec![Value::Null] }) },
+            Request::Batch(vec![
+                BatchItem { statement: Request::Update(Update::table("t").key([1]).set("a", col("a") - 1)), expect: Some(1) },
+                BatchItem { statement: Request::Prepared { id: 9, statement: None, params: vec![Value::Int(3)] }, expect: None },
+                BatchItem { statement: Request::Insert(Insert::into("t").set("a", 1)), expect: Some(0) },
+            ]),
+            Request::Batch(Vec::new()),
         ];
         for request in requests {
             let frame = encode_request(&request, 1500);
@@ -699,6 +849,22 @@ mod tests {
         }
         let frame = encode_request(&Request::Query(Query::table("t").filter(e)), 0);
         assert!(decode_request(&frame).is_err());
+        // Requests hold requests only as deep as a batch of prepared
+        // statements needs.
+        let nested = |levels: usize| {
+            let mut request = Request::Ping;
+            for _ in 0..levels {
+                request = Request::Batch(vec![BatchItem { statement: request, expect: None }]);
+            }
+            decode_request(&encode_request(&request, 0))
+        };
+        assert!(nested(2).is_ok());
+        assert!(nested(3).is_err());
+        let mut request = Request::Ping;
+        for _ in 0..3 {
+            request = Request::BeginWith { kind: TxnKind::Read, lock_wait_ms: 0, statement: Box::new(request) };
+        }
+        assert!(decode_request(&encode_request(&request, 0)).is_err());
     }
 
     #[test]

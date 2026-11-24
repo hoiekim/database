@@ -54,6 +54,13 @@ pub enum ErrorCode {
     /// beside it has since changed. Nothing of it took effect: run it
     /// again.
     Conflict = 22,
+    /// A prepared statement was named by its number alone on a connection
+    /// that does not keep it (any more). Nothing was run: send it again
+    /// with the statement.
+    NotPrepared = 23,
+    /// A statement of a batch did not affect as many rows as the batch
+    /// said it must. Nothing of the batch took effect.
+    Unmet = 24,
 }
 
 impl ErrorCode {
@@ -81,6 +88,8 @@ impl ErrorCode {
             20 => Arithmetic,
             21 => OutOfRange,
             22 => Conflict,
+            23 => NotPrepared,
+            24 => Unmet,
             _ => Internal,
         }
     }

@@ -31,6 +31,9 @@ pub struct Ctx<'a> {
     /// Where a writing transaction's statements draw the values that the
     /// rows do not decide. `None` for a reader, which draws them fresh.
     pub tape: Option<&'a Tape>,
+    /// The values a prepared statement is run with: what `Expr::Param`
+    /// reads. Empty for any other statement.
+    pub params: &'a [Value],
 }
 
 /// A value a statement drew that nothing in the database decides: a
@@ -359,6 +362,10 @@ pub fn eval(ctx: &Ctx, scope: &Scope, expr: &Expr) -> Result<Value> {
             let (row, frame) = found.ok_or_else(|| invalid("old(..) is only for an update's returning"))?;
             frame_value(ctx, &Frame { alias: frame.alias, table: frame.table, row: Some(row) }, frame.table.col(name)?)?
         }
+        Expr::Param(n) => match ctx.params.get(*n as usize) {
+            Some(value) => value.clone(),
+            None => return Err(invalid(format!("the statement reads value {n} of those it is run with, and was given {}", ctx.params.len()))),
+        },
         Expr::Depth => Value::Int(nearest(scope, |s| s.depth).ok_or_else(|| invalid("depth is only for a tree walk"))?),
         Expr::Rank => Value::Float(nearest(scope, |s| s.rank).ok_or_else(|| invalid("rank is only for a full-text search"))?),
         Expr::Not(e) => match truth(&eval(ctx, scope, e)?)? {
