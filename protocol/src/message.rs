@@ -18,8 +18,8 @@ use crate::value::Value;
 /// What a client says it speaks, in its `Hello`: bumped when a frame's
 /// meaning changes, or when the client comes to send something an older
 /// server would not know (version 3: `Prepared`, `BeginWith`, `Batch`,
-/// `Expr::Param`).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// `Expr::Param`; version 4: `Explain`).
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The oldest version a server still answers. Everything a client of
 /// that version sends means what it meant, so a server is upgraded
@@ -109,7 +109,17 @@ pub enum Request {
     /// The answer is one result for each statement, in order, or a single
     /// error if one failed: nothing of the batch then remains.
     Batch(Vec<BatchItem>),
+    /// Runs a query, as it is or prepared, and answers with what it read
+    /// instead of what it found: one row of `EXPLAIN_COLUMNS`. There is
+    /// no plan to show, since a query names its own access path; what
+    /// there is to know is how much that path made the server read.
+    Explain(Box<Request>),
 }
+
+/// The columns of an `Explain`'s answer, all integers: entries read from
+/// indexes, rows read from tables, rows the query returned, and the
+/// microseconds it took.
+pub const EXPLAIN_COLUMNS: [&str; 4] = ["index_entries", "rows_read", "rows_returned", "micros"];
 
 /// One statement of a `Request::Batch`.
 #[derive(Clone, Debug, PartialEq)]
@@ -327,6 +337,10 @@ fn put_request(w: &mut Writer, request: &Request) {
                 }
             }
         }
+        Request::Explain(statement) => {
+            w.u8(22);
+            put_request(w, statement);
+        }
     }
 }
 
@@ -339,8 +353,9 @@ pub fn decode_request(frame: &[u8]) -> DbResult<(Request, u64)> {
 }
 
 /// How deep requests may hold requests: a batch or a `BeginWith` holds
-/// statements, and a prepared one of those holds the statement itself.
-const MAX_REQUEST_DEPTH: u32 = 2;
+/// statements, one of which may be an `Explain` of a prepared statement,
+/// which holds the statement itself.
+const MAX_REQUEST_DEPTH: u32 = 3;
 
 /// Reads one request, `depth` requests inside the frame's own. What may
 /// hold what, beyond how deep, is the server's to say.
@@ -385,6 +400,7 @@ fn get_request(r: &mut Reader, depth: u32) -> DbResult<Request> {
             }
             Request::Batch(items)
         }
+        22 => Request::Explain(Box::new(get_request(r, depth + 1)?)),
         _ => return Err(DbError::new(ErrorCode::InvalidRequest, "unknown request")),
     };
     Ok(request)
@@ -775,6 +791,8 @@ mod tests {
                 BatchItem { statement: Request::Insert(Insert::into("t").set("a", 1)), expect: Some(0) },
             ]),
             Request::Batch(Vec::new()),
+            Request::Explain(Box::new(Request::Query(sample_query()))),
+            Request::Explain(Box::new(Request::Prepared { id: 7, statement: None, params: vec![Value::Int(1)] })),
         ];
         for request in requests {
             let frame = encode_request(&request, 1500);
@@ -853,8 +871,8 @@ mod tests {
         }
         let frame = encode_request(&Request::Query(Query::table("t").filter(e)), 0);
         assert!(decode_request(&frame).is_err());
-        // Requests hold requests only as deep as a batch of prepared
-        // statements needs.
+        // Requests hold requests only as deep as a transaction that
+        // begins by explaining a prepared statement needs.
         let nested = |levels: usize| {
             let mut request = Request::Ping;
             for _ in 0..levels {
@@ -862,10 +880,10 @@ mod tests {
             }
             decode_request(&encode_request(&request, 0))
         };
-        assert!(nested(2).is_ok());
-        assert!(nested(3).is_err());
+        assert!(nested(3).is_ok());
+        assert!(nested(4).is_err());
         let mut request = Request::Ping;
-        for _ in 0..3 {
+        for _ in 0..4 {
             request = Request::BeginWith { kind: TxnKind::Read, lock_wait_ms: 0, statement: Box::new(request) };
         }
         assert!(decode_request(&encode_request(&request, 0)).is_err());

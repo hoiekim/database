@@ -252,6 +252,15 @@ list); the filter; grouping; ordering; offset and limit; the selected
 values. With no `order_by` the pipeline stops as soon as the limit is
 reached, which is what makes "the newest 50" cost 50 rows.
 
+**What a statement read is counted as it reads**: an entry for each
+index entry a range or a tree walk gives and each hit of a search, a
+row for each row read from a table, by any path. The two counts are
+all the explaining there is to do where nothing is planned: a
+statement's cost is what its own access path made the server read.
+They are what `Request::Explain` answers with in place of a query's
+rows, and what the server writes to its log beside a statement that
+took longer than `DATABASE_SLOW_MS`.
+
 Expressions are a tree (`Expr`) evaluated against a chain of scopes:
 the current row, the rows of enclosing joins and queries, the proposed
 row of an upsert, the old row of an update. NULL follows SQL's

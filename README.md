@@ -152,6 +152,7 @@ The tests, by what they prove:
 | `server/tests/acid.rs` | atomicity, isolation, once-only races, savepoints, lock and statement timeouts |
 | `server/tests/optimistic.rs` | transactions that run beside other writers: committed as they stand, run again, or in conflict; what they were told is what is stored |
 | `server/tests/requests.rs` | statements the server keeps and runs with new values; a transaction sent whole as a batch, with conditions; a transaction that begins with its first statement; the Unix socket |
+| `server/tests/explain.rs` | what a query read, by every way in, against what it returned; slow statements in the server's log |
 | `server/tests/durability.rs` | a server killed with `SIGKILL` under load, six times over, loses nothing acknowledged; memory stays bounded with data many times the cache |
 | `server/tests/operations.rs` | dump under load, restore, a damaged dump refused, passwords, restarts |
 | `engine/tests/recovery.rs` | a random workload on a simulated disk that loses power at any write, keeping, dropping or tearing each unsynced write, with transactions open beside the writer; after every cut the database equals a model of what was committed and no page is lost |
