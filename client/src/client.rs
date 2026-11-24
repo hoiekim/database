@@ -1,11 +1,12 @@
 //! The client: statements, transactions, named locks, administration.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::expr::Expr;
-use database_protocol::message::{Admin as AdminRequest, Ddl, Request, Response};
+use database_protocol::message::{Admin as AdminRequest, Ddl, Request, Response, TxnKind};
 use database_protocol::query::{Delete, Insert, Query, Update};
 use database_protocol::schema::{ColumnDef, IndexDef, TableDef};
 use database_protocol::value::Timestamp;
@@ -15,6 +16,10 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::conn::{Pool, PooledConn};
 use crate::row::{Row, Rows};
+
+/// How many times `Client::transaction` runs its work beside other
+/// writers before it runs it as the only one.
+const OPTIMISTIC_RUNS: usize = 2;
 
 fn unexpected(what: &str) -> DbError {
     DbError::new(ErrorCode::Connection, format!("the server answered {what} with something else"))
@@ -201,30 +206,59 @@ impl Client {
         self.pool.clear();
     }
 
-    /// Starts a transaction that may write. It waits for any other writer
-    /// on the database to finish, then holds the database's write lock
-    /// until it commits or rolls back: keep it short, and do not wait on
-    /// the network inside it.
+    /// Starts a transaction that is the database's only writer until it
+    /// ends. It waits for any other writer to finish, and every other
+    /// writer then waits for it: keep it short, and do not wait on
+    /// anything but the database inside it. Its commit cannot conflict.
     pub async fn begin(&self) -> DbResult<Transaction> {
-        self.begin_with(true).await
+        self.begin_with(TxnKind::Exclusive).await
+    }
+
+    /// Starts a transaction that may write and holds nobody up: it runs
+    /// beside other writers, on a copy of the database that only it
+    /// sees. Its `commit` checks that no commit made meanwhile has
+    /// changed anything it was told; if one has, the commit fails with
+    /// `ErrorCode::Conflict`, nothing of the transaction takes effect,
+    /// and it can be run again. `transaction` does all of that.
+    pub async fn begin_optimistic(&self) -> DbResult<Transaction> {
+        self.begin_with(TxnKind::Optimistic).await
     }
 
     /// Starts a transaction that only reads. It sees the database as of
     /// this moment whatever is written meanwhile, and blocks nobody.
     pub async fn begin_read(&self) -> DbResult<Transaction> {
-        self.begin_with(false).await
+        self.begin_with(TxnKind::Read).await
     }
 
-    async fn begin_with(&self, write: bool) -> DbResult<Transaction> {
+    async fn begin_with(&self, kind: TxnKind) -> DbResult<Transaction> {
         let mut conn = self.pool.acquire().await?;
         let lock_wait_ms = self.pool.config.lock_wait.as_millis() as u64;
-        ok(conn.conn().call(Request::Begin { write, lock_wait_ms }).await?)?;
+        ok(conn
+            .conn()
+            .call(Request::Begin { kind, lock_wait_ms })
+            .await?)?;
         conn.held = true;
-        Ok(Transaction { inner: Arc::new(TxInner { conn: Mutex::new(Some(conn)) }) })
+        Ok(Transaction {
+            inner: Arc::new(TxInner {
+                conn: Mutex::new(Some(conn)),
+                conflicted: AtomicBool::new(false),
+            }),
+        })
     }
 
     /// Runs `work` in a writing transaction: commits if it returns `Ok`,
-    /// rolls back if it returns `Err` or panics.
+    /// rolls back if it returns `Err` or panics. The result is as if
+    /// nothing else had written while it ran.
+    ///
+    /// `work` may be called more than once. It runs first beside other
+    /// writers (see `begin_optimistic`), so that it holds nobody up
+    /// while it waits for its statements' answers. If another writer's
+    /// commit then proves to have changed something it read, that run is
+    /// undone whole and `work` is called again: once more the same way,
+    /// and after that as the database's only writer, which cannot fail
+    /// so. `work` should therefore do nothing but talk to the database
+    /// through the transaction it is given; use `exclusive` for one that
+    /// must run exactly once.
     ///
     /// ```ignore
     /// let id = db.transaction(|tx| async move {
@@ -233,7 +267,36 @@ impl Client {
     ///     row.get::<i64>("id")
     /// }).await?;
     /// ```
-    pub async fn transaction<T, E, F, Fut>(&self, work: F) -> Result<T, E>
+    pub async fn transaction<T, E, F, Fut>(&self, mut work: F) -> Result<T, E>
+    where
+        F: FnMut(Transaction) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: From<DbError>,
+    {
+        for _ in 0..OPTIMISTIC_RUNS {
+            let tx = self.begin_optimistic().await?;
+            match work(tx.clone()).await {
+                Ok(value) => match tx.commit().await {
+                    Ok(()) => return Ok(value),
+                    Err(e) if e.code == ErrorCode::Conflict => {}
+                    Err(e) => return Err(e.into()),
+                },
+                Err(e) => {
+                    let conflicted = tx.conflicted();
+                    let _ = tx.rollback().await;
+                    if !conflicted {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        self.exclusive(work).await
+    }
+
+    /// Runs `work`, once, in a transaction that is the database's only
+    /// writer while it runs (see `begin`): commits if it returns `Ok`,
+    /// rolls back if it returns `Err` or panics.
+    pub async fn exclusive<T, E, F, Fut>(&self, work: F) -> Result<T, E>
     where
         F: FnOnce(Transaction) -> Fut,
         Fut: Future<Output = Result<T, E>>,
@@ -311,6 +374,8 @@ impl Db for Client {
 
 struct TxInner {
     conn: Mutex<Option<PooledConn>>,
+    /// Whether the server has said that the transaction conflicted.
+    conflicted: AtomicBool,
 }
 
 /// An open transaction. Statements run through it see each other's
@@ -346,7 +411,14 @@ impl Transaction {
         // error on commit means it was rolled back.
         let result = conn.conn().call(request).await;
         conn.held = false;
-        ok(result?)
+        ok(self.inner.note(result)?)
+    }
+
+    /// Whether the server has ended the transaction because a commit
+    /// made beside it changed something it had read: it can be run
+    /// again. Only an optimistic transaction ever is.
+    pub fn conflicted(&self) -> bool {
+        self.inner.conflicted.load(Ordering::Relaxed)
     }
 
     /// Marks a point to return to with `rollback_to`.
@@ -366,11 +438,21 @@ impl Transaction {
     }
 }
 
+impl TxInner {
+    fn note(&self, result: DbResult<Response>) -> DbResult<Response> {
+        if matches!(&result, Err(e) if e.code == ErrorCode::Conflict) {
+            self.conflicted.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
 impl Db for Transaction {
     async fn call(&self, request: Request) -> DbResult<Response> {
         let mut slot = self.inner.conn.lock().await;
         let conn = slot.as_mut().ok_or_else(ended)?;
-        conn.conn().call(request).await
+        let result = conn.conn().call(request).await;
+        self.inner.note(result)
     }
 }
 

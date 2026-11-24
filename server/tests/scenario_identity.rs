@@ -712,7 +712,7 @@ async fn the_services_revision_is_one_row_that_every_change_counts_up() -> DbRes
         let db = db.clone();
         let revision = revision.clone();
         changes.push(tokio::spawn(async move {
-            db.transaction(|tx| async move {
+            db.exclusive(|tx| async move {
                 tx.update(bump_revision()).await?;
                 tx.query_one(revision).await?.get::<i64>("revision")
             })

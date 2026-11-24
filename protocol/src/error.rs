@@ -50,6 +50,10 @@ pub enum ErrorCode {
     Arithmetic = 20,
     /// A number too large for its column.
     OutOfRange = 21,
+    /// An optimistic transaction was told something that a commit made
+    /// beside it has since changed. Nothing of it took effect: run it
+    /// again.
+    Conflict = 22,
 }
 
 impl ErrorCode {
@@ -76,6 +80,7 @@ impl ErrorCode {
             18 => Unavailable,
             20 => Arithmetic,
             21 => OutOfRange,
+            22 => Conflict,
             _ => Internal,
         }
     }

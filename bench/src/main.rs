@@ -115,6 +115,17 @@ struct Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Asked to stop first, so that a server run under a profiler
+        // can write what it gathered; killed if it does not.
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status();
+        for _ in 0..600 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         if self.as_postgres {
@@ -144,7 +155,11 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
         .env("DATABASE_LISTEN", format!("127.0.0.1:{port}"))
         .env("DATABASE_ADMIN_PASSWORD", "bench-admin")
         .env("DATABASE_CACHE_MB", cache_mb.to_string())
-        .stderr(Stdio::null())
+        // BENCH_SERVER_LOG=file keeps what the server says.
+        .stderr(match std::env::var_os("BENCH_SERVER_LOG") {
+            Some(path) => Stdio::from(std::fs::File::create(path).expect("the server's log file")),
+            None => Stdio::null(),
+        })
         .spawn()
         .unwrap_or_else(|e| panic!("cannot run {}: {e}. Build it first: cargo build --release", binary.display()));
     let server = Server { child, dir, as_postgres: false };
@@ -261,6 +276,21 @@ struct Timing {
     p99: Duration,
 }
 
+/// Whether a workload is to run. `BENCH_WORKLOADS="transfer,upsert"` runs
+/// only those whose name holds one of the words, to study a few without
+/// waiting for the rest; the mails are then loaded only if one of them
+/// reads mails.
+fn selected(name: &str) -> bool {
+    match std::env::var("BENCH_WORKLOADS") {
+        Ok(words) => words.split(',').any(|word| name.contains(word.trim())),
+        Err(_) => true,
+    }
+}
+
+const BULK_LOAD: &str = "bulk load: 100,000 mails of 4 kB, 250 per statement (4 connections)";
+/// The workloads that read the mails.
+const ON_MAILS: [usize; 4] = [6, 7, 9, 10];
+
 /// Runs `op(worker, n)` from `workers` tasks for `total` operations.
 async fn measure<F, Fut>(workers: usize, total: u64, op: F) -> Timing
 where
@@ -297,6 +327,16 @@ where
 
 fn scramble(n: u64) -> u64 {
     n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 17
+}
+
+/// A well-mixed number for each `n`: what a workload picks its rows by.
+/// (`scramble` steps evenly, so numbers cut from it repeat in a pattern:
+/// good enough to make data of, not to choose rows at random.)
+fn mix(n: u64) -> u64 {
+    let mut z = n.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 fn token(n: i64) -> Vec<u8> {
@@ -524,10 +564,22 @@ const WORKLOADS: &[Workload] = &[
     ("transfer transaction: 2 reads, 3 writes (8 connections)", 8, 6_000),
     ("count unread of a user's 5,000 mails (4 connections)", 4, 800),
     ("full-text search, top 20 (4 connections)", 4, 2_000),
+    (
+        "transfer transaction, all into one account (8 connections)",
+        8,
+        6_000,
+    ),
 ];
 
 async fn run_workload(target: &Target, index: usize) -> Timing {
-    let (name, workers, mut total) = WORKLOADS[index];
+    let (name, mut workers, mut total) = WORKLOADS[index];
+    // BENCH_CONNECTIONS=1 runs every workload on that many connections.
+    if let Some(n) = std::env::var("BENCH_CONNECTIONS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+    {
+        workers = n;
+    }
     // BENCH_REPEAT="mailbox:20" runs the workloads whose name holds
     // "mailbox" twenty times as long, to study one under a profiler.
     if let Some((what, times)) = std::env::var("BENCH_REPEAT").ok().as_deref().and_then(|spec| spec.split_once(':')) {
@@ -539,7 +591,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
     measure(workers, total, move |worker, n| {
         let target = target.clone();
         async move {
-            let r = scramble(n + 7 * index as u64);
+            let r = mix(n + 7 * index as u64);
             match index {
                 0 | 1 => {
                     let hash = token((r % SESSIONS as u64) as i64);
@@ -631,8 +683,11 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                         }
                     }
                 }
-                8 => {
-                    let (from, to) = ((r % 1000) as i64, ((r >> 10) % 1000) as i64);
+                8 | 11 => {
+                    // Between two accounts picked at random, or, to see
+                    // transactions that are in each other's way, always
+                    // into the same one.
+                    let (from, to) = if index == 8 { ((r % 1000) as i64, ((r >> 10) % 1000) as i64) } else { ((1 + r % 999) as i64, 0) };
                     if from == to {
                         return;
                     }
@@ -713,8 +768,9 @@ struct Report {
     memory: u64,
     cpu: f64,
     disk: (u64, u64),
-    load: Timing,
-    timings: Vec<Timing>,
+    /// `None` for what was not run.
+    load: Option<Timing>,
+    timings: Vec<Option<Timing>>,
 }
 
 async fn run(name: &'static str, server: Server, target: Target) -> Report {
@@ -724,17 +780,39 @@ async fn run(name: &'static str, server: Server, target: Target) -> Report {
     let idle_memory = memory(pid);
     eprintln!("{name}: loading");
     load(&target).await;
-    let load = load_mails(&target).await;
+    let mails = selected(BULK_LOAD) || ON_MAILS.iter().any(|index| selected(WORKLOADS[*index].0));
+    let load = if mails {
+        Some(load_mails(&target).await)
+    } else {
+        None
+    };
     let mut timings = Vec::new();
     for (index, (workload, _, _)) in WORKLOADS.iter().enumerate() {
+        if !selected(workload) {
+            timings.push(None);
+            continue;
+        }
         eprintln!("{name}: {workload}");
-        timings.push(run_workload(&target, index).await);
+        timings.push(Some(run_workload(&target, index).await));
     }
     let memory = memory(pid);
     let cpu = cpu_seconds(pid);
     // Let each write what it buffers before the files are measured.
     match &target {
-        Target::Ours(db) => db.admin().checkpoint().await.unwrap(),
+        Target::Ours(db) => {
+            if std::env::var_os("BENCH_DETAILS").is_some() {
+                eprintln!(
+                    "{name}: {}",
+                    db.admin()
+                        .stats()
+                        .await
+                        .unwrap()
+                        .trim_end()
+                        .replace('\n', "; ")
+                );
+            }
+            db.admin().checkpoint().await.unwrap()
+        }
         Target::Pg(_) => {
             target.pg(0).batch_execute("CHECKPOINT").await.unwrap();
             // BENCH_DETAILS=1 shows how Postgres stores the mails: how
@@ -778,29 +856,78 @@ fn micros(d: Duration) -> String {
 fn print(reports: &[Report]) {
     let header: Vec<String> = reports.iter().flat_map(|r| [format!("{} ops/s", r.name), "p50".to_string(), "p99".to_string()]).collect();
     println!("| Workload | {} |", header.join(" | "));
-    println!("|---|{}|", "---:|".repeat(header.len()));
-    let row = |name: &str, pick: &dyn Fn(&Report) -> &Timing| {
+    println!("|---|{}", "---:|".repeat(header.len()));
+    let row = |name: &str, pick: &dyn Fn(&Report) -> Option<&Timing>| {
+        if reports.iter().all(|r| pick(r).is_none()) {
+            return;
+        }
         let cells: Vec<String> = reports
             .iter()
-            .flat_map(|r| {
-                let t = pick(r);
-                [format!("{:.0}", t.ops as f64 / t.seconds), micros(t.p50), micros(t.p99)]
+            .flat_map(|r| match pick(r) {
+                Some(t) => [
+                    format!("{:.0}", t.ops as f64 / t.seconds),
+                    micros(t.p50),
+                    micros(t.p99),
+                ],
+                None => ["-".to_string(), "-".to_string(), "-".to_string()],
             })
             .collect();
         println!("| {name} | {} |", cells.join(" | "));
     };
-    row("bulk load: 100,000 mails of 4 kB, 250 per statement (4 connections)", &|r| &r.load);
+    row(BULK_LOAD, &|r| r.load.as_ref());
     for (index, (name, _, _)) in WORKLOADS.iter().enumerate() {
-        row(name, &|r| &r.timings[index]);
+        row(name, &|r| r.timings[index].as_ref());
     }
     println!();
-    println!("| | {} |", reports.iter().map(|r| r.name).collect::<Vec<_>>().join(" | "));
-    println!("|---|{}|", "---:|".repeat(reports.len()));
-    println!("| Memory when idle, before any request | {} |", reports.iter().map(|r| mb(r.idle_memory)).collect::<Vec<_>>().join(" | "));
-    println!("| Memory after the run | {} |", reports.iter().map(|r| mb(r.memory)).collect::<Vec<_>>().join(" | "));
-    println!("| CPU time for the whole run | {} |", reports.iter().map(|r| format!("{:.1} s", r.cpu)).collect::<Vec<_>>().join(" | "));
-    println!("| Data files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk.0)).collect::<Vec<_>>().join(" | "));
-    println!("| Log files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk.1)).collect::<Vec<_>>().join(" | "));
+    println!(
+        "| | {} |",
+        reports
+            .iter()
+            .map(|r| r.name)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    println!("|---|{}", "---:|".repeat(reports.len()));
+    println!(
+        "| Memory when idle, before any request | {} |",
+        reports
+            .iter()
+            .map(|r| mb(r.idle_memory))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    println!(
+        "| Memory after the run | {} |",
+        reports
+            .iter()
+            .map(|r| mb(r.memory))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    println!(
+        "| CPU time for the whole run | {} |",
+        reports
+            .iter()
+            .map(|r| format!("{:.1} s", r.cpu))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    println!(
+        "| Data files on disk after a checkpoint | {} |",
+        reports
+            .iter()
+            .map(|r| mb(r.disk.0))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    println!(
+        "| Log files on disk after a checkpoint | {} |",
+        reports
+            .iter()
+            .map(|r| mb(r.disk.1))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
 }
 
 #[tokio::main]

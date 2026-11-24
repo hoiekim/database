@@ -40,6 +40,12 @@ const LIST: u8 = 0x90;
 const NULL: u8 = 0xF0;
 
 fn escaped(out: &mut Vec<u8>, bytes: &[u8]) {
+    // Few strings hold a zero byte: the rest are copied as they are.
+    if !bytes.contains(&0) {
+        out.extend_from_slice(bytes);
+        return;
+    }
+    out.reserve(bytes.len() + 2);
     for &b in bytes {
         out.push(b);
         if b == 0 {

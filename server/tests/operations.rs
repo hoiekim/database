@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use database_protocol::message::{decode_response, encode_request, Request, Response};
+use database_protocol::message::{
+    decode_response, encode_request, Request, Response, TxnKind, PROTOCOL_VERSION,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn pairs(db: &Client) -> DbResult<()> {
@@ -286,7 +288,16 @@ async fn a_misbehaving_client_gets_an_error_and_harms_nothing() -> DbResult<()> 
     let answers = raw_exchange(server.port, &[encode_request(&Request::Ping, 0)]).await;
     assert!(matches!(&answers[0], Some(Response::Error(e)) if e.code == ErrorCode::InvalidRequest));
     // Garbage after a good greeting: an error each time, the connection stays.
-    let answers = raw_exchange(server.port, &[hello(1, PASSWORD), vec![0xFF; 40], vec![], encode_request(&Request::Ping, 0)]).await;
+    let answers = raw_exchange(
+        server.port,
+        &[
+            hello(PROTOCOL_VERSION, PASSWORD),
+            vec![0xFF; 40],
+            vec![],
+            encode_request(&Request::Ping, 0),
+        ],
+    )
+    .await;
     assert!(matches!(answers[0], Some(Response::Hello { .. })));
     assert!(matches!(answers[1], Some(Response::Error(_))));
     assert!(matches!(answers[2], Some(Response::Error(_))));
@@ -306,8 +317,14 @@ async fn a_misbehaving_client_gets_an_error_and_harms_nothing() -> DbResult<()> 
     tx.rollback().await?;
     // A connection that vanishes mid-transaction frees the write lock.
     {
-        let begin = encode_request(&Request::Begin { write: true, lock_wait_ms: 1000 }, 0);
-        let answers = raw_exchange(server.port, &[hello(1, PASSWORD), begin]).await;
+        let begin = encode_request(
+            &Request::Begin {
+                kind: TxnKind::Exclusive,
+                lock_wait_ms: 1000,
+            },
+            0,
+        );
+        let answers = raw_exchange(server.port, &[hello(PROTOCOL_VERSION, PASSWORD), begin]).await;
         assert!(matches!(answers[1], Some(Response::Ok)));
     }
     db.update(Update::table("left").key([1]).set("n", 50)).await?;

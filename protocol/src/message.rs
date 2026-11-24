@@ -14,7 +14,7 @@ use crate::value::Value;
 
 /// Bumped when a frame's meaning changes. The server refuses a client
 /// that speaks another version, in the answer to its `Hello`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The largest frame either side accepts. A row holding a text of tens
 /// of megabytes must fit.
@@ -23,14 +23,34 @@ pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 /// A result is cut into frames of about this size.
 pub const ROWS_FRAME_TARGET: usize = 4 * 1024 * 1024;
 
+/// How a transaction stands to the database's writers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxnKind {
+    /// It only reads: one moment of the database, and it holds up nobody.
+    Read,
+    /// It is the database's one writer from `Begin` to its end: every
+    /// other writer waits for it.
+    Exclusive,
+    /// It may write, and runs beside other writers on a copy of its own.
+    /// At `Commit` the server checks that nothing it was told has been
+    /// changed by a commit made meanwhile; if something has, the
+    /// transaction fails with `ErrorCode::Conflict`, having changed
+    /// nothing, and may be run again.
+    Optimistic,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     /// `database` may be empty for a connection that only administers.
     Hello { version: u32, database: String, password: String, client: String },
     Ping,
-    /// Starts a transaction. A writing one waits for the database's write
-    /// lock, for at most `lock_wait_ms`.
-    Begin { write: bool, lock_wait_ms: u64 },
+    /// Starts a transaction. An exclusive one waits for the database's
+    /// write lock, for at most `lock_wait_ms`; an optimistic one waits
+    /// that long at most when it commits.
+    Begin {
+        kind: TxnKind,
+        lock_wait_ms: u64,
+    },
     Commit,
     Rollback,
     Savepoint(String),
@@ -127,9 +147,13 @@ pub fn encode_request(request: &Request, timeout_ms: u64) -> Vec<u8> {
             w.str(client);
         }
         Request::Ping => w.u8(2),
-        Request::Begin { write, lock_wait_ms } => {
+        Request::Begin { kind, lock_wait_ms } => {
             w.u8(3);
-            w.bool(*write);
+            w.u8(match kind {
+                TxnKind::Read => 0,
+                TxnKind::Exclusive => 1,
+                TxnKind::Optimistic => 2,
+            });
             w.varint(*lock_wait_ms);
         }
         Request::Commit => w.u8(4),
@@ -191,7 +215,22 @@ pub fn decode_request(frame: &[u8]) -> DbResult<(Request, u64)> {
     let request = match r.u8()? {
         1 => Request::Hello { version: r.u32()?, database: r.str()?, password: r.str()?, client: r.str()? },
         2 => Request::Ping,
-        3 => Request::Begin { write: r.bool()?, lock_wait_ms: r.varint()? },
+        3 => {
+            let kind = match r.u8()? {
+                0 => TxnKind::Read,
+                1 => TxnKind::Exclusive,
+                2 => TxnKind::Optimistic,
+                other => {
+                    return Err(DbError::invalid(format!(
+                        "no kind of transaction is numbered {other}"
+                    )))
+                }
+            };
+            Request::Begin {
+                kind,
+                lock_wait_ms: r.varint()?,
+            }
+        }
         4 => Request::Commit,
         5 => Request::Rollback,
         6 => Request::Savepoint(r.str()?),
@@ -540,7 +579,18 @@ mod tests {
         let requests = vec![
             Request::Hello { version: PROTOCOL_VERSION, database: "shop".into(), password: "pw".into(), client: "test".into() },
             Request::Ping,
-            Request::Begin { write: true, lock_wait_ms: 30_000 },
+            Request::Begin {
+                kind: TxnKind::Exclusive,
+                lock_wait_ms: 30_000,
+            },
+            Request::Begin {
+                kind: TxnKind::Optimistic,
+                lock_wait_ms: 0,
+            },
+            Request::Begin {
+                kind: TxnKind::Read,
+                lock_wait_ms: 0,
+            },
             Request::Commit,
             Request::Rollback,
             Request::Savepoint("a".into()),

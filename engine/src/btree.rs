@@ -10,6 +10,11 @@
 //! cells packed in key order. Header bytes 6..8 hold the cell count and
 //! 8..10 the end of the last cell.
 //!
+//! Most changes touch one cell of a page: they are made by moving the
+//! bytes after it within the page (`Edit`), on the page itself if the
+//! writer owns it and on a copy otherwise. Only a change that no longer
+//! fits takes the page apart into its cells to split it.
+//!
 //! ```text
 //! leaf cell    varint key length, varint value length, key, value
 //! branch cell  child page (u32), varint key length, key
@@ -50,6 +55,16 @@ pub trait PagesMut: Pages {
     fn replace(&mut self, id: PageId, buf: Vec<u8>);
     /// Says this writer's tree no longer uses the page.
     fn free(&mut self, id: PageId);
+    /// Changes a page this writer made, where it lies. Returns false,
+    /// having changed nothing, if that cannot be done now: the page is
+    /// not in memory, or someone still reads the bytes as they are.
+    fn edit(&mut self, _id: PageId, _change: &mut dyn FnMut(&mut [u8])) -> bool {
+        false
+    }
+    /// `alloc` for a page that is already in the form pages are kept in.
+    fn alloc_page(&mut self, page: Page) -> Result<PageId> {
+        self.alloc(page.to_vec())
+    }
 }
 
 // ---------------------------------------------------------------- nodes
@@ -87,12 +102,15 @@ impl<'a> Node<'a> {
         (0..self.len()).map(|i| self.cell(i)).collect()
     }
     fn key(&self, i: usize) -> &'a [u8] {
-        let cell = self.cell(i);
+        // The key's length is in the cell: where the cell ends is not
+        // needed to find it.
+        let cell = &self.page[self.offset(i)..];
+        let mut pos = if self.is_leaf() { 0 } else { 4 };
+        let klen = get_varint(cell, &mut pos).unwrap_or(0) as usize;
         if self.is_leaf() {
-            leaf_parts(cell).0
-        } else {
-            branch_key(cell)
+            get_varint(cell, &mut pos);
         }
+        &cell[pos..pos + klen]
     }
     fn value(&self, i: usize) -> &'a [u8] {
         leaf_parts(self.cell(i)).1
@@ -173,6 +191,131 @@ fn build(kind: u8, cells: &[&[u8]]) -> Vec<u8> {
 
 fn size(cells: &[&[u8]]) -> usize {
     cells.iter().map(|c| c.len() + 2).sum()
+}
+
+/// A change to one cell of a page.
+enum Edit<'c> {
+    /// A new cell, to be the `usize`th.
+    Insert(usize, &'c [u8]),
+    Replace(usize, &'c [u8]),
+    Remove(usize),
+}
+
+impl Node<'_> {
+    /// Where cell `i` ends.
+    fn cell_end(&self, i: usize) -> usize {
+        if i + 1 < self.len() {
+            self.offset(i + 1)
+        } else {
+            self.end()
+        }
+    }
+
+    /// Whether the page still holds its cells after `edit`.
+    fn fits(&self, edit: &Edit) -> bool {
+        let used = self.end() - HEADER;
+        match edit {
+            Edit::Insert(_, cell) => used + cell.len() + 2 <= CAPACITY,
+            Edit::Replace(i, cell) => {
+                used + cell.len() - (self.cell_end(*i) - self.offset(*i)) <= CAPACITY
+            }
+            Edit::Remove(_) => true,
+        }
+    }
+}
+
+/// Makes `edit` in a page's bytes, which have room for it: the cells
+/// after the one changed move up or down, and their offsets with them.
+fn apply(buf: &mut [u8], edit: &Edit) {
+    let n = get_u16(buf, 6) as usize;
+    let end = get_u16(buf, 8) as usize;
+    let offset = |buf: &[u8], i: usize| get_u16(buf, HEADER + 2 * i) as usize;
+    let start = HEADER + 2 * n;
+    match *edit {
+        Edit::Insert(i, cell) => {
+            let at = if i < n { offset(buf, i) } else { end };
+            // The cells from here on make room for the new one and for
+            // its offset; those before it only for the offset.
+            buf.copy_within(at..end, at + 2 + cell.len());
+            buf.copy_within(start..at, start + 2);
+            buf[at + 2..at + 2 + cell.len()].copy_from_slice(cell);
+            // From the last down: each takes the place after its own.
+            for j in (i + 1..=n).rev() {
+                let old = offset(buf, j - 1);
+                put_u16(buf, HEADER + 2 * j, (old + 2 + cell.len()) as u16);
+            }
+            put_u16(buf, HEADER + 2 * i, (at + 2) as u16);
+            for j in 0..i {
+                let old = offset(buf, j);
+                put_u16(buf, HEADER + 2 * j, (old + 2) as u16);
+            }
+            put_u16(buf, 6, (n + 1) as u16);
+            put_u16(buf, 8, (end + 2 + cell.len()) as u16);
+        }
+        Edit::Replace(i, cell) => {
+            let at = offset(buf, i);
+            let old_end = if i + 1 < n { offset(buf, i + 1) } else { end };
+            let new_end = at + cell.len();
+            buf.copy_within(old_end..end, new_end);
+            buf[at..new_end].copy_from_slice(cell);
+            for j in i + 1..n {
+                let old = offset(buf, j);
+                put_u16(buf, HEADER + 2 * j, (old + new_end - old_end) as u16);
+            }
+            let page_end = end + new_end - old_end;
+            if page_end < end {
+                buf[page_end..end].fill(0);
+            }
+            put_u16(buf, 8, page_end as u16);
+        }
+        Edit::Remove(i) => {
+            let at = offset(buf, i);
+            let old_end = if i + 1 < n { offset(buf, i + 1) } else { end };
+            let gone = old_end - at;
+            // From the first up: each takes the place before its own.
+            for j in 0..i {
+                let old = offset(buf, j);
+                put_u16(buf, HEADER + 2 * j, (old - 2) as u16);
+            }
+            for j in i..n - 1 {
+                let old = offset(buf, j + 1);
+                put_u16(buf, HEADER + 2 * j, (old - 2 - gone) as u16);
+            }
+            buf.copy_within(start..at, start - 2);
+            buf.copy_within(old_end..end, at - 2);
+            let page_end = end - 2 - gone;
+            buf[page_end..end].fill(0);
+            put_u16(buf, 6, (n - 1) as u16);
+            put_u16(buf, 8, page_end as u16);
+        }
+    }
+}
+
+/// Makes a change that fits in page `id`, whose bytes are `page`: on the
+/// page itself if the writer owns it, on a copy otherwise.
+fn change<P: PagesMut>(p: &mut P, id: PageId, page: Page, edit: &Edit) -> Result<Outcome> {
+    if p.is_private(id) {
+        // Given up here, the bytes are the writer's alone to change,
+        // unless a cursor somewhere still reads them.
+        drop(page);
+        if p.edit(id, &mut |buf| apply(buf, edit)) {
+            return Ok(Outcome::Same);
+        }
+        let mut buf = p.page(id)?.to_vec();
+        apply(&mut buf, edit);
+        p.replace(id, buf);
+        return Ok(Outcome::Same);
+    }
+    // One copy, made in the form the writer keeps, and changed there.
+    let mut copy: Page = Page::from(&page[..]);
+    drop(page);
+    apply(
+        std::sync::Arc::get_mut(&mut copy).expect("a page just made has one holder"),
+        edit,
+    );
+    let new = p.alloc_page(copy)?;
+    p.free(id);
+    Ok(Outcome::Now(vec![(Vec::new(), new)]))
 }
 
 /// Splits cells that overflow one page into runs that each fit, as even
@@ -268,7 +411,24 @@ fn write_node<P: PagesMut>(p: &mut P, id: PageId, kind: u8, cells: &[&[u8]], app
 }
 
 /// Rewrites a branch after its child `i` became `pages`.
-fn replace_child<P: PagesMut>(p: &mut P, id: PageId, node: Node, i: usize, pages: Vec<(Vec<u8>, PageId)>) -> Result<Outcome> {
+fn replace_child<P: PagesMut>(
+    p: &mut P,
+    id: PageId,
+    page: Page,
+    i: usize,
+    pages: Vec<(Vec<u8>, PageId)>,
+) -> Result<Outcome> {
+    let node = Node::new(&page, id)?;
+    match pages.as_slice() {
+        // The child moved: its cell names the new page.
+        [(_, child)] => {
+            let cell = branch_cell(*child, node.key(i));
+            return change(p, id, page, &Edit::Replace(i, &cell));
+        }
+        // The child is gone, and others remain.
+        [] if node.len() > 1 => return change(p, id, page, &Edit::Remove(i)),
+        _ => {}
+    }
     let old_key = node.key(i);
     let owned: Vec<Vec<u8>> =
         pages.iter().enumerate().map(|(n, (key, child))| branch_cell(*child, if n == 0 { old_key } else { key })).collect();
@@ -333,6 +493,14 @@ fn put_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8], value: &[u8]) -> Resu
     if node.is_leaf() {
         let (i, found) = node.search(key);
         let cell = leaf_cell(key, value);
+        let edit = if found {
+            Edit::Replace(i, &cell)
+        } else {
+            Edit::Insert(i, &cell)
+        };
+        if node.fits(&edit) {
+            return Ok((change(p, id, page, &edit)?, found));
+        }
         let mut cells = node.cells();
         if found {
             cells[i] = &cell;
@@ -346,7 +514,7 @@ fn put_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8], value: &[u8]) -> Resu
     let (outcome, existed) = put_rec(p, node.child(i), key, value)?;
     match outcome {
         Outcome::Same => Ok((Outcome::Same, existed)),
-        Outcome::Now(pages) => Ok((replace_child(p, id, node, i, pages)?, existed)),
+        Outcome::Now(pages) => Ok((replace_child(p, id, page, i, pages)?, existed)),
     }
 }
 
@@ -382,15 +550,17 @@ fn delete_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8]) -> Result<(Outcome
         if !found {
             return Ok((Outcome::Same, false));
         }
-        let mut cells = node.cells();
-        cells.remove(i);
-        return Ok((write_node(p, id, KIND_LEAF, &cells, false)?, true));
+        if node.len() > 1 {
+            return Ok((change(p, id, page, &Edit::Remove(i))?, true));
+        }
+        // Its last entry: the page goes.
+        return Ok((write_node(p, id, KIND_LEAF, &[], false)?, true));
     }
     let i = node.child_for(key);
     let (outcome, found) = delete_rec(p, node.child(i), key)?;
     match outcome {
         Outcome::Same => Ok((Outcome::Same, found)),
-        Outcome::Now(pages) => Ok((replace_child(p, id, node, i, pages)?, found)),
+        Outcome::Now(pages) => Ok((replace_child(p, id, page, i, pages)?, found)),
     }
 }
 
@@ -783,6 +953,70 @@ pub(crate) mod tests {
             assert!(self.pages.remove(&id).is_some(), "page {id} freed twice");
             self.private.remove(&id);
             self.frees.push(id);
+        }
+        fn edit(&mut self, id: PageId, change: &mut dyn FnMut(&mut [u8])) -> bool {
+            assert!(self.private.contains(&id));
+            match self.pages.get_mut(&id).and_then(Arc::get_mut) {
+                Some(buf) => {
+                    change(buf);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// A cell changed where it lies leaves the page byte for byte as
+    /// building it from its cells would.
+    #[test]
+    fn a_page_edited_in_place_equals_the_page_rebuilt() {
+        let mut rng = Rng::new(7);
+        for round in 0..300 {
+            let kind = if round % 2 == 0 {
+                KIND_LEAF
+            } else {
+                KIND_BRANCH
+            };
+            let mut cells: Vec<Vec<u8>> = Vec::new();
+            let mut page = build(kind, &[]);
+            for _ in 0..400 {
+                let cell: Vec<u8> = (0..rng.below(if round % 3 == 0 { 600 } else { 40 }) + 1)
+                    .map(|_| rng.next() as u8)
+                    .collect();
+                let pick = rng.below(10);
+                let edit = if cells.is_empty() || pick < 5 {
+                    Edit::Insert(rng.below(cells.len() as u64 + 1) as usize, &cell)
+                } else if pick < 8 {
+                    Edit::Replace(rng.below(cells.len() as u64) as usize, &cell)
+                } else {
+                    Edit::Remove(rng.below(cells.len() as u64) as usize)
+                };
+                let node = Node { page: &page };
+                let fits = node.fits(&edit);
+                let mut after = cells.clone();
+                match &edit {
+                    Edit::Insert(i, cell) => after.insert(*i, cell.to_vec()),
+                    Edit::Replace(i, cell) => after[*i] = cell.to_vec(),
+                    Edit::Remove(i) => {
+                        after.remove(*i);
+                    }
+                }
+                let slices: Vec<&[u8]> = after.iter().map(|c| c.as_slice()).collect();
+                assert_eq!(
+                    fits,
+                    size(&slices) <= CAPACITY,
+                    "whether an edit fits is whether its cells do"
+                );
+                if !fits {
+                    continue;
+                }
+                apply(&mut page, &edit);
+                assert!(
+                    page == build(kind, &slices),
+                    "round {round}: an edited page differs from the same cells built"
+                );
+                cells = after;
+            }
         }
     }
 

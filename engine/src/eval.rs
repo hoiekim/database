@@ -2,7 +2,8 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use database_protocol::decimal::Decimal;
@@ -26,6 +27,70 @@ pub struct Ctx<'a> {
     pub now: i64,
     /// When the statement must give up.
     pub deadline: Option<Instant>,
+    /// Where a writing transaction's statements draw the values that the
+    /// rows do not decide. `None` for a reader, which draws them fresh.
+    pub tape: Option<&'a Tape>,
+}
+
+/// A value a statement drew that nothing in the database decides: a
+/// random id, or the next number of a counter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Drawn {
+    Uuid([u8; 16]),
+    Serial(i64),
+}
+
+/// The values a transaction's statements drew, and the values they are
+/// to draw.
+///
+/// A transaction that ran beside others is run again, alone, when it
+/// commits (see `db.rs`), and must then do what it did the first time.
+/// So what a statement draws is kept, and the second run is given it to
+/// draw again.
+#[derive(Default)]
+pub struct Tape {
+    drawn: Mutex<Vec<Drawn>>,
+    given: Mutex<VecDeque<Drawn>>,
+}
+
+impl Tape {
+    /// What has been drawn since this was last asked.
+    pub fn take_drawn(&self) -> Vec<Drawn> {
+        std::mem::take(&mut self.drawn.lock().unwrap())
+    }
+
+    /// Sets what the next statement draws, in order. Where it draws
+    /// more, or something else, it draws fresh.
+    pub fn give(&self, values: &[Drawn]) {
+        let mut given = self.given.lock().unwrap();
+        given.clear();
+        given.extend(values);
+    }
+
+    pub fn uuid(&self) -> [u8; 16] {
+        let given = self.given.lock().unwrap().pop_front();
+        let uuid = match given {
+            Some(Drawn::Uuid(uuid)) => uuid,
+            _ => random_uuid(),
+        };
+        self.drawn.lock().unwrap().push(Drawn::Uuid(uuid));
+        uuid
+    }
+
+    /// A counter's next number: the one given, or else what `fresh`
+    /// makes of `floor`, where the counter stands. A number given is one
+    /// the counter kept for this transaction when it first ran (see
+    /// `Store::next_serial`), so it is used wherever the counter has got
+    /// to since.
+    pub fn serial(&self, floor: i64, fresh: impl FnOnce(i64) -> i64) -> i64 {
+        let given = self.given.lock().unwrap().pop_front();
+        let number = match given {
+            Some(Drawn::Serial(number)) => number,
+            _ => fresh(floor),
+        };
+        self.drawn.lock().unwrap().push(Drawn::Serial(number));
+        number
+    }
 }
 
 impl Ctx<'_> {
@@ -702,7 +767,7 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
     // These handle NULL themselves or take any number of arguments.
     match func {
         Func::Now => return Ok(Value::Timestamp(ctx.now)),
-        Func::RandomUuid => return Ok(Value::Uuid(random_uuid())),
+        Func::RandomUuid => return Ok(Value::Uuid(ctx.tape.map_or_else(random_uuid, Tape::uuid))),
         Func::Coalesce => {
             for arg in args {
                 let v = eval(ctx, scope, arg)?;

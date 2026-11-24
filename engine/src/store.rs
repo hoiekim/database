@@ -22,7 +22,7 @@
 //! read it: no reader pinned at an older version, and no checkpoint, on
 //! disk or under way, that still names it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -93,8 +93,8 @@ impl Meta {
 
 #[derive(Default)]
 struct Mem {
-    dirty: HashMap<PageId, Page>,
-    flushing: HashMap<PageId, Page>,
+    dirty: PageMap<Page>,
+    flushing: PageMap<Page>,
 }
 
 struct Alloc {
@@ -102,7 +102,7 @@ struct Alloc {
     next_page: PageId,
     /// Pages handed out since the last checkpoint was captured. No
     /// checkpoint names them, so once freed they wait only for readers.
-    young: HashSet<PageId>,
+    young: PageSet,
     /// Freed pages that no checkpoint names, by the version that freed
     /// them: reusable once no reader is older than that version.
     wait_readers: BTreeMap<u64, Vec<PageId>>,
@@ -113,6 +113,11 @@ struct Alloc {
     durable: u64,
     /// The pages holding that checkpoint's catalog and free list.
     chain_pages: Vec<PageId>,
+    /// Pages held by forks: transactions that write beside the one
+    /// writer and have not committed (see `Writer::fork`). No version
+    /// uses them, so a checkpoint counts them free: after a crash they
+    /// are, the fork having died with the process.
+    lent: PageSet,
     meta: Meta,
 }
 
@@ -147,6 +152,11 @@ pub struct Store {
     limits: Limits,
     /// Set when a write to the file failed: nothing more is written.
     failed: AtomicBool,
+    /// Per table and column, one past the highest number an
+    /// `auto_increment` counter has given a fork. Forks run beside each
+    /// other, each on its own copy of the counter: this keeps them from
+    /// giving out the same number twice.
+    serials: Mutex<HashMap<(u32, usize), i64>>,
     pub disk_reads: AtomicU64,
     pub disk_writes: AtomicU64,
 }
@@ -247,16 +257,18 @@ impl Store {
             alloc: Mutex::new(Alloc {
                 free,
                 next_page: meta.next_page,
-                young: HashSet::new(),
+                young: PageSet::default(),
                 wait_readers: BTreeMap::new(),
                 wait_checkpoint: BTreeMap::new(),
                 durable: meta.version,
                 chain_pages,
+                lent: PageSet::default(),
                 meta: meta.clone(),
             }),
             pins: Mutex::new(Pins { published: meta.version, counts: BTreeMap::new() }),
             limits,
             failed: AtomicBool::new(false),
+            serials: Mutex::new(HashMap::new()),
             disk_reads: AtomicU64::new(0),
             disk_writes: AtomicU64::new(0),
         }
@@ -316,7 +328,7 @@ impl Store {
         Ok(page)
     }
 
-    fn take_page(&self) -> PageId {
+    fn take_page(&self, lent: bool) -> PageId {
         let mut alloc = self.alloc.lock().unwrap();
         let id = match alloc.free.pop() {
             Some(id) => id,
@@ -327,7 +339,25 @@ impl Store {
             }
         };
         alloc.young.insert(id);
+        if lent {
+            alloc.lent.insert(id);
+        }
         id
+    }
+
+    /// The next number of a table's counter, which stands at `floor` in
+    /// the transaction that asks: `floor`, or more if forks have been
+    /// given that already. `claim` keeps the number from every fork that
+    /// asks later, whether or not the asker commits.
+    fn next_serial(&self, table: u32, column: usize, floor: i64, claim: bool) -> i64 {
+        let mut serials = self.serials.lock().unwrap();
+        let number = serials
+            .get(&(table, column))
+            .map_or(floor, |given| floor.max(*given));
+        if claim {
+            serials.insert((table, column), number.saturating_add(1));
+        }
+        number
     }
 
     // ------------------------------------------------------------ readers
@@ -490,6 +520,7 @@ impl Store {
         let mut free: Vec<PageId> = alloc.free.clone();
         free.extend(alloc.wait_readers.values().flatten());
         free.extend(alloc.wait_checkpoint.values().flatten());
+        free.extend(&alloc.lent);
         free.extend(&old_chain);
         // Its own pages come from the end of the file, so that taking
         // them does not change the list being written.
@@ -573,6 +604,7 @@ impl Store {
         let mut free = alloc.free.clone();
         free.extend(alloc.wait_readers.values().flatten());
         free.extend(alloc.wait_checkpoint.values().flatten());
+        free.extend(&alloc.lent);
         (free, alloc.next_page, alloc.chain_pages.clone())
     }
 
@@ -605,12 +637,12 @@ impl Pages for Store {
 /// it has written itself, which nobody else can see until `commit`.
 pub struct Writer {
     store: Arc<Store>,
-    private: HashMap<PageId, Page>,
+    private: PageMap<Page>,
     /// Private pages written to the file to save memory.
-    spilled: HashSet<PageId>,
+    spilled: PageSet,
     /// Private pages a savepoint may have to bring back: they are no
     /// longer changed in place.
-    frozen: HashSet<PageId>,
+    frozen: PageSet,
     /// Numbers this transaction took and gave back, to take again.
     recycled: Vec<PageId>,
     /// Committed pages this transaction's trees no longer use.
@@ -619,6 +651,8 @@ pub struct Writer {
     frozen_freed: Vec<PageId>,
     /// Every number handed out, in order, for `rollback_to`.
     alloc_log: Vec<PageId>,
+    /// Whether this writes beside the database's one writer: see `fork`.
+    fork: bool,
 }
 
 /// A point in a transaction's page writes to return to.
@@ -633,14 +667,58 @@ impl Writer {
     pub fn new(store: Arc<Store>) -> Writer {
         Writer {
             store,
-            private: HashMap::new(),
-            spilled: HashSet::new(),
-            frozen: HashSet::new(),
+            private: PageMap::default(),
+            spilled: PageSet::default(),
+            frozen: PageSet::default(),
             recycled: Vec::new(),
             freed: Vec::new(),
             frozen_freed: Vec::new(),
             alloc_log: Vec::new(),
+            fork: false,
         }
+    }
+
+    /// A writer that may work while another does: on a version it does
+    /// not have to itself, which the caller keeps pinned as a reader
+    /// would. Its pages are its own until `commit`, and that may be
+    /// called only if no other writer has committed since the version it
+    /// began on, and with every other writer held off. Otherwise there
+    /// is only `rollback`.
+    pub fn fork(store: Arc<Store>) -> Writer {
+        let mut writer = Writer::new(store);
+        writer.fork = true;
+        writer
+    }
+
+    /// Makes a fork the database's writer. The caller holds every other
+    /// writer off, and none has committed since the fork began.
+    pub fn attach(&mut self) {
+        if !self.fork {
+            return;
+        }
+        self.fork = false;
+        // Its pages are a writer's now: the next checkpoint finds no
+        // transaction open, and so none of them lent.
+        let mut alloc = self.store.alloc.lock().unwrap();
+        for id in self
+            .private
+            .keys()
+            .chain(&self.spilled)
+            .chain(&self.recycled)
+        {
+            alloc.lent.remove(id);
+        }
+    }
+
+    /// Pages held in memory for the transaction.
+    pub fn private_pages(&self) -> usize {
+        self.private.len()
+    }
+
+    /// The next number of a table's `auto_increment` counter, which
+    /// stands at `floor` in this transaction.
+    pub fn next_serial(&self, table: u32, column: usize, floor: i64) -> i64 {
+        self.store.next_serial(table, column, floor, self.fork)
     }
 
     pub fn store(&self) -> &Arc<Store> {
@@ -708,6 +786,17 @@ impl Writer {
         {
             let mut alloc = self.store.alloc.lock().unwrap();
             let mut mem = self.store.mem.write().unwrap();
+            if self.fork {
+                // Every page it took is now in one of these three.
+                for id in self
+                    .private
+                    .keys()
+                    .chain(&self.spilled)
+                    .chain(&self.recycled)
+                {
+                    alloc.lent.remove(id);
+                }
+            }
             for id in self.freed.drain(..) {
                 // A page handed out since the last checkpoint is named by
                 // none; any other may be.
@@ -742,7 +831,13 @@ impl Writer {
         self.frozen_freed.clear();
         self.alloc_log.clear();
         if !ids.is_empty() {
-            self.store.alloc.lock().unwrap().free.extend(ids);
+            let mut alloc = self.store.alloc.lock().unwrap();
+            if self.fork {
+                for id in &ids {
+                    alloc.lent.remove(id);
+                }
+            }
+            alloc.free.extend(ids);
         }
     }
 }
@@ -767,12 +862,16 @@ impl Pages for Writer {
 
 impl PagesMut for Writer {
     fn alloc(&mut self, buf: Vec<u8>) -> Result<PageId> {
+        self.alloc_page(Arc::from(buf))
+    }
+
+    fn alloc_page(&mut self, page: Page) -> Result<PageId> {
         let id = match self.recycled.pop() {
             Some(id) => id,
-            None => self.store.take_page(),
+            None => self.store.take_page(self.fork),
         };
         self.alloc_log.push(id);
-        self.private.insert(id, Arc::from(buf));
+        self.private.insert(id, page);
         self.spill_if_many()?;
         Ok(id)
     }
@@ -785,6 +884,19 @@ impl PagesMut for Writer {
         debug_assert!(self.is_private(id));
         self.spilled.remove(&id);
         self.private.insert(id, Arc::from(buf));
+    }
+
+    fn edit(&mut self, id: PageId, change: &mut dyn FnMut(&mut [u8])) -> bool {
+        if self.frozen.contains(&id) {
+            return false;
+        }
+        match self.private.get_mut(&id).and_then(Arc::get_mut) {
+            Some(buf) => {
+                change(buf);
+                true
+            }
+            None => false,
+        }
     }
 
     fn free(&mut self, id: PageId) {

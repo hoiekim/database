@@ -831,7 +831,7 @@ async fn migrate(db: &Client, model: Vec<TableDef>, hash: &str) -> DbResult<Vec<
     let guard = db.lock("app.migrate").await?;
     let hash = hash.to_string();
     let outcome = db
-        .transaction(|tx| async move {
+        .exclusive(|tx| async move {
             for table in &model {
                 tx.create_table_if_not_exists(table.clone()).await?;
             }
@@ -1666,7 +1666,7 @@ enum Added {
 async fn allow(db: &Client, user: Uuid, pattern: &str, cap: i64) -> DbResult<Added> {
     let proposed = pattern.to_string();
     let created = db
-        .transaction(|tx| async move {
+        .exclusive(|tx| async move {
             let have: i64 = tx
                 .query_one(Query::table("spam_allowlist").index("spam_allowlist_user_pattern", KeyRange::eq([user])).select("count", count()))
                 .await?

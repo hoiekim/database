@@ -17,6 +17,19 @@
 //! never sees, and a client is never told of, a commit that a crash could
 //! take back.
 //!
+//! **Forks.** A transaction that talks to its owner between statements
+//! would hold the write lock while it waits for the network. It may run
+//! as a fork instead: on a private copy of the newest durable catalog,
+//! without the lock, beside the writer and other forks. Nobody sees what
+//! it writes. To commit it takes the lock, and if no commit was made
+//! since it began, its copy is simply the next version (`attach`). If
+//! one was, the fork is dropped, and its owner runs the same statements
+//! again in an ordinary transaction, checking that each answers as it
+//! did: then nothing the owner was told has changed, and committing is
+//! the same as having run alone at that moment. The values statements
+//! draw rather than derive (random ids, counters) are kept for that
+//! second run: see `eval::Tape`.
+//!
 //! **Recovery.** Open the data file as of its last checkpoint, apply the
 //! log's records in order, checkpoint. A torn record at the log's end was
 //! never acknowledged and is ignored.
@@ -37,7 +50,7 @@ use crate::btree::{self, Pages};
 use crate::cache::PageCache;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
-use crate::eval::{Ctx, Scope};
+use crate::eval::{Ctx, Drawn, Scope};
 use crate::exec;
 use crate::page::{PageId, FIRST_DATA_PAGE};
 use crate::row::Row;
@@ -73,8 +86,9 @@ pub struct Database {
     vfs: Arc<dyn Vfs>,
     store: Arc<Store>,
     wal: Wal,
-    /// True while a writing transaction holds the database.
-    writing: Mutex<bool>,
+    /// Whether a writing transaction holds the database, and how many
+    /// threads wait for it to let go.
+    writing: Mutex<(bool, usize)>,
     write_free: Condvar,
     /// The newest committed version, durable or not: what the next
     /// writer builds on.
@@ -148,8 +162,13 @@ struct WriteGuard(Arc<Database>);
 
 impl Drop for WriteGuard {
     fn drop(&mut self) {
-        *self.0.writing.lock().unwrap() = false;
-        self.0.write_free.notify_one();
+        let mut writing = self.0.writing.lock().unwrap();
+        writing.0 = false;
+        // Waking is a call into the kernel: only when someone waits,
+        // which between writers that queue for their turn is seldom.
+        if writing.1 > 0 {
+            self.0.write_free.notify_one();
+        }
     }
 }
 
@@ -241,7 +260,7 @@ impl Database {
             vfs,
             store,
             wal,
-            writing: Mutex::new(false),
+            writing: Mutex::new((false, 0)),
             write_free: Condvar::new(),
             latest: Mutex::new(snapshot.clone()),
             published: Mutex::new(snapshot),
@@ -296,14 +315,16 @@ impl Database {
     fn lock_writes(self: &Arc<Self>, wait: Duration) -> Result<WriteGuard> {
         let deadline = Instant::now() + wait;
         let mut writing = self.writing.lock().unwrap();
-        while *writing {
+        while writing.0 {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(Error::db(ErrorCode::LockTimeout, format!("waited {wait:?} for the write lock of {:?}", self.name)));
             }
+            writing.1 += 1;
             writing = self.write_free.wait_timeout(writing, left).unwrap().0;
+            writing.1 -= 1;
         }
-        *writing = true;
+        writing.0 = true;
         Ok(WriteGuard(self.clone()))
     }
 
@@ -323,6 +344,11 @@ impl Database {
     /// The newest committed version, durable or not.
     pub fn latest_version(&self) -> u64 {
         self.latest.lock().unwrap().version
+    }
+
+    /// Whether `version` is on disk and visible to readers.
+    pub fn is_published(&self, version: u64) -> bool {
+        self.published.lock().unwrap().version >= version
     }
 
     /// Arranges for `done` to be called once everything up to `version`
@@ -406,8 +432,45 @@ impl Database {
             let synced = self.fatal(self.wal.sync_to(base.version))?;
             self.publish_up_to(synced);
         }
-        let tx = Tx::new(Writer::new(self.store.clone()), (*base.catalog).clone(), now_micros());
-        Ok(WriteTxn { db: self.clone(), tx: Some(tx), base: base.version, failed: false, savepoints: Vec::new(), guard: Some(guard) })
+        let tx = Tx::new(
+            Writer::new(self.store.clone()),
+            (*base.catalog).clone(),
+            now_micros(),
+        );
+        Ok(WriteTxn {
+            db: self.clone(),
+            tx: Some(tx),
+            base: base.version,
+            failed: false,
+            savepoints: Vec::new(),
+            guard: Some(guard),
+            pinned: None,
+        })
+    }
+
+    /// Starts a transaction that may write but does not take the write
+    /// lock: a fork of the newest durable version, which it holds as a
+    /// reader does. It cannot commit as it is: see `WriteTxn::attach`.
+    pub fn begin_fork(self: &Arc<Self>) -> Result<WriteTxn> {
+        self.check_failed()?;
+        let (base, pinned) = {
+            let published = self.published.lock().unwrap();
+            (published.clone(), self.store.pin())
+        };
+        let tx = Tx::new(
+            Writer::fork(self.store.clone()),
+            (*base.catalog).clone(),
+            now_micros(),
+        );
+        Ok(WriteTxn {
+            db: self.clone(),
+            tx: Some(tx),
+            base: base.version,
+            failed: false,
+            savepoints: Vec::new(),
+            guard: None,
+            pinned: Some(pinned),
+        })
     }
 
     /// Whether a checkpoint would do some good now.
@@ -467,7 +530,13 @@ impl Database {
         let mut report = String::new();
         let mut rows_total = 0u64;
         for table in latest.catalog.tables.values() {
-            let ctx = Ctx { pages, catalog: &latest.catalog, now: 0, deadline: None };
+            let ctx = Ctx {
+                pages,
+                catalog: &latest.catalog,
+                now: 0,
+                deadline: None,
+                tape: None,
+            };
             // The rows, and the large values they name.
             let mut rows = 0u64;
             let mut blob_bytes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
@@ -590,7 +659,7 @@ pub struct ReadTxn {
 /// and its locks.
 struct Recent<'a> {
     store: &'a Store,
-    pages: std::cell::RefCell<std::collections::HashMap<PageId, crate::page::Page>>,
+    pages: std::cell::RefCell<crate::page::PageMap<crate::page::Page>>,
 }
 
 /// As many pages as a query keeps for itself: half a megabyte.
@@ -613,14 +682,29 @@ impl Pages for Recent<'_> {
 
 impl ReadTxn {
     pub fn ctx(&self, deadline: Option<Instant>) -> Ctx<'_> {
-        Ctx { pages: &*self.db.store, catalog: &self.snapshot.catalog, now: self.now, deadline }
+        Ctx {
+            pages: &*self.db.store,
+            catalog: &self.snapshot.catalog,
+            now: self.now,
+            deadline,
+            tape: None,
+        }
     }
 
     pub fn query(&self, q: &Query, deadline: Option<Instant>) -> Result<RowSet> {
         // A version's pages never change, so what the query has read
         // once it may read again from its own copy.
-        let recent = Recent { store: &self.db.store, pages: Default::default() };
-        let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline };
+        let recent = Recent {
+            store: &self.db.store,
+            pages: Default::default(),
+        };
+        let ctx = Ctx {
+            pages: &recent,
+            catalog: &self.snapshot.catalog,
+            now: self.now,
+            deadline,
+            tape: None,
+        };
         exec::query(&ctx, q, &Scope::default())
     }
 
@@ -664,7 +748,8 @@ struct Savepoint {
     log_len: usize,
 }
 
-/// A transaction that may write. It holds the database's write lock.
+/// A transaction that may write. It holds the database's write lock,
+/// unless it is a fork that has not been attached.
 pub struct WriteTxn {
     db: Arc<Database>,
     tx: Option<Tx>,
@@ -674,6 +759,8 @@ pub struct WriteTxn {
     failed: bool,
     savepoints: Vec<Savepoint>,
     guard: Option<WriteGuard>,
+    /// For a fork: the version it holds as a reader would.
+    pinned: Option<u64>,
 }
 
 fn aborted() -> Error {
@@ -752,6 +839,77 @@ impl WriteTxn {
         self.tx.as_ref().map_or(0, |tx| tx.now)
     }
 
+    /// Sets the clock its statements read: to run again, at the same
+    /// moment, what a fork ran.
+    pub fn set_now(&mut self, now: i64) {
+        if let Some(tx) = self.tx.as_mut() {
+            tx.now = now;
+        }
+    }
+
+    /// The random ids and counters' numbers its statements have drawn
+    /// since this was last asked.
+    pub fn take_drawn(&mut self) -> Vec<Drawn> {
+        self.tx
+            .as_ref()
+            .map_or_else(Vec::new, |tx| tx.tape.take_drawn())
+    }
+
+    /// Has the next statement draw these, in order, where it draws.
+    pub fn give(&mut self, values: &[Drawn]) {
+        if let Some(tx) = self.tx.as_ref() {
+            tx.tape.give(values);
+        }
+    }
+
+    /// Whether this is a fork that still runs beside the writer.
+    pub fn is_fork(&self) -> bool {
+        self.guard.is_none()
+    }
+
+    /// Whether a statement has failed, so that only a rollback is left.
+    pub fn has_failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Whether it has changed anything so far.
+    pub fn has_written(&self) -> bool {
+        self.tx
+            .as_ref()
+            .is_some_and(|tx| !(tx.writer.is_clean() && tx.log.buf.is_empty()))
+    }
+
+    /// Pages it holds in memory.
+    pub fn private_pages(&self) -> usize {
+        self.tx.as_ref().map_or(0, |tx| tx.writer.private_pages())
+    }
+
+    /// Makes a fork the database's writer, waiting up to `wait` for the
+    /// write lock, if nothing has been committed since the fork began:
+    /// from then on it is a transaction like any other, and may commit.
+    /// Returns false, leaving the fork as it was, if something has: what
+    /// it read may no longer hold, and it can only be rolled back.
+    pub fn attach(&mut self, wait: Duration) -> Result<bool> {
+        if self.guard.is_some() {
+            return Ok(true);
+        }
+        self.db.check_failed()?;
+        let guard = self.db.lock_writes(wait)?;
+        if self.db.latest.lock().unwrap().version != self.base {
+            return Ok(false);
+        }
+        self.guard = Some(guard);
+        if let Some(tx) = self.tx.as_mut() {
+            tx.writer.attach();
+        }
+        // It builds on the newest version with no other writer about:
+        // nothing it can reach will be freed under it.
+        if let Some(pinned) = self.pinned.take() {
+            self.db.store.unpin(pinned);
+        }
+        Ok(true)
+    }
+
     /// Direct access for loading a dump: writes that are already known to
     /// be valid, without a log record.
     pub fn raw(&mut self) -> Result<&mut Tx> {
@@ -821,6 +979,12 @@ impl WriteTxn {
         if self.failed {
             return Err(aborted());
         }
+        if self.guard.is_none() {
+            return Err(Error::db(
+                ErrorCode::Internal,
+                "a fork was committed without the write lock",
+            ));
+        }
         // A database dropped or replaced meanwhile takes no more commits.
         self.db.check_failed()?;
         let tx = self.tx.take().expect("present until the transaction ends");
@@ -843,22 +1007,27 @@ impl WriteTxn {
         *db.last_commit.lock().unwrap() = Instant::now();
         db.commits.fetch_add(1, Ordering::Relaxed);
         db.commits_since_checkpoint.fetch_add(1, Ordering::Relaxed);
+        // A commit that put nothing in the log, with nothing before it
+        // still on its way to the disk, has nothing to wait for: readers
+        // may see it now.
+        if db.wal.synced_version() >= version {
+            db.publish_up_to(version);
+        }
         // The next writer may start while this commit reaches the disk.
         self.guard.take();
         Ok(Some(Committed { db, version }))
     }
 
-    pub fn rollback(mut self) {
-        if let Some(tx) = self.tx.take() {
-            tx.writer.rollback();
-        }
-    }
+    pub fn rollback(self) {}
 }
 
 impl Drop for WriteTxn {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
             tx.writer.rollback();
+        }
+        if let Some(pinned) = self.pinned.take() {
+            self.db.store.unpin(pinned);
         }
     }
 }

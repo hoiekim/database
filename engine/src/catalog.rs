@@ -17,6 +17,33 @@ use database_protocol::value::{Type, Value};
 use crate::error::{Error, Result};
 use crate::page::{PageId, NO_PAGE};
 
+/// Hashes a column's name, to look it up by: every column an expression
+/// names is found this way for every row it is read from, so a short
+/// plain hash (FNV-1a) serves better than one that withstands chosen
+/// keys. The names are the schema's own.
+#[derive(Clone, Copy)]
+pub struct NameHasher(u64);
+
+impl Default for NameHasher {
+    fn default() -> Self {
+        NameHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl std::hash::Hasher for NameHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 29)
+    }
+}
+
+/// Columns by name.
+pub type NameMap = HashMap<String, usize, std::hash::BuildHasherDefault<NameHasher>>;
+
 #[derive(Clone, Debug)]
 pub struct Column {
     pub def: ColumnDef,
@@ -42,12 +69,15 @@ pub struct TableMeta {
     /// Every column a stored row may hold, dropped ones included.
     pub cols: Vec<Column>,
     /// Live columns by name.
-    pub by_name: HashMap<String, usize>,
+    pub by_name: NameMap,
     pub pk: Vec<usize>,
     pub indexes: Vec<Index>,
     pub foreign_keys: Vec<ForeignKey>,
     pub checks: Vec<Check>,
     pub volatile: bool,
+    /// The type and direction of each part of the primary key, worked
+    /// out when first asked for (see `exec::pk_parts`).
+    pub pk_parts: std::sync::OnceLock<Vec<(Option<Type>, bool)>>,
 }
 
 /// A table as stored in one version of the database: its definition, and
@@ -76,7 +106,9 @@ impl std::ops::Deref for Table {
 
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
-    pub tables: BTreeMap<String, Arc<Table>>,
+    /// By name. The names are shared, not copied, between the versions
+    /// of the catalog, of which every writing transaction makes one.
+    pub tables: BTreeMap<Arc<str>, Arc<Table>>,
     pub next_table_id: u32,
 }
 
@@ -144,12 +176,13 @@ impl Table {
             id,
             name: def.name.clone(),
             cols: Vec::new(),
-            by_name: HashMap::new(),
+            by_name: NameMap::default(),
             pk: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             checks: Vec::new(),
             volatile: def.volatile,
+            pk_parts: Default::default(),
         };
         for column in &def.columns {
             meta.add_column(column.clone(), Value::Null)?;
@@ -277,9 +310,16 @@ impl TableMeta {
         let parent: &TableMeta = if fk.ref_table == self.name {
             self
         } else {
-            catalog.tables.get(&fk.ref_table).map(|t| &*t.meta).ok_or_else(|| {
-                Error::Db(DbError::not_found(format!("foreign key {:?} points at table {:?}, which does not exist", fk.name, fk.ref_table)))
-            })?
+            catalog
+                .tables
+                .get(fk.ref_table.as_str())
+                .map(|t| &*t.meta)
+                .ok_or_else(|| {
+                    Error::Db(DbError::not_found(format!(
+                        "foreign key {:?} points at table {:?}, which does not exist",
+                        fk.name, fk.ref_table
+                    )))
+                })?
         };
         if fk.ref_columns.is_empty() {
             fk.ref_columns = parent.pk.iter().map(|i| parent.cols[*i].def.name.clone()).collect();
@@ -426,7 +466,7 @@ impl Catalog {
             let name = r.str().map_err(bad)?;
             let mut cols = Vec::new();
             let mut serials = Vec::new();
-            let mut by_name = HashMap::new();
+            let mut by_name = NameMap::default();
             for i in 0..r.count().map_err(bad)? {
                 let col = Column { def: codec::get_column(&mut r).map_err(bad)?, fill: codec::get_value(&mut r).map_err(bad)?, dropped: r.bool().map_err(bad)? };
                 serials.push(r.zigzag().map_err(bad)?);
@@ -442,7 +482,18 @@ impl Catalog {
             if pk.iter().any(|i| *i >= cols.len()) {
                 return Err(Error::corrupt("the stored catalog names a key column that does not exist"));
             }
-            let mut meta = TableMeta { id, name, cols, by_name, pk, indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), volatile: false };
+            let mut meta = TableMeta {
+                id,
+                name,
+                cols,
+                by_name,
+                pk,
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                checks: Vec::new(),
+                volatile: false,
+                pk_parts: Default::default(),
+            };
             let root = r.u32().map_err(bad)?;
             let blobs = r.u32().map_err(bad)?;
             let next_blob = r.varint().map_err(bad)?;
@@ -457,8 +508,18 @@ impl Catalog {
             meta.foreign_keys = rest.foreign_keys;
             meta.checks = rest.checks;
             meta.volatile = rest.volatile;
-            let table = Table { meta: Arc::new(meta), root, blobs, next_blob, rows, index_roots, serials };
-            catalog.tables.insert(table.name.clone(), Arc::new(table));
+            let table = Table {
+                meta: Arc::new(meta),
+                root,
+                blobs,
+                next_blob,
+                rows,
+                index_roots,
+                serials,
+            };
+            catalog
+                .tables
+                .insert(Arc::from(table.name.as_str()), Arc::new(table));
         }
         Ok(catalog)
     }

@@ -6310,7 +6310,19 @@ async fn default_splits_are_created_once_per_eligible_transaction_with_signed_am
     let defaults: Vec<DefaultSplit> = vec![(dec("33.33"), Some(budget), Some(category)), (dec("41.67"), Some(budget), None), (dec("25"), None, None)];
     let members = ["s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11", "s-bob", "s-none"];
 
-    let created = db.transaction(|tx| async move { create_default_splits(&tx, home.alice, &members, &defaults, dec("10"), "2026-03-01").await }).await?;
+    let created = db
+        .exclusive(|tx| async move {
+            create_default_splits(
+                &tx,
+                home.alice,
+                &members,
+                &defaults,
+                dec("10"),
+                "2026-03-01",
+            )
+            .await
+        })
+        .await?;
     assert_eq!(created, 5 * 3);
 
     let made = db
@@ -6361,7 +6373,17 @@ async fn default_splits_are_created_once_per_eligible_transaction_with_signed_am
     // Run again, every one of them is already split: nothing is added.
     let defaults = vec![(dec("50"), None, None), (dec("50"), None, None)];
     let again = db
-        .transaction(|tx| async move { create_default_splits(&tx, home.alice, &["s01", "s02", "s03", "s04", "s11"], &defaults, dec("10"), "2026-03-01").await })
+        .exclusive(|tx| async move {
+            create_default_splits(
+                &tx,
+                home.alice,
+                &["s01", "s02", "s03", "s04", "s11"],
+                &defaults,
+                dec("10"),
+                "2026-03-01",
+            )
+            .await
+        })
         .await?;
     assert_eq!(again, 0);
     // s05's only live split was Bob's; Alice's own now stand beside it.
@@ -6591,7 +6613,7 @@ async fn delete_budget(db: &Client, viewer: Uuid, budget: Uuid, interrupted: boo
         .query(find(Query::table("sections").index("idx_sections_budget_id", KeyRange::eq([budget])), &Filters::new(scope)).columns(["section_id"]))
         .await?
         .column()?;
-    db.transaction(|tx| async move {
+    db.exclusive(|tx| async move {
         for section in &sections {
             bulk_soft_delete_by_column(&tx, "categories", "section_id", *section, scope).await?;
         }
@@ -7174,7 +7196,7 @@ async fn import_plan_statement(
     mappings: Json,
     holdings: Vec<Data>,
 ) -> DbResult<(usize, u64)> {
-    db.transaction(|tx| async move {
+    db.exclusive(|tx| async move {
         let mut inserted = 0;
         for chunk in rows.chunks(1000) {
             inserted += upsert_many(&tx, "investment_transactions", chunk.to_vec(), Some(&[])).await?.len();
@@ -7452,7 +7474,7 @@ async fn delete_item(db: &Client, viewer: Uuid, item: &'static str) -> DbResult<
         .query(find(Query::table("accounts").index("idx_accounts_item_id", KeyRange::eq([item])), &Filters::new(scope)).columns(["account_id"]))
         .await?
         .column()?;
-    db.transaction(|tx| async move {
+    db.exclusive(|tx| async move {
         let ids = || accounts.iter().map(Value::from).collect::<Vec<Value>>();
         for (table, column) in [
             ("transactions", "account_id"),

@@ -37,6 +37,12 @@ impl Writer {
     pub fn new() -> Writer {
         Writer { buf: Vec::new() }
     }
+    /// A writer with room for `bytes` before it has to grow.
+    pub fn with_capacity(bytes: usize) -> Writer {
+        Writer {
+            buf: Vec::with_capacity(bytes),
+        }
+    }
     pub fn u8(&mut self, v: u8) {
         self.buf.push(v);
     }

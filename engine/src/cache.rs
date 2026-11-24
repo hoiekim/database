@@ -27,7 +27,7 @@ struct Slot {
 
 #[derive(Default)]
 struct Shard {
-    map: HashMap<Key, usize>,
+    map: HashMap<Key, usize, crate::page::PageHash>,
     slots: Vec<Slot>,
     hand: usize,
 }

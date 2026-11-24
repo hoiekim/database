@@ -1,0 +1,4 @@
+# The code is laid out by hand, with lines as long as they read well.
+# rustfmt has no setting that keeps it so: without this, `cargo fmt` or
+# an editor that formats on saving rewrites every file.
+disable_all_formatting = true
