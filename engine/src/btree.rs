@@ -37,6 +37,15 @@ pub const MAX_CELL: usize = CAPACITY / 4 - 2;
 /// page number and an index entry a key and little else. A table row with
 /// a key this long has almost no room left beside it.
 pub const MAX_KEY: usize = 1900;
+/// More levels than any tree has: a tree grows a level only when its root
+/// splits, and each level takes at least twice the splits of the one
+/// below. A path down that goes deeper runs in a circle, of pages from
+/// different moments that only a damaged file puts together.
+const MAX_DEPTH: usize = 64;
+
+fn too_deep(id: PageId) -> Error {
+    Error::corrupt(format!("tree page {id} lies deeper than any tree grows: the tree's pages point in a circle"))
+}
 
 /// The longest value that can sit beside a key of `key_len` bytes.
 pub const fn max_value(key_len: usize) -> usize {
@@ -476,7 +485,7 @@ pub fn get_with<P: Pages + ?Sized>(p: &P, root: PageId, key: &[u8], on_value: &m
         return Ok(false);
     }
     let mut id = root;
-    loop {
+    for _ in 0..MAX_DEPTH {
         let mut child = None;
         let mut found = false;
         p.view(id, &mut |page| {
@@ -497,6 +506,7 @@ pub fn get_with<P: Pages + ?Sized>(p: &P, root: PageId, key: &[u8], on_value: &m
             None => return Ok(found),
         }
     }
+    Err(too_deep(id))
 }
 
 /// Sets `key` to `value`. Returns the tree's new root and whether the key
@@ -507,7 +517,7 @@ pub fn put<P: PagesMut>(p: &mut P, root: PageId, key: &[u8], value: &[u8]) -> Re
         let cell = leaf_cell(key, value);
         return Ok((p.alloc(build(KIND_LEAF, &[&cell]))?, false));
     }
-    let (outcome, existed) = put_rec(p, root, key, value)?;
+    let (outcome, existed) = put_rec(p, root, key, value, 0)?;
     let root = match outcome {
         Outcome::Same => root,
         Outcome::Now(pages) if pages.len() == 1 => pages[0].1,
@@ -521,7 +531,10 @@ pub fn put<P: PagesMut>(p: &mut P, root: PageId, key: &[u8], value: &[u8]) -> Re
     Ok((root, existed))
 }
 
-fn put_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8], value: &[u8]) -> Result<(Outcome, bool)> {
+fn put_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8], value: &[u8], depth: usize) -> Result<(Outcome, bool)> {
+    if depth == MAX_DEPTH {
+        return Err(too_deep(id));
+    }
     let page = p.page(id)?;
     let node = Node::new(&page, id)?;
     if node.is_leaf() {
@@ -545,7 +558,7 @@ fn put_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8], value: &[u8]) -> Resu
         return Ok((write_node(p, id, KIND_LEAF, &cells, appended)?, found));
     }
     let i = node.child_for(key);
-    let (outcome, existed) = put_rec(p, node.child(i), key, value)?;
+    let (outcome, existed) = put_rec(p, node.child(i), key, value, depth + 1)?;
     match outcome {
         Outcome::Same => Ok((Outcome::Same, existed)),
         Outcome::Now(pages) => Ok((replace_child(p, id, page, i, pages)?, existed)),
@@ -557,7 +570,7 @@ pub fn delete<P: PagesMut>(p: &mut P, root: PageId, key: &[u8]) -> Result<(PageI
     if root == NO_PAGE {
         return Ok((root, false));
     }
-    let (outcome, found) = delete_rec(p, root, key)?;
+    let (outcome, found) = delete_rec(p, root, key, 0)?;
     let mut root = match outcome {
         Outcome::Same => root,
         Outcome::Now(pages) => pages.first().map_or(NO_PAGE, |(_, id)| *id),
@@ -576,7 +589,10 @@ pub fn delete<P: PagesMut>(p: &mut P, root: PageId, key: &[u8]) -> Result<(PageI
     Ok((root, found))
 }
 
-fn delete_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8]) -> Result<(Outcome, bool)> {
+fn delete_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8], depth: usize) -> Result<(Outcome, bool)> {
+    if depth == MAX_DEPTH {
+        return Err(too_deep(id));
+    }
     let page = p.page(id)?;
     let node = Node::new(&page, id)?;
     if node.is_leaf() {
@@ -591,7 +607,7 @@ fn delete_rec<P: PagesMut>(p: &mut P, id: PageId, key: &[u8]) -> Result<(Outcome
         return Ok((write_node(p, id, KIND_LEAF, &[], false)?, true));
     }
     let i = node.child_for(key);
-    let (outcome, found) = delete_rec(p, node.child(i), key)?;
+    let (outcome, found) = delete_rec(p, node.child(i), key, depth + 1)?;
     match outcome {
         Outcome::Same => Ok((Outcome::Same, found)),
         Outcome::Now(pages) => Ok((replace_child(p, id, page, i, pages)?, found)),
@@ -604,17 +620,23 @@ pub fn destroy<P: PagesMut>(p: &mut P, root: PageId, on_value: &mut dyn FnMut(&m
     if root == NO_PAGE {
         return Ok(());
     }
-    let page = p.page(root)?;
-    let node = Node::new(&page, root)?;
-    for i in 0..node.len() {
-        if node.is_leaf() {
-            on_value(p, node.value(i))?;
-        } else {
-            destroy(p, node.child(i), on_value)?;
+    fn rec<P: PagesMut>(p: &mut P, id: PageId, on_value: &mut dyn FnMut(&mut P, &[u8]) -> Result<()>, depth: usize) -> Result<()> {
+        if depth == MAX_DEPTH {
+            return Err(too_deep(id));
         }
+        let page = p.page(id)?;
+        let node = Node::new(&page, id)?;
+        for i in 0..node.len() {
+            if node.is_leaf() {
+                on_value(p, node.value(i))?;
+            } else {
+                rec(p, node.child(i), on_value, depth + 1)?;
+            }
+        }
+        p.free(id);
+        Ok(())
     }
-    p.free(root);
-    Ok(())
+    rec(p, root, on_value, 0)
 }
 
 /// Every page of a tree, for the consistency check. Calls `on_page` with
@@ -634,7 +656,11 @@ pub fn walk<P: Pages + ?Sized>(
         low: Option<&[u8]>,
         on_page: &mut dyn FnMut(PageId) -> Result<()>,
         on_entry: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
+        depth: usize,
     ) -> Result<()> {
+        if depth == MAX_DEPTH {
+            return Err(too_deep(id));
+        }
         on_page(id)?;
         let page = p.page(id)?;
         let node = Node::new(&page, id)?;
@@ -655,12 +681,12 @@ pub fn walk<P: Pages + ?Sized>(
                     return Err(Error::corrupt(format!("page {id} has keys out of order")));
                 }
                 let child_low = if i == 0 { low } else { Some(node.key(i)) };
-                rec(p, node.child(i), child_low, on_page, on_entry)?;
+                rec(p, node.child(i), child_low, on_page, on_entry, depth + 1)?;
             }
         }
         Ok(())
     }
-    rec(p, root, None, on_page, on_entry)
+    rec(p, root, None, on_page, on_entry, 0)
 }
 
 // -------------------------------------------------------------- building
@@ -820,6 +846,9 @@ impl Scan {
 
     fn descend<P: Pages + ?Sized>(&mut self, pages: &P, mut id: PageId, pick: &dyn Fn(Node) -> usize) -> Result<()> {
         loop {
+            if self.path.len() == MAX_DEPTH {
+                return Err(too_deep(id));
+            }
             let page = pages.page(id)?;
             let node = Node::new(&page, id)?;
             let i = pick(node);
@@ -1345,5 +1374,24 @@ pub(crate) mod tests {
             root = put(&mut p, root, &key, &vec![4u8; max_value(MAX_KEY)]).unwrap().0;
         }
         assert_eq!(entries(&p, root).len(), 201);
+    }
+
+    #[test]
+    fn a_tree_whose_pages_point_in_a_circle_is_damage() {
+        // A branch that names itself as both its children: what a disk
+        // that lost writes can leave of pages from different moments.
+        let mut p = MemPages::new();
+        let id = p.next;
+        let cells = [branch_cell(id, &[]), branch_cell(id, b"m")];
+        let cells: Vec<&[u8]> = cells.iter().map(|c| c.as_slice()).collect();
+        assert_eq!(p.alloc(build(KIND_BRANCH, &cells)).unwrap(), id);
+        let damage = |result: Result<()>| assert!(matches!(result, Err(Error::Corrupt(_))), "{:?}", result.err());
+        damage(get(&p, id, b"a").map(|_| ()));
+        damage(Scan::new(id).first(&p));
+        damage(Scan::new(id).seek(&p, b"z"));
+        damage(walk(&p, id, &mut |_| Ok(()), &mut |_, _| Ok(())));
+        damage(put(&mut p, id, b"a", b"v").map(|_| ()));
+        damage(delete(&mut p, id, b"a").map(|_| ()));
+        damage(destroy(&mut p, id, &mut |_, _| Ok(())));
     }
 }

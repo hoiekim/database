@@ -281,7 +281,13 @@ impl Store {
             let mut id = head;
             while id != NO_PAGE {
                 let mut page = vec![0u8; PAGE_SIZE];
-                read_exact_at(&*file, &mut page, u64::from(id) * PAGE_SIZE as u64)?;
+                // A header that names a page the file does not have is
+                // damage, like a page that fails its checksum, and not
+                // a failing disk.
+                read_exact_at(&*file, &mut page, u64::from(id) * PAGE_SIZE as u64).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof => Error::corrupt(format!("page {id} of the checkpoint lies beyond the end of the data file")),
+                    _ => Error::Io(e),
+                })?;
                 if !verify(&page) || kind(&page) != KIND_CHAIN {
                     return Err(Error::corrupt(format!("page {id} of the checkpoint is damaged")));
                 }
@@ -302,6 +308,17 @@ impl Store {
         let (free_bytes, free_chain) = read_chain(meta.freelist, meta.freelist_len)?;
         chain_pages.extend(free_chain);
         let free: Vec<PageId> = free_bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        // The header may have come from the system's cache without ever
+        // having reached the disk: a checkpoint whose last sync failed
+        // leaves it so, for whoever opens the file next. Whoever does
+        // will remove the log this checkpoint replaced, and that log is
+        // then the only durable copy of what the header stands for. So
+        // the header is written again and synced before it is believed.
+        // If it was on disk, this writes what is there, and no tear of
+        // that changes anything; if it was not, this is the checkpoint's
+        // own last step, made at last or torn like any other.
+        file.write_at(&meta.encode(), (meta.counter % 2) * PAGE_SIZE as u64)?;
+        file.sync()?;
         // Whatever lies beyond the checkpoint's last page was written by
         // transactions the log will replay; drop it.
         let end = u64::from(meta.next_page) * PAGE_SIZE as u64;
@@ -878,8 +895,11 @@ impl Writer {
         let mut victims: Vec<PageId> = self.private.iter().filter(|(_, page)| kind(page) != KIND_BRANCH).map(|(id, _)| *id).collect();
         victims.truncate(self.private.len() / 2);
         for id in victims {
-            let page = self.private.remove(&id).unwrap();
-            self.store.write_page(id, &page)?;
+            // Written first and let go of after: a page whose write
+            // failed is still the transaction's, to give back when it
+            // is undone.
+            self.store.write_page(id, &self.private[&id])?;
+            self.private.remove(&id);
             self.spilled.insert(id);
         }
         Ok(())

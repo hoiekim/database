@@ -207,6 +207,42 @@ docker rm -f drill
   same counts for any query, slow or not, are `db.explain(query)`
   (`CLIENT.md`).
 
+## When the disk fails
+
+A commit is answered only once it is on disk, so a disk that fails
+costs availability and not commits.
+
+- **A full disk, or a write or a sync that fails.** The request that
+  met it fails with an I/O error. If it was a commit or a checkpoint,
+  the database then answers `Unavailable` to every write, and to
+  `check`, until the server is restarted: from inside, the server cannot
+  tell how much of what failed reached the disk, and it does not guess.
+  Reads go on and show every commit that was acknowledged. Make room or
+  replace the disk, restart, and the server recovers from its files with
+  everything acknowledged in place. A commit that was answered with the
+  error may be in place too, as after a connection lost at the wrong
+  moment.
+- **A start while the disk is still full** may fail, since recovery
+  writes a checkpoint and begins a log file. Nothing is harmed by
+  trying. Start it again when there is room.
+- **A server killed at any moment**, in a commit, a checkpoint, a
+  `create`, a `drop`, a `restore` or its own recovery, starts again with
+  every acknowledged commit and no part of anything else. A database
+  that was being created, dropped or restored over is there whole, as it
+  was before or as it was to be.
+- **A disk that reports a sync it has not done** (a write cache that
+  acknowledges a flush and loses power) can lose acknowledged commits,
+  and no server can prevent it. What the server does is notice. A log
+  that lost records gives the database as it stood at an earlier commit;
+  if commits were logged after the lost ones, the server refuses to
+  start and names the damaged log file. A data file that lost pages is
+  noticed where a page fails its checksum, where its log no longer
+  applies to it (the server refuses to start and says so), or where
+  `check` finds the tables and indexes at odds, and not always: where a
+  page was never written,
+  the older page in its place is whole. Use disks that honour flushes,
+  and run `database check` after a power loss on hardware that may not.
+
 ## Files
 
 ```text
@@ -219,6 +255,18 @@ docker rm -f drill
 A copy of the directory taken while the server is **stopped** is a
 complete backup. A copy taken while it runs is not guaranteed to be
 (the data file and the log are read at different moments): use `dump`.
+
+A file named `<name>--creating.db` or `<name>--restoring.*` is a
+database that was being made when the server stopped, and the next start
+removes it. A log file without its data file is what a `create` or a
+`drop` left when the server was killed in the middle of it: it is
+ignored, and removed when the name is used again.
+
+Before going back to an earlier build of the server, stop this one in
+good order (`SIGTERM`), so that its logs hold no commits. A log that
+holds commits may begin with a record that says where the log file
+before it ended. Builds from before that record do not know it, and
+refuse to start on such a log rather than read past it.
 
 A database with a column that keeps the start of its large values in
 its rows (`keep_start`, `CLIENT.md`) is stored in a form that a build
