@@ -522,6 +522,10 @@ pub fn put_expr(w: &mut Writer, e: &Expr) {
             w.u8(*kind as u8);
             put_query(w, query);
         }
+        Expr::Param(n) => {
+            w.u8(22);
+            w.varint(u64::from(*n));
+        }
     }
 }
 
@@ -583,6 +587,7 @@ pub fn get_expr(r: &mut Reader) -> DbResult<Expr> {
             let kind = SubqueryKind::from_u8(r.u8()?).ok_or_else(|| malformed("unknown subquery kind"))?;
             Expr::Subquery(Box::new(get_query(r)?), kind)
         }
+        22 => Expr::Param(u32::try_from(r.varint()?).map_err(|_| malformed("parameter number too large"))?),
         _ => return Err(malformed("unknown expression tag")),
     };
     r.leave();

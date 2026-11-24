@@ -172,6 +172,72 @@ locks, in the allocations a row costs (about ten: its key, its bytes,
 its values). With that gone, what separates the two is the second
 lookup for each preview and those allocations themselves.
 
+### What a request costs: prepared statements, one request for a transaction, a Unix socket
+
+*What was wrong.* For a small request the engine is the lesser part of
+the cost. The rest is the trip through the network stack, decoding the
+request into a tree of expressions (and encoding it, in the client),
+and for a transaction one round trip per statement plus one to begin
+and one to commit.
+
+*What changed.* Four things, none of them in the engine:
+
+- **Prepared statements** (`Prepared`, `param(n)`, `Db::execute`). A
+  connection is sent a statement once and keeps it decoded; after that
+  a request is the statement's number and its values, which the
+  evaluator reads from its context.
+- **A transaction begins with its first statement.** `transaction`,
+  `exclusive` and `read` send the begin with the first statement: a
+  transfer is six round trips, as in Postgres, where it was seven.
+- **A batch** (`Client::batch`) sends a transaction whole when its
+  statements need no answers from each other. It is one round trip, and
+  it runs once, as a job that holds the write turn: nothing is run a
+  second time at the commit, and nothing conflicts. `Batch::expect`
+  makes a statement a condition of the rest.
+- **A Unix domain socket** beside the TCP port, for a client on the
+  server's own host.
+
+And where conflicts are the rule, the client now goes straight to the
+write lock after a transaction's first conflict (see 4 below).
+
+The benchmark prepares this server's statements as it does Postgres',
+and runs the transfers a second time sent whole: a batch here, and for
+Postgres one statement of chained `WITH` updates, which is the nearest
+it has. `BENCH_SOCKET=1` reaches both servers through Unix sockets.
+
+What the server executes for one request, counted by a profiler with
+one connection, before and after (the counts do not depend on the
+machine or on what else it is doing):
+
+| Request | instructions before | after | |
+|---|---:|---:|---:|
+| Session lookup with user | 54,700 | 37,800 | 0.69× |
+| Rate-limit upsert, unlogged | 67,100 | 52,600 | 0.78× |
+| Durable insert | 63,800 | 62,000 | 0.97× |
+| Transfer as a transaction of 2 reads and 3 writes | 202,500 | 178,500 | 0.88× |
+| The same transfer sent whole | | 106,700 | 0.53× |
+
+A statement gains by how much of it is expressions: the lookup's join
+and filters and the upsert's `when(..)` are trees that are no longer
+rebuilt, where the insert was three values to begin with. The transfer
+gains a request less and five statements not decoded; sent whole it
+also loses its fork, its digests and five requests' worth of reading
+and answering. (With one connection nothing is run twice at the commit.
+With eight, nearly every transfer was: that second run is what a batch
+also saves, and the count above does not show it.)
+
+What the socket saves depends on the system. A round trip that asks
+for nothing (a ping) was measured at 23 to 25 µs over TCP on the
+loopback address and 8 to 11 µs over a Unix socket on macOS, and at 10
+to 11 µs against 9 µs on Linux: a third of a point lookup on the one,
+a few percent on the other.
+
+*What is left.* The table at the top of this file was measured before
+these changes and has not been run again on that machine. Of a prepared
+lookup's 37,800 instructions about 26,000 are the query itself; a sixth
+of all of them is the allocator, which is what "fewer allocations per
+row" under 1 is about. Encoding the rows is untouched.
+
 ## Where it is ahead, and why
 
 - **Counting 5,000 rows of a user** (3.1×) and **updating a flag**
@@ -204,8 +270,11 @@ lookup for each preview and those allocations themselves.
 | Option | What it changes | Expected effect | Cost |
 |---|---|---|---|
 | **Keep volatile tables in memory only**: they are empty after a restart anyway | No page copies and no version per write; such a table could take a lock of its own and be written beside the database's writer | Probably past Postgres for this workload | Moderate; such a table would no longer roll back with a transaction or be read from a snapshot, which has to be acceptable for what is kept in it |
-| **A prepared form of a request**: sent once, then named with its values | The statement is not decoded and its tree of expressions not built for each call | A few microseconds of the 13; helps every small request | Moderate: a new request type and a cache per connection |
 | **One version for a batch of jobs**: the thread that runs waiting writes back to back begins and commits once for all of them | About 4 µs of the 17 | About a fifth at eight connections, nothing at one | Small to moderate: a failed statement must undo only itself |
+
+A prepared form of the request, which was a third option here, is done:
+an upsert is 52,600 instructions in the server where it was 67,100 (see
+"What a request costs").
 
 ### 3. The bulk load (0.73×)
 
@@ -283,33 +352,167 @@ was not traced.
 
 ### 4. Transactions of several requests (0.91×)
 
+Three of the four options that stood here are done (see "What a
+request costs"):
+
+- **`begin` travels with the first statement**: six round trips where
+  there were seven. If the begin fails the server leaves the connection
+  with a dead transaction, so that the statements meant for it cannot
+  run outside one.
+- **A batch**: one round trip, and nothing to run twice. For the
+  contended workload it is more than that: a batch never conflicts,
+  because it is the writer while it runs, so eight connections crediting
+  one account go as fast as eight crediting different ones.
+- **Straight to the write lock after one conflict, where conflicts are
+  the rule.** `optimistic_runs` sets how many runs beside other writers
+  a transaction gets (2 unless set). And without being told, a client
+  counts how its transactions' first runs end: while more than a third
+  of them conflict, one that conflicts is not run beside the others
+  again, where it would mostly conflict again, but as the only writer.
+  In the workload where every transfer credits the same account that
+  halves the conflicts (one per transaction, not two); where conflicts
+  are rare nothing changes.
+
 | Option | What it changes | Expected effect | Cost |
 |---|---|---|---|
-| **Send `begin` with the first statement** | Six round trips instead of seven | About a seventh | Small; the server must refuse the statement if the begin failed |
-| **A batch request**: a transaction whose statements do not depend on each other's answers, sent whole | One round trip, and nothing to run twice | Several times, for transactions that fit | Moderate: a new request type |
-| **Go straight to the write lock after one conflict**, where conflicts are the rule | A contended transaction runs twice, not three times | A third of the round trips in the contended workload; a few percent lost where conflicts are rare, since each then holds every writer up once | Small: a setting of the client's |
 | **Wait instead of running again**, for rows that have just conflicted: a transaction that is about to read such a row waits for the one that holds it | Contended transactions queue for the row, as in Postgres, without holding up the writers of other rows | The runs that conflict; and transactions on other rows no longer wait behind the contended ones | Large: this is row locking, with its waits and its deadlocks to time out |
 
 ### 5. Point lookups and durable inserts (0.85× to 1.06×)
 
-Within a tenth, sometimes ahead. A lookup's cost is mostly outside the
+Within a tenth, sometimes ahead. A lookup's cost was mostly outside the
 engine: decoding the request into a query value and encoding the rows.
-The prepared form under 2 would cut the first. A durable insert on one
+A prepared statement now skips the first (see "What a request costs");
+what is left outside the engine is encoding the rows and the trip
+through the network stack, which a client on the server's own host
+shortens with the Unix socket. A durable insert on one
 connection is the disk's sync and little else on both servers.
+
+## The SQLite family
+
+`bench/` runs six of the workloads against embedded SQLite, rqlite and
+libSQL's server as well: the session lookup on 1 and 16 connections, the
+durable insert on 1 and 16, and the two transfers. The data and the row
+picks are those of the other targets (20 users, 20,000 sessions, 1,000
+accounts; the same `mix`, `token` and `user_id`). The other workloads
+are not run against them: the mails and their search were not set up
+three more ways.
+
+How each is run, and what that does to a comparison:
+
+- **Embedded SQLite** (`--only sqlite`; `rusqlite` 0.32 with the SQLite
+  it bundles) is opened in the benchmark's own process: no server and
+  no socket, so a read costs no round trip at all, and it has no
+  process whose memory and CPU could be measured apart. WAL mode with
+  `synchronous=FULL`, so that every commit is synced before it returns
+  (and `fullfsync=ON`, which on macOS makes that the sync this server
+  makes, and elsewhere changes nothing). Statements are prepared once
+  per connection; a writing transaction begins with `BEGIN IMMEDIATE`.
+  A worker is a thread. Readers get a connection each. Writers are
+  measured two ways, a column each:
+  - **one write connection** behind a lock, which is how an application
+    usually runs embedded SQLite from many threads;
+  - **a connection each**, with a busy timeout of 10 s. Writers then
+    wait for each other inside SQLite, and one that waits out the
+    timeout gives up; the report counts those. This column runs a
+    quarter of each workload's operations, because on a disk with a
+    slow sync it takes minutes over them, and only the workloads where
+    several connections write.
+- **rqlite** (`--only rqlite`) is one node, `rqlited -node-id 1`, with
+  its defaults: every write is an entry in its Raft log, which is
+  synced before the answer, while its SQLite file is written with
+  `synchronous=OFF`, and foreign keys are not enforced. Reads ask with
+  `level=none`: the node answers from its own state without asking
+  whether it still leads, as every other target answers. rqlite has no
+  transaction that spans requests, so its transfer is sent whole as one
+  request, with the balance check folded into the first `UPDATE`: one
+  round trip, where this server's transfer is seven and has its
+  statements run twice. That is the batch request listed under 4 above.
+- **libSQL's server** (`--only libsql`) is `sqld -d <dir>`, asked
+  through Hrana over HTTP. Its transfer is an interactive transaction
+  in two requests: `BEGIN IMMEDIATE` and the reads, then the writes and
+  `COMMIT`. When the comparison was first made (version 0.24.32) it ran
+  SQLite with `synchronous=NORMAL` and refused `PRAGMA synchronous`
+  from clients: a commit was then not synced on its own, and its
+  durable insert is not the same work as the others'.
+
+Both servers are reached over HTTP with JSON, on one connection kept
+open per worker. Keys that are bytes elsewhere travel as hex text,
+because rqlite's JSON parameters carry no bytes. A request that gets no
+answer within `BENCH_HTTP_TIMEOUT` seconds (120) ends that target's run:
+the report says which workload did not complete, and keeps what came
+before.
+
+The embedded SQLite and rqlite targets have been run from this
+repository, on Linux (rqlite 10.7.4). The libSQL target has not: it was
+written from the program the comparison was first made with, and only
+its requests have been tested, not their answers from a real `sqld`.
+
+## At the small end, and the large
+
+Where CPU per request decides throughput, on one vCPU with a small
+memory limit, the benchmark can put each server it starts under those
+limits (Linux only):
+
+```sh
+BENCH_SERVER_CPUS=1 BENCH_SERVER_MEMORY_MB=256 ./target/release/bench
+```
+
+- `BENCH_SERVER_CPUS=n` pins each server, with `taskset`, to the first
+  `n` CPUs the benchmark may use, and moves the benchmark's own client
+  to the others, so that the client's work is not taken out of the
+  server's share. (An ordinary run has both on the same cores.)
+- `BENCH_SERVER_MEMORY_MB=m` starts each server in a memory cgroup of
+  its own, with that limit and no swap (`memory.max` on cgroup v2,
+  `memory.limit_in_bytes` on v1), and removes it afterwards. That is
+  what a container's memory limit is: the server's own memory and the
+  file cache of its files both count, the kernel drops cache to stay
+  under, and a server whose own memory goes over is killed. The report
+  says so if it happens. Making a cgroup takes root on the host, or a
+  container that may write to its cgroups. Where none can be made, the
+  run says that the limit is **not enforced** and goes on without it.
+- The report's **most memory held during the run** is the server's own
+  high-water mark (`VmHWM`) for a server that is one process, and for
+  Postgres the largest of two samples a second of all its processes,
+  shared pages counted once. With no enforced limit it is the figure to
+  read against the limit.
+
+Embedded SQLite runs inside the benchmark, on the client's CPUs and
+under no memory limit.
+
+The large end needs nothing set: run it on a machine with 16 cores or
+more. `BENCH_SERVER_CPUS=16` there keeps the client off the server's
+cores. One writer per database is expected to cost more there on the
+workloads that write.
 
 ## Running it
 
 ```sh
 cargo build --release
-./target/release/bench                 # both servers, if Postgres is installed
+./target/release/bench                 # this server and Postgres, if Postgres is installed
 ./target/release/bench --only ours
+./target/release/bench --only ours,postgres   # --only takes several, or all
 BENCH_DETAILS=1 ./target/release/bench                   # also: each server's own counts
 BENCH_WORKLOADS="transfer,upsert" ./target/release/bench # only the workloads named so
 BENCH_REPEAT="mailbox:30" BENCH_WORKLOADS=mailbox ./target/release/bench --only ours   # one workload, longer, to profile
 BENCH_KEEP=1 BENCH_WORKLOADS=mailbox ./target/release/bench --only ours   # keep this server's loaded data for the next run
 BENCH_CONNECTIONS=1 BENCH_WORKLOADS=upsert ./target/release/bench --only ours
+BENCH_SOCKET=1 ./target/release/bench  # both servers through Unix domain sockets, not TCP
 BENCH_SERVER_LOG=server.log ./target/release/bench --only ours
+BENCH_SERVER_CPUS=1 BENCH_SERVER_MEMORY_MB=256 ./target/release/bench   # each server on one CPU, under 256 MB
 ```
 
 `database stats` (and `BENCH_DETAILS=1`) says how the commits of
 optimistic transactions went: as they stood, run again, or in conflict.
+
+The SQLite family, on the workloads it runs:
+
+```sh
+cargo build --release -p database-server -p database-bench --features database-bench/sqlite
+BENCH_WORKLOADS="session,durable insert,transfer" ./target/release/bench --only ours,sqlite,rqlite,libsql
+```
+
+Embedded SQLite is compiled in only with the `sqlite` feature, which an
+ordinary build leaves off because it compiles SQLite's C source.
+`rqlited` and `sqld` are found on the `PATH`, or where `BENCH_RQLITED`
+and `BENCH_SQLD` say; a target that is not installed is skipped with a
+line saying so, as Postgres is.

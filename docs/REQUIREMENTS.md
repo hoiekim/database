@@ -119,6 +119,8 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-X8 | Many connections from several processes at once (a rolling deploy runs two copies of an application for a moment); a writer that waits too long is told so | A server over TCP; `LockTimeout` |
 | R-X9 | A statement that runs too long is stopped | A per-request deadline |
 | R-X10 | What was committed survives a crash or power cut; what was not leaves no trace | Write-ahead log, synced before the commit is acknowledged |
+| R-X11 | A statement an application runs for every request is sent and understood once, and then run with new values each time (a prepared statement) | `Prepared`, `param(n)`, `Db::execute`: each connection keeps the statement decoded |
+| R-X12 | A transaction whose statements need no answers from each other, in one round trip; a statement may be a condition of the rest (debit only if the balance allows, and only then credit) | `Client::batch`, `Batch::expect` |
 
 ## F. Operations
 
@@ -129,3 +131,5 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-O3 | A cheap health check, and the server's time | `Client::ping`, `Client::now` |
 | R-O4 | A way to verify the files | `database check` |
 | R-O5 | A fixed memory budget well under what a Postgres of the same job needs, and little CPU when idle | One page cache with a byte limit; no background work when nothing changes |
+| R-O6 | An application on the server's own host reaches it without the network stack | A Unix domain socket beside the TCP port: `DATABASE_SOCKET`, `?socket=` |
+| R-O7 | A slow statement can be seen and understood: how many index entries and rows a query read against how many it returned, on request and, for statements over a threshold, in the server's log (what `EXPLAIN ANALYZE` and `log_min_duration_statement` are used for) | `Db::explain`; `DATABASE_SLOW_MS` |
