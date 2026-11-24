@@ -11,6 +11,17 @@ export const DEFAULT_PORT = 5454;
 /** A pooled connection that sat idle this long is pinged before it is trusted with a request. */
 const IDLE_CHECK_MS = 20_000;
 
+/** The longest a timer waits: Node fires one set for longer at once. */
+const LONGEST_TIMER_MS = 0x7fff_ffff;
+
+/**
+ * Bytes received and not yet read above which the socket stops reading,
+ * so that a server sending faster than the caller takes (a dump handed to
+ * a slow `write`) waits instead of filling this process's memory. A read
+ * that needs a larger frame lets it read on.
+ */
+const HIGH_WATER = 1 << 20;
+
 function lost(what: unknown): DbError {
   return new DbError(ErrorCode.Connection, `connection to the database lost: ${what instanceof Error ? what.message : String(what)}`);
 }
@@ -135,6 +146,8 @@ export class Conn {
   private buffered = 0;
   private failure: DbError | null = null;
   private waiting: (() => void) | null = null;
+  /** How many bytes the read under way waits to have. */
+  private wanted = 0;
   private readonly statementTimeoutMs: number;
   /** The server enforces the statement's deadline; this outer limit only catches a server gone silent. */
   private readonly patienceMs: number;
@@ -148,6 +161,7 @@ export class Conn {
     socket.on("data", (chunk: Buffer) => {
       this.chunks.push(chunk);
       this.buffered += chunk.length;
+      if (this.buffered >= Math.max(HIGH_WATER, this.wanted)) socket.pause();
       this.wake();
     });
     socket.on("error", (e) => this.fail(lost(e)));
@@ -161,7 +175,7 @@ export class Conn {
       const timer = setTimeout(() => {
         socket.destroy();
         reject(new DbError(ErrorCode.Connection, `timed out connecting to the database at ${where}`));
-      }, config.connectTimeout * 1000);
+      }, Math.min(config.connectTimeout * 1000, LONGEST_TIMER_MS));
       socket.once("connect", () => {
         clearTimeout(timer);
         socket.removeAllListeners("error");
@@ -215,9 +229,11 @@ export class Conn {
       if (this.failure) throw this.failure;
       const left = deadline - Date.now();
       if (left <= 0) throw lost("no answer in time");
+      this.wanted = n;
+      if (this.socket.isPaused()) this.socket.resume();
       await new Promise<void>((resolve) => {
-        // A timer holds at most 2^31-1 ms; a longer wait is taken in pieces.
-        const timer = setTimeout(resolve, Math.min(left, 0x7fff_ffff));
+        // A longer wait is taken in pieces.
+        const timer = setTimeout(resolve, Math.min(left, LONGEST_TIMER_MS));
         this.waiting = () => {
           clearTimeout(timer);
           resolve();
@@ -236,6 +252,8 @@ export class Conn {
       else this.chunks[0] = head.subarray(take);
     }
     this.buffered -= n;
+    this.wanted = 0;
+    if (this.buffered < HIGH_WATER && this.socket.isPaused()) this.socket.resume();
     return out;
   }
 

@@ -19,6 +19,11 @@ DEFAULT_PORT = 5454
 #: trusted with a request: a server restart may have closed it.
 _IDLE_CHECK_SECONDS = 20.0
 
+#: The longest one wait on a socket is set to; a socket refuses a timeout
+#: of more than about 292 years, and a URL may ask for one. A longer wait
+#: is taken in pieces.
+_LONGEST_WAIT = 86_400.0
+
 
 def _lost(what: object) -> DbError:
     return DbError(ErrorCode.CONNECTION, f"connection to the database lost: {what}")
@@ -142,7 +147,8 @@ class Conn:
         self.last_used = time.monotonic()
         where = f"{config.host}:{config.port}"
         try:
-            self.sock = socket.create_connection((config.host.strip("[]"), config.port), timeout=config.connect_timeout)
+            # A connect that has not succeeded within a day is not going to.
+            self.sock = socket.create_connection((config.host.strip("[]"), config.port), timeout=min(config.connect_timeout, _LONGEST_WAIT))
         except socket.timeout:
             raise DbError(ErrorCode.CONNECTION, f"timed out connecting to the database at {where}") from None
         except OSError as e:
@@ -172,10 +178,12 @@ class Conn:
             left = deadline - time.monotonic()
             if left <= 0:
                 raise _lost("no answer in time")
-            self.sock.settimeout(left)
+            self.sock.settimeout(min(left, _LONGEST_WAIT))
             try:
                 chunk = self.sock.recv(min(n, 1 << 20))
             except socket.timeout:
+                if left > _LONGEST_WAIT:
+                    continue
                 raise _lost("no answer in time") from None
             except OSError as e:
                 raise _lost(e) from None
@@ -194,7 +202,7 @@ class Conn:
             # unread: the next answer read would be that one.
             raise _lost("an earlier request on this connection was abandoned before its answer was read")
         self.broken = True
-        self.sock.settimeout(max(0.001, (deadline or time.monotonic() + self.patience) - time.monotonic()))
+        self.sock.settimeout(min(max(0.001, (deadline or time.monotonic() + self.patience) - time.monotonic()), _LONGEST_WAIT))
         try:
             self.sock.sendall(struct.pack("<I", len(payload)) + payload)
         except socket.timeout:
@@ -284,14 +292,25 @@ class Pool:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._idle: List[Conn] = []
-        self._lock = threading.Lock()
-        self._slots = threading.BoundedSemaphore(max(1, config.pool_size))
+        # Reentrant: a forgotten lease is given back by its finalizer,
+        # which the garbage collector may run on a thread that is inside
+        # the pool already, holding this lock.
+        self._lock = threading.RLock()
+        self._freed = threading.Condition(self._lock)
+        #: Connections that may still be leased.
+        self._free = max(1, config.pool_size)
         #: Counts the calls of ``clear``: a connection leased before one
         #: is closed when it comes back.
         self._generation = 0
 
     def acquire(self) -> Lease:
-        self._slots.acquire()
+        with self._lock:
+            while not self._free:
+                # A finalizer that gives a lease back while this thread
+                # is getting ready to wait wakes nobody: look again now
+                # and then.
+                self._freed.wait(1.0)
+            self._free -= 1
         try:
             while True:
                 with self._lock:
@@ -307,17 +326,23 @@ class Pool:
                         continue
                 return Lease(self, conn, generation)
         except BaseException:
-            self._slots.release()
+            self._give_slot()
             raise
+
+    def _give_slot(self) -> None:
+        with self._lock:
+            self._free += 1
+            self._freed.notify()
 
     def _release(self, conn: Conn, keep: bool, generation: int) -> None:
         with self._lock:
             keep = keep and generation == self._generation
             if keep:
                 self._idle.append(conn)
+            self._free += 1
+            self._freed.notify()
         if not keep:
             conn.close()
-        self._slots.release()
 
     def clear(self) -> None:
         """Closes the idle connections. Ones in use close when released."""

@@ -105,14 +105,16 @@ def decimal_parts(number: _decimal.Decimal) -> Tuple[int, int]:
     sign, digits, exponent = number.as_tuple()
     if not isinstance(exponent, int):
         raise ValueError("a decimal cannot hold NaN or infinity")
-    mantissa = int("".join(map(str, digits)) or "0")
-    scale = 0
-    if exponent > 0:
-        mantissa *= 10**exponent
-    else:
-        scale = -exponent
+    scale = max(0, -exponent)
     if scale > MAX_SCALE:
         raise ValueError(f"a decimal keeps at most {MAX_SCALE} digits after the point; {number} has {scale}")
+    if not any(digits):
+        return (0, scale)
+    # 2**127 has 39 digits. Counted before the power of ten is made,
+    # which for an exponent in the millions takes seconds.
+    if len(digits) + max(0, exponent) > 39:
+        raise ValueError(f"{number} has more digits than a decimal can hold")
+    mantissa = int("".join(map(str, digits))) * 10 ** max(0, exponent)
     if mantissa > _I128_MAX:
         raise ValueError(f"{number} has more digits than a decimal can hold")
     return (-mantissa if sign else mantissa, scale)

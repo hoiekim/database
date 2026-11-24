@@ -110,9 +110,12 @@ directly.
 text and `[1, 2]` is a list, so a JSON string or array is written
 `json("x")` or `json([1, 2])`. A plain object can only be JSON and needs
 no wrapper. It is read with `JSON.parse`, so an integer inside JSON
-beyond 2^53 loses precision as it does anywhere in JavaScript. Object
-keys come back in the order the server stores them: by length, then by
-bytes.
+beyond 2^53 loses precision as it does anywhere in JavaScript. The
+server stores object keys by length, then by bytes, but a JavaScript
+object lists keys that look like array indices first, in numeric order:
+`{"2":1,"b":2,"10":3}` comes back with the keys `2`, `10`, `b`. Where
+the stored order matters, read the column as text,
+`col("detail").cast(Type.Text)`, which gives the JSON as stored.
 
 ## Errors
 

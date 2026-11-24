@@ -216,6 +216,26 @@ test("the small helpers", () => {
   assert.throws(() => Query.table("t").key(7 as never), TypeError);
   assert.throws(() => val(undefined as never), TypeError);
   assert.throws(() => col("a").eq(Query.table("t") as never), TypeError);
+  // A path is a list: a string would be spread into its letters.
+  assert.deepEqual(col("d").json(["device"]).node, { kind: "call", func: "json_get", args: [col("d").node, val("device").node] });
+  for (const path of ["device", 7]) {
+    assert.throws(() => col("d").json(path as never), TypeError);
+    assert.throws(() => col("d").jsonText(path as never), TypeError);
+  }
+});
+
+test("a number past its field's width is refused, not wrapped", () => {
+  const encode = (q: Query): Uint8Array => encodeRequest({ kind: "query", query: q.spec }, 0n);
+  // A span beyond a signed 64-bit count of microseconds.
+  for (const span of [() => seconds(1e13), () => days(1.1e8), () => seconds(NaN), () => minutes(-Infinity)]) assert.throws(span, RangeError);
+  assert.deepEqual(seconds(9.2e12).node, { kind: "value", value: { kind: "int", value: 9_200_000_000_000_000_000n } });
+  const walk = Query.table("t").ancestors([[1]], "parent");
+  for (const depth of [-1, 2 ** 32, 1.5]) assert.throws(() => encode(walk.maxDepth(depth)), RangeError, String(depth));
+  encode(walk.maxDepth(2 ** 32 - 1));
+  assert.throws(() => encode(Query.table("t").select("x", col("a").cast(Type.decimal(300, 2)))), RangeError);
+  // The same for values handed over as plain data.
+  assert.throws(() => encode(Query.table("t").filter(new Expr({ kind: "value", value: { kind: "int", value: 2n ** 63n } }))), RangeError);
+  assert.throws(() => encode(Query.table("t").filter(new Expr({ kind: "value", value: { kind: "decimal", mantissa: 2n ** 127n, scale: 0 } }))), RangeError);
 });
 
 test("writes", () => {

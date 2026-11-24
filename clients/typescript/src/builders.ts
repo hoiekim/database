@@ -194,11 +194,11 @@ export class Expr {
   }
   /** A member of a JSON value: `col("detail").json(["device", "name"])`. */
   json(path: Iterable<Arg>): Expr {
-    return this.call("json_get", ...path);
+    return new Expr({ kind: "call", func: "json_get", args: [this.node, ...nodes(path)] });
   }
   /** The same member as text. */
   jsonText(path: Iterable<Arg>): Expr {
-    return this.call("json_get_text", ...path);
+    return new Expr({ kind: "call", func: "json_get_text", args: [this.node, ...nodes(path)] });
   }
   jsonContains(other: Arg): Expr {
     return this.call("json_contains", other);
@@ -418,6 +418,8 @@ export function listOf(q: Query | ast.QuerySpec): Expr {
 /** A span of time in microseconds, to add to a timestamp: `now().add(seconds(60))`. */
 export function seconds(n: number): Expr {
   const micros = n * 1_000_000;
+  // A span is a signed 64-bit count of microseconds; 2^63 is the first a double holds beyond it.
+  if (!(Math.abs(micros) < 2 ** 63)) throw new RangeError(`${n} seconds is not a span the database holds`);
   // Halves away from zero, as the Rust client rounds a fractional span.
   return new Expr({ kind: "value", value: { kind: "int", value: BigInt(Math.sign(micros) * Math.round(Math.abs(micros))) } });
 }

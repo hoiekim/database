@@ -99,7 +99,9 @@ database holds times and days far outside the years 1 to 9999 that
 text and `[1, 2]` is a list, so a JSON string or array is written
 `Json("x")` or `Json([1, 2])`. A `dict` can only be JSON and needs no
 wrapper. Object keys come back in the order the server stores them: by
-length, then by bytes.
+length, then by bytes. The server keeps an integer inside JSON exactly
+from -2^63 to 2^64-1 and reads a larger one as a float, so one beyond
+that raises `ValueError`; `float(n)` writes the float.
 
 ## Errors
 

@@ -187,6 +187,26 @@ class Builders(unittest.TestCase):
             Query.table("t").key(7)  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
             Query.table("t").key("abc")
+        # A path is a list: a string would be spread into its letters.
+        self.assertEqual(col("d").json(["device"]).node, ast.Call(Func.JSON_GET, (col("d").node, ast.Lit("device"))))
+        for path in ["device", b"device", 7]:
+            with self.assertRaises(TypeError):
+                col("d").json(path)  # type: ignore[arg-type]
+            with self.assertRaises(TypeError):
+                col("d").json_text(path)  # type: ignore[arg-type]
+
+    def test_a_number_past_its_fields_width_is_refused(self) -> None:
+        def encode(q: Query) -> bytes:
+            return codec.encode_request(codec.request(codec.QUERY, q.spec), 0)
+
+        walk = Query.table("t").ancestors([[1]], "parent")
+        for depth in [-1, 2**32]:
+            with self.assertRaises(ValueError):
+                encode(walk.max_depth(depth))
+        encode(walk.max_depth(2**32 - 1))
+        for bad in [Query.table("t").select("x", col("a").cast(Type.decimal(300, 2))), Query.table("t").select("x", col("a") + seconds(1e13)), Query.table("t").select("x", col("a") + days(110_000_000))]:
+            with self.assertRaises(ValueError):
+                encode(bad)
 
     def test_writes(self) -> None:
         self.same(

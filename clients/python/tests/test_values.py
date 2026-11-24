@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import ast as python_ast
 import datetime as dt
+import gc
+import threading
+import time
 import unittest
 import uuid
 from decimal import Decimal, getcontext
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from database_client import Config, Date, DbError, ErrorCode, Json, Rows, Timestamp, ast, codec
+from database_client import conn as connection
 
 
 def encode(value: Any) -> bytes:
@@ -78,9 +83,17 @@ class ValueMapping(unittest.TestCase):
             getcontext().prec = 28
         self.assertEqual(str(back(Decimal("1E+3"))), "1000")
         self.assertEqual(str(back(Decimal("-0"))), "0")
-        for bad in ["NaN", "Infinity", "1e-31", "170141183460469231731687303715884105728"]:
+        for bad in ["NaN", "Infinity", "1e-31", "170141183460469231731687303715884105728", "1E+39", "1234567890123456789012345678901234567890"]:
             with self.assertRaises(ValueError):
                 encode(Decimal(bad))
+        self.assertEqual(back(Decimal("1E+38")), Decimal(10**38))
+        self.assertEqual(back(Decimal("0E+100000000")), Decimal(0))
+        # A large exponent is refused before its power of ten is worked out.
+        started = time.monotonic()
+        for bad in ["1E+10000000", "1E+999999999999999999"]:
+            with self.assertRaises(ValueError):
+                encode(Decimal(bad))
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_timestamps_are_microseconds_in_utc(self) -> None:
         tokyo = dt.timezone(dt.timedelta(hours=9))
@@ -114,14 +127,66 @@ class ValueMapping(unittest.TestCase):
         self.assertEqual(back(Json([1, "two"])), [1, "two"])
         self.assertEqual(back(Json(None)), None)
         self.assertEqual(back(Json("text"), exact=True), Json("text"))
-        self.assertEqual(back({"big": 2**70}), {"big": 2**70})
         with self.assertRaises(ValueError):
             encode({"x": float("nan")})
+        # The server keeps JSON integers within 64 bits, signed or not, and
+        # reads a larger one as a float: one is refused, not changed.
+        self.assertEqual(back({"a": [2**64 - 1, -(2**63)], "b": True}), {"a": [2**64 - 1, -(2**63)], "b": True})
+        for bad in [{"big": 2**64}, {"a": [1, {"b": -(2**63) - 1}]}, Json([2**70]), Json(2**70)]:
+            with self.assertRaises(ValueError):
+                encode(bad)
+        self.assertEqual(back({"big": float(2**70)}), {"big": float(2**70)})
+        looped: Any = []
+        looped.append(looped)
+        with self.assertRaises(ValueError):
+            encode(Json(looped))
+        # Half a surrogate pair has no UTF-8 form.
+        for text in ["a\ud800b", Json("\udc00"), {"\ud800": 1}]:
+            with self.assertRaises(ValueError):
+                encode(text)
 
     def test_what_has_no_kind_is_refused(self) -> None:
         for bad in [object(), {1, 2}, 1 + 2j, dt.time(1, 2), dt.timedelta(1)]:
             with self.assertRaises(TypeError):
                 encode(bad)
+
+
+class FakeConn:
+    """Stands in for a connection where only the pool's bookkeeping is tested."""
+
+    def __init__(self, config: Config) -> None:
+        self.broken = False
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class PoolWithoutServer(unittest.TestCase):
+    def test_a_forgotten_lease_collected_inside_the_pool_does_not_deadlock(self) -> None:
+        with mock.patch.object(connection, "Conn", FakeConn):
+            pool = connection.Pool(Config("127.0.0.1", pool_size=1))
+            lease = pool.acquire()
+            conn = lease.conn
+            lease.held = True
+            # Forgotten in a cycle: only the cycle collector finalizes it,
+            # whenever an allocation sets it off, on whatever thread.
+            lease.cycle = lease  # type: ignore[attr-defined]
+            del lease
+
+            def collect_inside_the_pool() -> None:
+                with pool._lock:
+                    gc.collect()
+
+            worker = threading.Thread(target=collect_inside_the_pool, daemon=True)
+            worker.start()
+            worker.join(5)
+            self.assertFalse(worker.is_alive(), "the collector deadlocked on the pool's lock")
+            # The connection held a transaction: closed, and its slot is free.
+            self.assertTrue(conn.closed)  # type: ignore[union-attr]
+            again = pool.acquire()
+            self.assertIsNot(again.conn, conn)
+            again.release()
 
 
 class Urls(unittest.TestCase):

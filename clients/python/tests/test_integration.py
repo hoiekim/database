@@ -527,6 +527,46 @@ class Transactions(Case):
             db.transaction(failing)
         self.assertEqual((runs, self.balance(2)), ([1], 130))
 
+    def test_a_transaction_that_conflicts_before_its_commit_is_run_again(self) -> None:
+        db = self.db
+        other = self.server.client(self.name)
+        self.addCleanup(other.close)
+        bump = Update.table("accounts").key([1]).set("balance", col("balance") + 1)
+
+        # More than eight rows in one insert is more than the server does
+        # twice: a transaction asked for it becomes the database's writer
+        # there and then, running what it did again on the newest version.
+        # If another commit has changed what it read, that fails with
+        # CONFLICT at the insert, before any commit.
+        def many(start: int) -> Insert:
+            insert = Insert.into("accounts").columns(["id", "balance"])
+            for id in range(start, start + 9):
+                insert = insert.values([id, 0])
+            return insert
+
+        tx = db.begin_optimistic()
+        self.balance(1, tx)
+        other.update(bump)
+        self.code(ErrorCode.CONFLICT, tx.insert, many(10))
+        self.assertTrue(tx.conflicted)
+        self.code(ErrorCode.CONFLICT, tx.commit)
+
+        # `transaction` runs the work again when that happens.
+        runs: List[int] = []
+
+        def work(tx: Transaction) -> None:
+            runs.append(len(runs))
+            available = self.balance(1, tx)
+            if len(runs) == 1:
+                other.update(bump)
+            tx.insert(many(10 * len(runs)))
+            tx.update(Update.table("accounts").key([1]).set("balance", available - 1))
+
+        db.transaction(work)
+        self.assertEqual(runs, [0, 1])
+        self.assertEqual(self.balance(1), 101)
+        self.assertEqual(db.query(Query.table("accounts").filter(col("id").ge(10))).column("id"), list(range(20, 29)))
+
     def test_a_reading_transaction_sees_one_moment(self) -> None:
         db = self.db
         with db.begin_read() as tx:
@@ -652,6 +692,11 @@ class Administration(Case):
         self.assertNotIn(other, admin.admin.list_databases())
         unreachable = self.code(ErrorCode.CONNECTION, Client.connect, "database://a:b@127.0.0.1:1")
         self.assertIn("127.0.0.1:1", unreachable.message)
+        # Times longer than a socket's timeout holds, which a URL may ask
+        # for, are waited in pieces.
+        far = Client.connect(f"database://{PASSWORD}@127.0.0.1:{self.server.port}/{self.name}?connect_timeout=1e10&statement_timeout=1e10")
+        self.addCleanup(far.close)
+        far.ping()
 
     def test_check_checkpoint_stats_dump_and_restore(self) -> None:
         db = self.db

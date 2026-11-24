@@ -40,6 +40,14 @@ class ProtocolError(DbError):
 # ----------------------------------------------------------------- writer
 
 
+def _fits(v: int, most: int) -> int:
+    """Refuses with ``ValueError``, as ``u8`` does, a number its field
+    cannot hold: ``max_depth(-1)``, say."""
+    if not 0 <= v <= most:
+        raise ValueError(f"{v} is not a whole number from 0 to {most}")
+    return v
+
+
 class Writer:
     def __init__(self) -> None:
         self.buf = bytearray()
@@ -51,13 +59,13 @@ class Writer:
         self.buf.append(1 if v else 0)
 
     def u16(self, v: int) -> None:
-        self.buf += struct.pack("<H", v)
+        self.buf += struct.pack("<H", _fits(v, 0xFFFF))
 
     def u32(self, v: int) -> None:
-        self.buf += struct.pack("<I", v)
+        self.buf += struct.pack("<I", _fits(v, 0xFFFF_FFFF))
 
     def u64(self, v: int) -> None:
-        self.buf += struct.pack("<Q", v)
+        self.buf += struct.pack("<Q", _fits(v, _U64_MAX))
 
     def varint(self, v: int) -> None:
         if not 0 <= v <= _U64_MAX:
@@ -191,9 +199,31 @@ TAG_NULL, TAG_FALSE, TAG_TRUE, TAG_INT, TAG_FLOAT, TAG_DECIMAL, TAG_TEXT = 0, 1,
 TAG_BYTES, TAG_UUID, TAG_TIMESTAMP, TAG_DATE, TAG_JSON, TAG_LIST = 7, 8, 9, 10, 11, 12
 
 
+#: The integers the server keeps exactly in JSON; it reads one beyond
+#: them as a float.
+_JSON_INT_MIN, _JSON_INT_MAX = -(1 << 63), _U64_MAX
+
+
+def _check_json_ints(value: Any) -> None:
+    pending = [value]
+    # A container that holds itself is looked at once; json.dumps refuses it.
+    seen = set()
+    while pending:
+        v = pending.pop()
+        if isinstance(v, (dict, list, tuple)):
+            if id(v) not in seen:
+                seen.add(id(v))
+                pending.extend(v.values() if isinstance(v, dict) else v)
+        elif isinstance(v, int) and not isinstance(v, bool) and not _JSON_INT_MIN <= v <= _JSON_INT_MAX:
+            raise ValueError(f"{v} in JSON is beyond the 64-bit integers the database keeps exactly; write float({v}) for the nearest float")
+
+
 def json_text(value: Any) -> str:
     """JSON as this client writes it: compact, and not escaping what need
-    not be. The server reads any JSON text."""
+    not be. The server reads any JSON text, but an integer in it beyond 64
+    bits silently as a float: such an integer is refused here, as it is
+    outside JSON."""
+    _check_json_ints(value)
     return _json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 

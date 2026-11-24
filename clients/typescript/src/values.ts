@@ -24,10 +24,15 @@
 
 /** The most digits a decimal keeps after the point. */
 export const MAX_SCALE = 30;
+/** The most digits of a decimal read from text that are kept in all. */
+const MAX_DIGITS = 37;
 
 const I64_MIN = -(1n << 63n);
 const I64_MAX = (1n << 63n) - 1n;
 const I128_MAX = (1n << 127n) - 1n;
+
+/** A lone surrogate, which UTF-8 cannot carry. */
+const LONE_SURROGATE = /\p{Cs}/u;
 
 /**
  * A value exactly as the wire carries it, kind and all. `toWire` and
@@ -127,10 +132,22 @@ export class Timestamp {
     return this.micros / 1000n - (this.micros % 1000n < 0n ? 1n : 0n);
   }
 
-  /** RFC 3339 in UTC with six fraction digits: `2026-03-05T10:20:30.123456Z`. */
+  /**
+   * RFC 3339 in UTC with six fraction digits, `2026-03-05T10:20:30.123456Z`,
+   * as the server prints it: also for years before 1 and after 9999,
+   * which a `Date` prints otherwise or not at all.
+   */
   toISOString(): string {
-    const micro = ((this.micros % 1000n) + 1000n) % 1000n;
-    return this.toDate().toISOString().replace("Z", `${micro.toString().padStart(3, "0")}Z`);
+    let days = this.micros / DAY_MICROS;
+    let rest = this.micros % DAY_MICROS;
+    if (rest < 0n) {
+      rest += DAY_MICROS;
+      days -= 1n;
+    }
+    const secs = Number(rest / 1_000_000n);
+    const two = (n: number): string => String(n).padStart(2, "0");
+    const fraction = (rest % 1_000_000n).toString().padStart(6, "0");
+    return `${formatDay(Number(days))}T${two(Math.floor(secs / 3600))}:${two(Math.floor(secs / 60) % 60)}:${two(secs % 60)}.${fraction}Z`;
   }
 
   equals(other: Timestamp): boolean {
@@ -147,6 +164,31 @@ export class Timestamp {
 }
 
 const DAY_MS = 86_400_000;
+const DAY_MICROS = 86_400_000_000n;
+
+/**
+ * The calendar day of a count of days since 1970-01-01, proleptic
+ * Gregorian, for any day a date holds: Howard Hinnant's
+ * `civil_from_days`, as `protocol/src/time.rs` has it.
+ */
+function civilFromDays(days: number): [year: number, month: number, day: number] {
+  const z = days + 719_468;
+  const era = Math.floor(z / 146_097);
+  const doe = z - era * 146_097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36_524) - Math.floor(doe / 146_096)) / 365);
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const day = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const month = mp < 10 ? mp + 3 : mp - 9;
+  return [yoe + era * 400 + (month <= 2 ? 1 : 0), month, day];
+}
+
+/** `YYYY-MM-DD` as Rust's `{:04}` writes the year: `-0007`, `10000`. */
+function formatDay(days: number): string {
+  const [y, m, d] = civilFromDays(days);
+  const year = y < 0 ? `-${String(-y).padStart(3, "0")}` : String(y).padStart(4, "0");
+  return `${year}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
 
 /** A calendar day as the database holds it: days since 1970-01-01. */
 export class CalendarDate {
@@ -185,18 +227,16 @@ export class CalendarDate {
   }
 
   ymd(): [year: number, month: number, day: number] {
-    const date = this.toDate();
-    return [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()];
+    return civilFromDays(this.days);
   }
 
   equals(other: CalendarDate): boolean {
     return this.days === other.days;
   }
 
-  /** `YYYY-MM-DD`. */
+  /** `YYYY-MM-DD`, as the server prints it. */
   toString(): string {
-    const [y, m, d] = this.ymd();
-    return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    return formatDay(this.days);
   }
 
   toJSON(): string {
@@ -219,17 +259,46 @@ export class Decimal {
     this.scale = scale;
   }
 
-  /** Reads `-12.34`, `.5`, `1e3`, `2.5E-4`. */
+  /**
+   * Reads `-12.34`, `.5`, `1e3`, `2.5E-4` as `protocol/src/decimal.rs`
+   * does: digits after the point beyond what can be kept are rounded
+   * away, halves away from zero; a whole part beyond 127 bits is a
+   * `RangeError`.
+   */
   static parse(text: string): Decimal {
     const parts = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text.trim());
     const whole = parts?.[2] ?? "";
-    const fraction = parts?.[3] ?? "";
+    let fraction = parts?.[3] ?? "";
     if (!parts || whole.length + fraction.length === 0) throw new SyntaxError(`not a decimal number: ${JSON.stringify(text)}`);
-    let mantissa = BigInt(whole + fraction);
-    let scale = fraction.length - Number(parts[4] ?? 0);
+    const tooLarge = (): RangeError => new RangeError(`${text.trim()} is beyond what a decimal holds`);
+    const exponent = Number(parts[4] ?? 0);
+    if (!(Math.abs(exponent) < 2 ** 31)) throw tooLarge();
+    // Room after the point: 37 digits in all, at most MAX_SCALE of them there.
+    const room = Math.min(Math.max(0, MAX_DIGITS - whole.replace(/^0+/, "").length), MAX_SCALE);
+    const roundUp = fraction.length > room && fraction.charCodeAt(room) >= 0x35;
+    fraction = fraction.slice(0, room);
+    const digits = (whole + fraction).replace(/^0+/, "");
+    if (digits.length > 39) throw tooLarge();
+    let mantissa = BigInt(digits || "0") + (roundUp ? 1n : 0n);
+    let scale = fraction.length - exponent;
     if (scale < 0) {
+      // 10^38 is the largest power of ten 127 bits hold.
+      if (-scale > 38) throw tooLarge();
       mantissa *= 10n ** BigInt(-scale);
       scale = 0;
+    }
+    if (mantissa > I128_MAX) throw tooLarge();
+    if (scale > 255) throw tooLarge();
+    if (scale > MAX_SCALE) {
+      // Rounded to MAX_SCALE digits, halves away from zero.
+      const excess = scale - MAX_SCALE;
+      if (excess > 38) {
+        mantissa = 0n;
+      } else {
+        const divisor = 10n ** BigInt(excess);
+        mantissa = mantissa / divisor + ((mantissa % divisor) * 2n >= divisor ? 1n : 0n);
+      }
+      scale = MAX_SCALE;
     }
     return new Decimal(parts[1] === "-" ? -mantissa : mantissa, scale);
   }
@@ -295,7 +364,14 @@ export type Value =
   | { readonly [key: string]: unknown };
 
 function jsonText(value: unknown): string {
-  const text = JSON.stringify(value);
+  // `JSON.stringify` writes half a surrogate pair as an escape, which is
+  // not text either: refused here, as in `text`.
+  const text = JSON.stringify(value, function (key, item: unknown) {
+    if (LONE_SURROGATE.test(key) || (typeof item === "string" && LONE_SURROGATE.test(item))) {
+      throw new RangeError(`${JSON.stringify(typeof item === "string" ? item : key)} holds half of a surrogate pair, which is not text`);
+    }
+    return item;
+  });
   if (text === undefined) throw new TypeError("that value has no JSON form");
   return text;
 }

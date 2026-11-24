@@ -19,7 +19,19 @@ export const MAX_FRAME = 256 * 1024 * 1024;
 export const MAX_DEPTH = 100;
 
 const U64_MAX = (1n << 64n) - 1n;
+const I64_MIN = -(1n << 63n);
+const I64_MAX = (1n << 63n) - 1n;
 const I128_MIN = -(1n << 127n);
+const I128_MAX = (1n << 127n) - 1n;
+
+/** Refuses a number a fixed-width field would wrap: `maxDepth(-1)`, a precision of 300. */
+function fits(v: number, max: number): number {
+  if (!Number.isInteger(v) || v < 0 || v > max) throw new RangeError(`${v} is not a whole number from 0 to ${max}`);
+  return v;
+}
+
+/** A lone surrogate, which UTF-8 cannot carry: `TextEncoder` would put U+FFFD in its place. */
+const LONE_SURROGATE = /\p{Cs}/u;
 
 /** The server sent something this client cannot read. */
 export class ProtocolError extends DbError {
@@ -85,6 +97,7 @@ export class Writer {
   // The room is made before the buffer is named: making it may replace
   // the buffer.
   u8(v: number): void {
+    fits(v, 0xff);
     const at = this.room(1);
     this.buf[at] = v;
   }
@@ -94,11 +107,13 @@ export class Writer {
   }
 
   u16(v: number): void {
+    fits(v, 0xffff);
     const at = this.room(2);
     this.view.setUint16(at, v, true);
   }
 
   u32(v: number): void {
+    fits(v, 0xffff_ffff);
     const at = this.room(4);
     this.view.setUint32(at, v, true);
   }
@@ -109,6 +124,7 @@ export class Writer {
   }
 
   i128(v: bigint): void {
+    if (v < -I128_MAX || v > I128_MAX) throw new RangeError("a decimal's digits must fit 127 bits");
     const at = this.room(16);
     const bits = BigInt.asUintN(128, v);
     this.view.setBigUint64(at, bits & U64_MAX, true);
@@ -141,6 +157,7 @@ export class Writer {
 
   /** A signed integer, small in either direction staying short. */
   zigzag(v: bigint): void {
+    if (v < I64_MIN || v > I64_MAX) throw new RangeError(`${v} does not fit the database's 64-bit integers`);
     this.varint(BigInt.asUintN(64, (v << 1n) ^ (v >> 63n)));
   }
 
@@ -150,6 +167,7 @@ export class Writer {
   }
 
   text(v: string): void {
+    if (LONE_SURROGATE.test(v)) throw new RangeError(`${JSON.stringify(v)} holds half of a surrogate pair, which is not text`);
     this.blob(utf8.encode(v));
   }
 

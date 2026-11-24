@@ -231,6 +231,13 @@ describe("against a server", { skip }, () => {
     await db.update(Update.table("things").key([3]).set("x", 2));
     assert.equal((await db.get("things", [3]))?.get("x"), 2);
 
+    // Keys that look like array indices come first in a JavaScript
+    // object whatever the stored order; read as text, the JSON keeps it.
+    await db.update(Update.table("things").key([3]).set("doc", { "2": 1, b: 2, "10": 3 }));
+    const doc = await db.queryOne(Query.table("things").key([3]).select("doc", col("doc")).select("text", col("doc").cast(Type.Text)));
+    assert.deepEqual(Object.keys(doc.get("doc") as object), ["2", "10", "b"]);
+    assert.deepEqual([...(doc.get("text") as string).matchAll(/"(\w+)":/g)].map((m) => m[1]), ["2", "b", "10"]);
+
     // What JavaScript cannot send is refused before it is sent.
     assert.throws(() => Query.row().select("v", val(2n ** 63n)), RangeError);
     assert.throws(() => Query.row().select("v", val(new Map() as never)), TypeError);
@@ -431,6 +438,47 @@ describe("against a server", { skip }, () => {
     }
   });
 
+  test("a dump read slowly holds the server back", async () => {
+    const [name, db] = await fresh();
+    await db.createTable(new TableDef("blobs").column(new ColumnDef("id", Type.Int)).column(new ColumnDef("body", Type.Bytes)).primaryKey(["id"]));
+    for (let id = 0; id < 16; id++) await db.insert(Insert.into("blobs").set("id", id).set("body", randomBytes(1 << 20)));
+
+    // A dump taken a frame at a time, slower than the server sends it:
+    // what has arrived and not been read stays near the high-water mark
+    // instead of growing to the whole dump.
+    const conn = await Conn.open(server.config(name));
+    const unread = (): number => (conn as unknown as { buffered: number }).buffered;
+    let most = 0;
+    let total = 0;
+    try {
+      await conn.send({ kind: "admin", admin: { kind: "dump", databases: [] } });
+      for (;;) {
+        const frame = await conn.receive();
+        if (frame.kind !== "chunk") {
+          assert.equal(frame.kind, "ok");
+          break;
+        }
+        total += frame.bytes.length;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        most = Math.max(most, unread());
+      }
+      conn.settle();
+    } finally {
+      conn.close();
+    }
+    assert.ok(total > 16 << 20, String(total));
+    assert.ok(most < 4 << 20, `${most} bytes waited unread`);
+
+    // Admin.dump with a slow `write` gets the whole of it.
+    let written = 0;
+    const counted = await db.admin.dump(async (chunk) => {
+      written += chunk.length;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    });
+    assert.equal(counted, written);
+    assert.ok(written > 16 << 20);
+  });
+
   test("errors carry their code and what was broken", async () => {
     const [, db] = await fresh();
     await db.createTable(users());
@@ -579,6 +627,42 @@ describe("against a server", { skip }, () => {
     assert.deepEqual([runs, await balance(db, 2)], [1, 130]);
   });
 
+  test("a transaction that conflicts before its commit is run again", async () => {
+    const [name, db] = await accounts();
+    const other = await another(name);
+    // More than eight rows in one insert is more than the server does
+    // twice: a transaction asked for it becomes the database's writer
+    // there and then, running what it did again on the newest version.
+    // If another commit has changed what it read, that fails with
+    // Conflict at the insert, before any commit.
+    const many = (from: number): Insert => {
+      let insert = Insert.into("accounts").columns(["id", "balance"]);
+      for (let id = from; id < from + 9; id++) insert = insert.values([id, 0]);
+      return insert;
+    };
+
+    const tx = await db.beginOptimistic();
+    await balance(tx, 1);
+    await other.update(bump);
+    await code(ErrorCode.Conflict, tx.insert(many(10)));
+    assert.equal(tx.conflicted, true);
+    await code(ErrorCode.Conflict, tx.commit());
+
+    // `transaction` runs the work again when that happens.
+    let runs = 0;
+    await db.transaction(async (tx) => {
+      runs++;
+      const available = await balance(tx, 1);
+      if (runs === 1) await other.update(bump);
+      await tx.insert(many(10 * runs));
+      await tx.update(setBalance(1, available - 1));
+    });
+    assert.equal(runs, 2);
+    assert.equal(await balance(db, 1), 101);
+    const ids = (await db.query(Query.table("accounts").filter(col("id").ge(10)))).column("id");
+    assert.deepEqual(ids, [20, 21, 22, 23, 24, 25, 26, 27, 28]);
+  });
+
   test("a reading transaction sees one moment", async () => {
     const [, db] = await accounts();
     const tx = await db.beginRead();
@@ -699,6 +783,19 @@ describe("against a server", { skip }, () => {
     assert.ok(!(await admin.admin.listDatabases()).includes(other));
     const unreachable = await code(ErrorCode.Connection, Client.connect("database://a:b@127.0.0.1:1"));
     assert.match(unreachable.message, /127\.0\.0\.1:1/);
+
+    // A connect timeout longer than a timer holds is waited in full, not
+    // cut to a millisecond.
+    const overflows: Error[] = [];
+    const warned = (w: Error): void => void (w.name === "TimeoutOverflowWarning" && overflows.push(w));
+    process.on("warning", warned);
+    try {
+      for (let i = 0; i < 20; i++) (await Client.connect(`database://${PASSWORD}@${at}/${name}?connect_timeout=3000000`)).close();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("warning", warned);
+    }
+    assert.deepEqual(overflows, []);
   });
 
   test("check, checkpoint, stats, dump and restore", async () => {

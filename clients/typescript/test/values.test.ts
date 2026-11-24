@@ -73,7 +73,26 @@ test("decimals are exact", () => {
   assert.ok(Decimal.parse("1.50").equals(Decimal.parse("1.5")));
   assert.equal(JSON.stringify({ amount: Decimal.parse("1.50") }), '{"amount":"1.50"}');
   for (const bad of ["", ".", "-", "1.2.3", "abc", "1e", "0x10"]) assert.throws(() => Decimal.parse(bad), SyntaxError, bad);
-  for (const bad of ["1e-31", "170141183460469231731687303715884105728"]) assert.throws(() => Decimal.parse(bad), RangeError, bad);
+  for (const bad of ["170141183460469231731687303715884105728", "1234567890123456789012345678901234567890", "1e39", "1e2147483648"]) {
+    assert.throws(() => Decimal.parse(bad), RangeError, bad);
+  }
+});
+
+test("decimals are read from text as the server reads them", () => {
+  // protocol/src/decimal.rs: digits after the point beyond what can be
+  // kept are rounded away, halves away from zero.
+  assert.ok(Decimal.parse("-2.00000000000000000000000000000049").equals(Decimal.parse("-2")));
+  assert.equal(Decimal.parse("12345678901234567890123456789012345.123456").toString(), "12345678901234567890123456789012345.12");
+  assert.equal(Decimal.parse("0.1234567890123456789012345678905555555555").toString(), "0.123456789012345678901234567891");
+  assert.equal(Decimal.parse("-0.0000000000000000000000000000005").toString(), "-0.000000000000000000000000000001");
+  assert.ok(Decimal.parse("1e-31").equals(Decimal.parse("0")));
+  assert.equal(Decimal.parse("1.5e-30").toString(), "0.000000000000000000000000000002");
+  assert.equal(Decimal.parse("1e38").toString(), "1" + "0".repeat(38));
+  // A large exponent is refused before its power of ten is worked out.
+  const started = Date.now();
+  assert.throws(() => Decimal.parse("1e100000000"), RangeError);
+  assert.throws(() => Decimal.parse("0e100000000"), RangeError);
+  assert.ok(Date.now() - started < 1000);
 });
 
 test("timestamps are microseconds in UTC", () => {
@@ -95,6 +114,11 @@ test("timestamps are microseconds in UTC", () => {
   const far = back(new Timestamp(2n ** 63n - 1n));
   assert.ok(far instanceof Timestamp && far.micros === 2n ** 63n - 1n);
   assert.throws(() => far.toDate(), RangeError);
+  // Printed as protocol/src/time.rs prints it, wherever a Date cannot follow.
+  assert.equal(far.toISOString(), "294247-01-10T04:00:54.775807Z");
+  assert.equal(new Timestamp(-(2n ** 63n)).toISOString(), "-290308-12-21T19:59:05.224192Z");
+  assert.equal(new Timestamp(253_402_300_800_000_000n).toISOString(), "10000-01-01T00:00:00.000000Z");
+  assert.equal(new Timestamp(-62_135_596_800_000_001n).toISOString(), "0000-12-31T23:59:59.999999Z");
 });
 
 test("dates are days", () => {
@@ -108,6 +132,14 @@ test("dates are days", () => {
   assert.throws(() => CalendarDate.parse("2026-3-5"), SyntaxError);
   const read = back(new CalendarDate(2 ** 31 - 1));
   assert.ok(read instanceof CalendarDate && read.days === 2 ** 31 - 1);
+  // Printed as protocol/src/time.rs prints it, beyond the years a Date holds too.
+  assert.equal(CalendarDate.fromYmd(-7, 12, 21).days, -721_730);
+  assert.equal(CalendarDate.fromYmd(-7, 12, 21).toString(), "-007-12-21");
+  assert.deepEqual(CalendarDate.fromYmd(-7, 12, 21).ymd(), [-7, 12, 21]);
+  assert.equal(CalendarDate.fromYmd(10000, 1, 1).toString(), "10000-01-01");
+  assert.equal(new CalendarDate(200_000_000).toString(), "549551-05-28");
+  assert.equal(new CalendarDate(2 ** 31 - 1).toString(), "5881580-07-11");
+  assert.equal(new CalendarDate(-(2 ** 31)).toString(), "-5877641-06-23");
 });
 
 test("uuids print in the usual form", () => {
@@ -126,6 +158,11 @@ test("JSON is written compactly and read parsed", () => {
   assert.equal(back(json(null)), null);
   assert.equal(back(json("text")), "text");
   assert.throws(() => toWire(json(undefined)), TypeError);
+  // Half a surrogate pair is not text: UTF-8 has no form for it.
+  assert.equal(back("a\ud83d\ude00b"), "a\ud83d\ude00b");
+  for (const bad of [json("a\ud800b"), { "\udc00": 1 }, { a: ["\ud800"] }]) assert.throws(() => toWire(bad), RangeError);
+  assert.throws(() => back("a\ud800b"), RangeError);
+  assert.throws(() => back("\udc00"), RangeError);
   assert.deepEqual(back([1, "a", null, [true]]), [1, "a", null, [true]]);
   const bytes = back(new Uint8Array([0, 255, 7]));
   assert.ok(bytes instanceof Uint8Array && !Buffer.isBuffer(bytes));

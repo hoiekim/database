@@ -261,11 +261,11 @@ class Expr:
 
     def json(self, path: Iterable[Any]) -> "Expr":
         """A member of a JSON value: ``col("detail").json(["device", "name"])``."""
-        return self._call(Func.JSON_GET, *path)
+        return Expr(ast.Call(Func.JSON_GET, (self.node,) + _nodes(path)))
 
     def json_text(self, path: Iterable[Any]) -> "Expr":
         """The same member as text."""
-        return self._call(Func.JSON_GET_TEXT, *path)
+        return Expr(ast.Call(Func.JSON_GET_TEXT, (self.node,) + _nodes(path)))
 
     def json_contains(self, other: Any) -> "Expr":
         return self._call(Func.JSON_CONTAINS, other)
