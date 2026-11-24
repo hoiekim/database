@@ -54,6 +54,12 @@ are said here. The bytes on the wire are `docs/PROTOCOL.md`.
   work on expressions.
 - **Builders do not change:** each method returns a new builder, so a
   query kept in a variable can be narrowed twice.
+- **It greets the server with protocol version 2** (`PROTOCOL_VERSION`),
+  so it has none of what later versions added: no prepared statements
+  or `param(n)`, no transaction that begins with its first statement in
+  one request, no batches, and no `explain`. It cannot set `keep_start`
+  on a column, and a table that uses `keep_start` is described to it
+  without the setting.
 - **Calls block.** A `Client` may be shared between threads; it keeps a
   pool of connections (8 by default, `?pool=n` in the URL). A
   transaction is used by one thread at a time.
