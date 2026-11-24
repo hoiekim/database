@@ -336,18 +336,32 @@ little. The server's CPU time for the load was 47 to 56 s before and 43
 to 55 s after; the trims take part of what was saved (40 to 46 s
 without the budget).
 
-Merging beside the writer has a price on disk: after the load the data
-file holds 750 to 800 MB, where it held 624 to 655 MB. A merge holds the
-version it reads for as long as it runs, as a reader would, and no page
-freed meanwhile is given out again until it ends, so writers take new
-pages from the end of the file instead. That is the likely reason; it
-was not traced.
+Merging beside the writer leaves the data file larger. Stopped as soon
+as the load was over, the server's file held 803 MB: 83,729 pages in
+use and 14,316 free, where it held 665 MB, 73,968 in use and 7,221
+free (`database check`). The pages in use over those were full-text
+segments not yet merged, 29 in the index against 8: the merging thread
+takes the cheapest run that is due first, so the large runs wait while
+the load goes on, and the stop gave up the merge under way. An engine
+now looks for due segments when it opens a database. Started again on
+that file, it made 7 merges, and then held 73,960 pages in use, as many
+as before, in a file of 900 MB with 35,881 pages free.
+
+The rest is free pages, which later writes take before they grow the
+file. A merge writes its tree before the segments it replaces are
+freed, and it holds the version it reads while it runs, so that no page
+freed meanwhile is given out again. Loading the same 100,000 mails
+twice into one database through the engine (one writer at a time, no
+server), the file grew by 1,549 MB and then by 251 MB, where before it
+grew by 598 MB and then by 612 MB: 1,800 MB and 1,210 MB in all, with
+83,388 and 11,780 pages free.
 
 | What is left | What it changes | Expected effect | Cost |
 |---|---|---|---|
 | **Build indexes after loading**, for `restore`: load the rows, then write each index bottom-up from sorted entries with the tree `Builder` | A restore pays for neither pending rows nor merges | Several times faster restores; nothing for ordinary inserts | Moderate; not begun |
 | **Cut words ahead inside transactions** | Only a large insert that is its own transaction is cut ahead now | The same for loads made in transactions | Small |
-| **Hold only what a merge reads**: keep the pages of the segments being merged from being given out again, not every page freed meanwhile | Writers reuse freed pages while a merge runs | The fifth the data file grew | Moderate: the store keeps whole versions, not sets of pages |
+| **Hold only what a merge reads**: keep the pages of the segments being merged from being given out again, not every page freed meanwhile | Writers reuse freed pages while a merge runs | Fewer free pages after a load (how many is not measured) | Moderate: the store keeps whole versions, not sets of pages |
+| **Fewer merges dropped**: a writer that merges past 40 segments changes the segments a merge beside it is reading | In the engine-only loads above, 4 of 14 and 10 of 30 merges were dropped and their trees freed | Less work, fewer free pages | Small to moderate: the writer could merge only segments newer than those being merged |
 | **Trim less, at less cost**: return only the pools the large requests used | The CPU time the trims take | A few seconds of the load's CPU | Small; the C library trims all pools at once |
 
 ### 4. Transactions of several requests (0.91×)

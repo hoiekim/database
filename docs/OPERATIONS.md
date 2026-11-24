@@ -239,12 +239,13 @@ large requests shared a budget): the cache, the requests and their log
 records in flight, and freed memory that the allocator has not yet
 returned. Large requests take turns for 4 MB of memory, a request larger
 than that runs alone, and the memory each held is returned to the system
-as it is answered. A container limit of 128 MB fits ordinary requests
-and a bulk load of megabyte statements with the default cache; give it
-192 MB if rows of a megabyte and more are common (the load above has
-rows of 4 kB, and a row is held whole), and raise `DATABASE_CACHE_MB`
-only if `stats` shows many disk reads for the working set. A transaction
-that runs beside other writers keeps at most about a megabyte of its own
+as it is answered (on Linux with the GNU C library; elsewhere the budget
+alone bounds it). A container limit of 128 MB fits ordinary requests and
+a bulk load of megabyte statements with the default cache; give it 192
+MB if rows of a megabyte and more are common (the load above has rows of
+4 kB, and a row is held whole), and raise `DATABASE_CACHE_MB` only if
+`stats` shows many disk reads for the working set. A transaction that
+runs beside other writers keeps at most about a megabyte of its own
 before it takes the write lock.
 
 The largest single request or result is 256 MiB, and it is held in

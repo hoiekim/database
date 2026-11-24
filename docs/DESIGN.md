@@ -308,7 +308,9 @@ would be hundreds of writes all over a tree for each row. Instead:
   exactly the rows the merge kept. Otherwise the merge is dropped. A
   writer still merges at once a segment that is mostly dead, and the
   cheapest run of segments once more than 40 have gathered, so that a
-  search never meets many.
+  search never meets many. A merge given up on when the engine stops is
+  made again when it next opens the database: the thread looks for due
+  segments in each database it opens.
 
 A search looks each word up in every segment (a handful), intersects the
 lists, and adds the scores. Text is cut into words and, for English,
@@ -439,7 +441,8 @@ the budget may be waiting for that turn: it takes what is free and
 runs. As a large request is answered, the memory it held is handed back
 to the system, at most five times a second; left in the allocator's
 pool of the thread that decoded it, it was most of what the server held
-during a bulk load.
+during a bulk load. Only the GNU C library keeps such pools and is asked
+to (`memory.rs`); built for any other, the server has the budget alone.
 
 ## Dump and restore (`dump.rs`)
 
