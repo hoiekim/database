@@ -291,7 +291,11 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
                 session.request_bytes = frame.len();
                 drop(frame);
                 let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
-                session.handle(request, deadline, &mut writer).await
+                // The statement of a bulk load goes a way of its own.
+                match session.load(request, deadline).await {
+                    Ok(answer) => Ok(answer),
+                    Err(request) => session.handle(request, deadline, &mut writer).await,
+                }
             }
             Err(e) => Ok(vec![Response::Error(e)]),
         };
@@ -305,6 +309,8 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
         }
     }
 }
+
+mod load;
 
 fn rows(set: RowSet) -> Vec<Response> {
     rows_responses(set)

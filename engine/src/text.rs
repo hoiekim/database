@@ -279,6 +279,99 @@ pub fn terms(text: &str, config: TextConfig) -> HashMap<String, u32> {
     out
 }
 
+/// The distinct terms of a text in their order, each with how often it
+/// occurs: what a full-text index keeps of a text. They are held packed,
+/// one after another (a term's length, its bytes, its count), so that a
+/// text's terms are one piece of memory and not one each. Cutting a text
+/// is most of what indexing it costs, and nothing but the text and the
+/// configuration decides the result: so it can be done ahead of the
+/// write that stores the text, and beside other writes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Cut {
+    packed: Vec<u8>,
+}
+
+impl Cut {
+    pub fn is_empty(&self) -> bool {
+        self.packed.is_empty()
+    }
+
+    /// The memory the terms take.
+    pub fn bytes(&self) -> usize {
+        self.packed.len()
+    }
+
+    /// Each term and its count, the terms in rising order.
+    pub fn iter(&self) -> CutTerms<'_> {
+        CutTerms { packed: &self.packed }
+    }
+}
+
+pub struct CutTerms<'a> {
+    packed: &'a [u8],
+}
+
+impl<'a> Iterator for CutTerms<'a> {
+    type Item = (&'a [u8], u32);
+
+    fn next(&mut self) -> Option<(&'a [u8], u32)> {
+        let (len, rest) = self.packed.split_first()?;
+        let (term, rest) = rest.split_at(usize::from(*len));
+        // A count is written as a varint of at most five bytes.
+        let (mut count, mut shift, mut used) = (0u32, 0, 0);
+        for byte in rest {
+            used += 1;
+            count |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        self.packed = &rest[used..];
+        Some((term, count))
+    }
+}
+
+/// Cuts a text into its terms. Terms longer than `longest` bytes (at
+/// most 255) are left out: they are not words.
+///
+/// The terms are gathered as they come, sorted, and counted where they
+/// repeat: no table of them is kept and none is copied on its own.
+pub fn cut(text: &str, config: TextConfig, longest: usize) -> Cut {
+    let longest = longest.min(255);
+    // Every term's bytes, one after another, and for each where it lies:
+    // with the first eight bytes beside it, which decide most comparisons.
+    let mut bytes: Vec<u8> = Vec::with_capacity(text.len().min(MAX_INDEXED_BYTES) / 2 + 8);
+    let mut found: Vec<(u64, u32, u8)> = Vec::new();
+    each_term(text, config, &mut |term| {
+        if term.len() <= longest {
+            let mut head = [0u8; 8];
+            let n = term.len().min(8);
+            head[..n].copy_from_slice(&term.as_bytes()[..n]);
+            found.push((u64::from_be_bytes(head), bytes.len() as u32, term.len() as u8));
+            bytes.extend_from_slice(term.as_bytes());
+        }
+    });
+    let term_of = |at: &(u64, u32, u8)| &bytes[at.1 as usize..at.1 as usize + usize::from(at.2)];
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| term_of(a).cmp(term_of(b))));
+    let mut packed = Vec::with_capacity(bytes.len() / 2 + found.len().min(64) * 2);
+    let mut at = 0;
+    while at < found.len() {
+        let term = term_of(&found[at]);
+        let same = found[at..].iter().take_while(|other| term_of(other) == term).count();
+        packed.push(term.len() as u8);
+        packed.extend_from_slice(term);
+        let mut count = same as u32;
+        while count >= 0x80 {
+            packed.push((count as u8) | 0x80);
+            count >>= 7;
+        }
+        packed.push(count as u8);
+        at += same;
+    }
+    Cut { packed }
+}
+
 /// The terms a search looks for, in order, each once.
 pub fn query_terms(query: &str, config: TextConfig) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -655,6 +748,26 @@ mod tests {
         assert_eq!(simple, ["hello", "wörld", "user", "example", "com", "x", "ray", "42"]);
         assert_eq!(query_terms("The invoices are overdue, the INVOICE", TextConfig::English), ["invoic", "overdu"]);
         assert_eq!(terms("pay the payment paying", TextConfig::English).get("pai"), Some(&2));
+    }
+
+    #[test]
+    fn a_cut_is_the_terms_in_order_with_their_counts() {
+        let text = "Pay the payment, paying a naïve x-ray 42 times; the 42 invoices of a supercalifragilistic kind";
+        for config in [TextConfig::Simple, TextConfig::English] {
+            for longest in [5, 64, 1000] {
+                let mut want: Vec<(String, u32)> = terms(text, config).into_iter().filter(|(term, _)| term.len() <= longest.min(255)).collect();
+                want.sort();
+                let got: Vec<(String, u32)> = cut(text, config, longest).iter().map(|(term, count)| (String::from_utf8(term.to_vec()).unwrap(), count)).collect();
+                assert_eq!(got, want, "{config:?}, at most {longest} bytes");
+            }
+        }
+        assert!(cut("", TextConfig::English, 64).is_empty());
+        assert!(cut("the and of", TextConfig::English, 64).is_empty());
+        // Terms that agree in their first eight bytes, and a term that
+        // occurs more often than one byte counts.
+        let many = "abcdefgh1 ".repeat(300) + "abcdefgh abcdefgh0 abcdefgh2 abcdefg";
+        let got: Vec<(Vec<u8>, u32)> = cut(&many, TextConfig::Simple, 64).iter().map(|(term, count)| (term.to_vec(), count)).collect();
+        assert_eq!(got, [(b"abcdefg".to_vec(), 1), (b"abcdefgh".to_vec(), 1), (b"abcdefgh0".to_vec(), 1), (b"abcdefgh1".to_vec(), 300), (b"abcdefgh2".to_vec(), 1)]);
     }
 
     #[test]

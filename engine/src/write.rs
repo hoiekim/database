@@ -218,11 +218,13 @@ impl Tx {
     /// the column's type, and breaks no constraint.
     pub fn apply_insert(&mut self, name: &str, values: &[Value]) -> Result<Vec<u8>> {
         let stored = Row::from_values(values);
-        self.apply_insert_row(name, values, &stored)
+        self.apply_insert_row(name, values, &stored, None)
     }
 
-    /// `apply_insert` for a row already made of its values.
-    fn apply_insert_row(&mut self, name: &str, values: &[Value], stored: &Row) -> Result<Vec<u8>> {
+    /// `apply_insert` for a row already made of its values. `ahead` holds
+    /// what was cut of the row's texts before the transaction began, if
+    /// anything was.
+    fn apply_insert_row(&mut self, name: &str, values: &[Value], stored: &Row, ahead: Option<fts::RowAhead>) -> Result<Vec<u8>> {
         let table = self.table(name)?;
         let pk = pk_of(&table, values)?;
         let (entries, words) = {
@@ -230,7 +232,7 @@ impl Tx {
             let entries: Vec<Vec<Entry>> = (0..table.indexes.len()).map(|i| index_entries(&ctx, &table, i, stored, &pk)).collect::<Result<_>>()?;
             let mut words = Vec::new();
             for i in (0..table.indexes.len()).filter(|i| is_full_text(&table, *i)) {
-                if let Some(w) = fts::words_of(&ctx, &table, i, stored)? {
+                if let Some(w) = fts::words_of_cut(&ctx, &table, i, stored, ahead)? {
                     words.push((i, w));
                 }
             }
@@ -724,6 +726,13 @@ impl Tx {
     // ------------------------------------------------------- statements
 
     pub fn insert(&mut self, ins: &Insert) -> Result<RowSet> {
+        self.insert_ahead(ins, None)
+    }
+
+    /// `insert`, for an insert whose texts were cut into words before
+    /// the transaction began: see `fts::cut_ahead`. `ahead` must have
+    /// been made from this very insert.
+    pub fn insert_ahead(&mut self, ins: &Insert, ahead: Option<&fts::Ahead>) -> Result<RowSet> {
         let table = self.table(&ins.table)?;
         let mut targets = Vec::with_capacity(ins.columns.len());
         for name in &ins.columns {
@@ -817,7 +826,7 @@ impl Tx {
             let (stored, old) = match existing {
                 None => {
                     self.check_parents(&table, &proposed, None)?;
-                    self.apply_insert_row(&ins.table, &values, &proposed)?;
+                    self.apply_insert_row(&ins.table, &values, &proposed, ahead.and_then(|ahead| ahead.row(ins, n)))?;
                     (proposed, None)
                 }
                 Some(holder) => {

@@ -54,12 +54,16 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::borrow::Cow;
+
 use database_protocol::error::{DbError, ErrorCode};
-use database_protocol::schema::IndexKind;
+use database_protocol::expr::Expr;
+use database_protocol::query::{Insert, InsertSource};
+use database_protocol::schema::{IndexKind, TextConfig};
 use database_protocol::value::Value;
 
 use crate::btree::{self, Cursor, Pages, PagesMut, Scan};
-use crate::catalog::Table;
+use crate::catalog::{Catalog, Table};
 use crate::error::{Error, Result};
 use crate::eval::{eval, holds, Ctx, Frame, Scope};
 use crate::exec::{encode_prefix, index_parts};
@@ -186,16 +190,156 @@ fn store<P: PagesMut>(p: &mut P, root: PageId, state: &State) -> Result<PageId> 
 // ----------------------------------------------------------------- words
 
 /// What a row gives the index: the bytes of its leading keys, and each of
-/// its words with a score, in order of the words.
+/// its words with a score, in order of the words. It is held as the
+/// index stores it for a pending row, in one piece: nothing is made, or
+/// thrown away, per word.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Words {
-    pub lead: Vec<u8>,
-    pub terms: Vec<(String, u32)>,
+    /// The length of the leading keys and the keys; the count of words;
+    /// then each word: its length in a byte, its bytes, its score.
+    stored: Vec<u8>,
+}
+
+impl Words {
+    /// From leading keys and words, the words in rising order and each
+    /// once, none longer than `MAX_TERM`.
+    pub fn new<'a>(lead: &[u8], terms: impl IntoIterator<Item = (&'a [u8], u32)>) -> Words {
+        let mut body = Vec::new();
+        let mut count = 0;
+        for (term, score) in terms {
+            put_term(&mut body, term, score);
+            count += 1;
+        }
+        Words::assemble(lead, count, &body)
+    }
+
+    fn assemble(lead: &[u8], count: u64, body: &[u8]) -> Words {
+        let mut stored = Vec::with_capacity(lead.len() + body.len() + 8);
+        put_varint(&mut stored, lead.len() as u64);
+        stored.extend_from_slice(lead);
+        put_varint(&mut stored, count);
+        stored.extend_from_slice(body);
+        Words { stored }
+    }
+
+    /// Words as a pending row stores them, checked to be that.
+    fn from_stored(stored: &[u8]) -> Result<Words> {
+        let (_, pos) = stored_lead(stored)?;
+        stored_terms(stored, pos, &mut |_, _| {})?;
+        Ok(Words { stored: stored.to_vec() })
+    }
+
+    pub fn lead(&self) -> &[u8] {
+        stored_lead(&self.stored).map_or(&[], |(lead, _)| lead)
+    }
+
+    /// Each word and its score, in order of the words.
+    pub fn terms(&self) -> impl Iterator<Item = (&[u8], u32)> {
+        let (mut pos, mut left) = (self.stored.len(), 0);
+        if let Ok((_, at)) = stored_lead(&self.stored) {
+            pos = at;
+            left = get_varint(&self.stored, &mut pos).unwrap_or(0);
+        }
+        let mut reading = Reading { pos, left, term: (0, 0), score: 0 };
+        std::iter::from_fn(move || match reading.advance(&self.stored) {
+            Ok(true) => Some((&self.stored[reading.term.0..reading.term.1], reading.score)),
+            _ => None,
+        })
+    }
+}
+
+fn put_term(out: &mut Vec<u8>, term: &[u8], score: u32) {
+    out.push(term.len() as u8);
+    out.extend_from_slice(term);
+    put_varint(out, u64::from(score));
+}
+
+/// The texts of an insert's rows, cut into words before the insert's turn
+/// to write came: see `cut_ahead`.
+pub struct Ahead {
+    /// For each row: where among the row's values a text lies, how it was
+    /// cut, and what it was cut into.
+    rows: Vec<Vec<(usize, TextConfig, text::Cut)>>,
+}
+
+/// One row's share of an `Ahead`, with the values it was cut from.
+#[derive(Clone, Copy)]
+pub struct RowAhead<'a> {
+    cuts: &'a [(usize, TextConfig, text::Cut)],
+    values: &'a [Expr],
+}
+
+impl Ahead {
+    /// What was cut of row `n` of `ins`, the insert this was made from.
+    pub fn row<'a>(&'a self, ins: &'a Insert, n: usize) -> Option<RowAhead<'a>> {
+        let InsertSource::Values(rows) = &ins.source else { return None };
+        Some(RowAhead { cuts: self.rows.get(n)?, values: rows.get(n)? })
+    }
+
+    /// The memory it holds.
+    pub fn bytes(&self) -> usize {
+        self.rows.iter().flatten().map(|(_, _, cut)| cut.bytes() + 32).sum()
+    }
+}
+
+impl RowAhead<'_> {
+    /// The cut of `text`, if this very text was cut ahead in this way.
+    /// It is found by comparing the text itself with what was cut: a
+    /// row whose text is not what the insert said (a default took its
+    /// place, an upsert rewrote it) finds nothing, and is cut when it is
+    /// written.
+    fn cut_of(&self, text: &str, config: TextConfig) -> Option<&text::Cut> {
+        self.cuts.iter().find(|(place, how, _)| *how == config && matches!(self.values.get(*place), Some(Expr::Value(Value::Text(cut))) if cut == text)).map(|(_, _, cut)| cut)
+    }
+}
+
+/// Cuts the texts an insert brings into words, for the full-text indexes
+/// of its table as `catalog` has it. This is most of what such an insert
+/// costs, and needs nothing but the texts: so whoever sends the insert
+/// can do it before taking the turn to write, beside whoever has it.
+///
+/// Only a text given as it is, for a column an index reads as it is, is
+/// cut. Whether the words are used is decided when the row is written,
+/// by `RowAhead::cut_of`: a table or an index changed meanwhile only
+/// means that words were cut for nothing. `None` if there is nothing to
+/// cut.
+pub fn cut_ahead(catalog: &Catalog, ins: &Insert) -> Option<Ahead> {
+    let InsertSource::Values(rows) = &ins.source else { return None };
+    let table = catalog.tables.get(ins.table.as_str())?;
+    let mut wanted: Vec<(usize, TextConfig)> = Vec::new();
+    for index in &table.indexes {
+        let IndexKind::FullText { config, fields } = &index.def.kind else { continue };
+        for field in fields {
+            let Expr::Column(None, name) = &field.expr else { continue };
+            let Some(place) = ins.columns.iter().position(|column| column == name) else { continue };
+            if !wanted.contains(&(place, *config)) {
+                wanted.push((place, *config));
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return None;
+    }
+    let cut_row = |row: &Vec<Expr>| {
+        wanted
+            .iter()
+            .filter_map(|(place, config)| match row.get(*place) {
+                Some(Expr::Value(Value::Text(text))) => Some((*place, *config, text::cut(text, *config, MAX_TERM))),
+                _ => None,
+            })
+            .collect()
+    };
+    Some(Ahead { rows: rows.iter().map(cut_row).collect() })
 }
 
 /// A row's words, or `None` if the index leaves the row out: its filter
 /// does, or the row has no words.
 pub fn words_of(ctx: &Ctx, table: &Table, index: usize, row: &Row) -> Result<Option<Words>> {
+    words_of_cut(ctx, table, index, row, None)
+}
+
+/// `words_of`, for a row whose texts may have been cut ahead.
+pub fn words_of_cut(ctx: &Ctx, table: &Table, index: usize, row: &Row, ahead: Option<RowAhead>) -> Result<Option<Words>> {
     let def = &table.indexes[index].def;
     let IndexKind::FullText { config, fields } = &def.kind else { return Err(malformed()) };
     let frame = [Frame { alias: &table.name, table, row: Some(row) }];
@@ -205,21 +349,24 @@ pub fn words_of(ctx: &Ctx, table: &Table, index: usize, row: &Row) -> Result<Opt
             return Ok(None);
         }
     }
-    let mut weights: HashMap<String, f64> = HashMap::new();
+    // Each field's terms, in order, and what one occurrence weighs.
+    let mut cuts: Vec<(Cow<text::Cut>, f64)> = Vec::with_capacity(fields.len());
     for field in fields {
         match eval(ctx, &scope, &field.expr)? {
             Value::Null => {}
             Value::Text(text) => {
-                for (term, count) in text::terms(&text, *config) {
-                    if term.len() <= MAX_TERM {
-                        *weights.entry(term).or_insert(0.0) += field.weight * f64::from(count);
-                    }
+                let cut = match ahead.as_ref().and_then(|ahead| ahead.cut_of(&text, *config)) {
+                    Some(cut) => Cow::Borrowed(cut),
+                    None => Cow::Owned(text::cut(&text, *config, MAX_TERM)),
+                };
+                if !cut.is_empty() {
+                    cuts.push((cut, field.weight));
                 }
             }
             other => return Err(Error::Db(DbError::type_mismatch(format!("index {:?} expects text, got {}", def.name, other.type_name())))),
         }
     }
-    if weights.is_empty() {
+    if cuts.is_empty() {
         return Ok(None);
     }
     let lead = def.keys.iter().map(|key| eval(ctx, &scope, &key.expr)).collect::<Result<Vec<_>>>()?;
@@ -227,22 +374,32 @@ pub fn words_of(ctx: &Ctx, table: &Table, index: usize, row: &Row) -> Result<Opt
     if lead.len() > MAX_LEAD {
         return Err(Error::db(ErrorCode::KeyTooLong, format!("the leading keys of index {:?} take {} bytes, and at most {MAX_LEAD} fit", def.name, lead.len())));
     }
-    let mut terms: Vec<(String, u32)> = weights.into_iter().map(|(term, w)| (term, (w * SCORE_UNIT).round().clamp(1.0, 65535.0) as u32)).collect();
-    terms.sort();
-    Ok(Some(Words { lead, terms }))
-}
-
-fn encode_words(words: &Words) -> Vec<u8> {
-    let mut out = Vec::with_capacity(words.lead.len() + words.terms.len() * 10 + 8);
-    put_varint(&mut out, words.lead.len() as u64);
-    out.extend_from_slice(&words.lead);
-    put_varint(&mut out, words.terms.len() as u64);
-    for (term, score) in &words.terms {
-        out.push(term.len() as u8);
-        out.extend_from_slice(term.as_bytes());
-        put_varint(&mut out, u64::from(*score));
+    // The fields' terms are each in order: so are the row's, taken from
+    // them least first, a term that several fields have weighing what it
+    // weighs in each, added up in the order of the fields.
+    let mut body = Vec::with_capacity(cuts.iter().map(|(cut, _)| cut.bytes()).sum::<usize>() + 16);
+    let mut count = 0;
+    let mut heads: Vec<_> = cuts.iter().map(|(cut, weight)| (cut.iter().peekable(), *weight)).collect();
+    loop {
+        let mut least: Option<&[u8]> = None;
+        for (terms, _) in &mut heads {
+            if let Some((term, _)) = terms.peek() {
+                if least.is_none_or(|least| *term < least) {
+                    least = Some(term);
+                }
+            }
+        }
+        let Some(term) = least else { break };
+        let mut weight = 0.0;
+        for (terms, each) in &mut heads {
+            if let Some((_, n)) = terms.next_if(|(other, _)| *other == term) {
+                weight += *each * f64::from(n);
+            }
+        }
+        put_term(&mut body, term, (weight * SCORE_UNIT).round().clamp(1.0, 65535.0) as u32);
+        count += 1;
     }
-    out
+    Ok(Some(Words::assemble(&lead, count, &body)))
 }
 
 /// The leading keys of stored words, and where the terms start.
@@ -266,23 +423,9 @@ fn stored_terms(buf: &[u8], mut pos: usize, f: &mut dyn FnMut(&[u8], u32)) -> Re
     Ok(())
 }
 
-fn decode_words(buf: &[u8]) -> Result<Words> {
-    let (lead, pos) = stored_lead(buf)?;
-    let mut terms = Vec::new();
-    let mut bad = false;
-    stored_terms(buf, pos, &mut |term, score| match std::str::from_utf8(term) {
-        Ok(term) => terms.push((term.to_string(), score)),
-        Err(_) => bad = true,
-    })?;
-    if bad {
-        return Err(malformed());
-    }
-    Ok(Words { lead: lead.to_vec(), terms })
-}
-
-fn word_key(lead: &[u8], term: &str) -> Vec<u8> {
+fn word_key(lead: &[u8], term: &[u8]) -> Vec<u8> {
     let mut key = lead.to_vec();
-    keys::encode(&mut key, &Value::Text(term.to_string()), false);
+    keys::encode_text(&mut key, term);
     key
 }
 
@@ -450,9 +593,8 @@ pub fn add<P: PagesMut>(p: &mut P, mut root: PageId, pk: &[u8], words: &Words) -
         return Err(Error::db(ErrorCode::KeyTooLong, format!("a primary key of {} bytes is too long for a full-text index", pk.len())));
     }
     let mut state = load(p, root)?;
-    let stored = encode_words(words);
     let room = btree::max_value(pk.len() + 2);
-    for (part, bytes) in stored.chunks(room).enumerate() {
+    for (part, bytes) in words.stored.chunks(room).enumerate() {
         let part = u16::try_from(part).map_err(|_| Error::db(ErrorCode::OutOfRange, "a row has too many words for a full-text index"))?;
         let key = pending_key(pk, part);
         state.pending_bytes += (key.len() + bytes.len()) as u64;
@@ -929,7 +1071,7 @@ pub fn verify(ctx: &Ctx, table: &Table, index: usize, on_page: &mut dyn FnMut(Pa
                 for key in &parts {
                     stored.extend(btree::get(ctx.pages, state.pending, key)?.ok_or_else(malformed)?);
                 }
-                if decode_words(&stored)? != words {
+                if Words::from_stored(&stored)? != words {
                     return Err(wrong("a pending row's words are not its row's"));
                 }
             }
@@ -937,8 +1079,8 @@ pub fn verify(ctx: &Ctx, table: &Table, index: usize, on_page: &mut dyn FnMut(Pa
                 held += 1;
                 let number = varint(&number, &mut 0)?;
                 let segment = state.segments.iter().find(|s| s.low <= number && number <= s.high).ok_or_else(|| wrong("a row's number is in no segment"))?;
-                for (term, score) in &words.terms {
-                    if listed(ctx.pages, segment, &word_key(&words.lead, term), number)? != Some(*score) {
+                for (term, score) in words.terms() {
+                    if listed(ctx.pages, segment, &word_key(words.lead(), term), number)? != Some(score) {
                         return Err(wrong("a word of a row is not listed for it"));
                     }
                 }
@@ -961,15 +1103,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn words(lead: u8, terms: &[(&str, u32)]) -> Words {
-        let mut terms: Vec<(String, u32)> = terms.iter().map(|(t, s)| (t.to_string(), *s)).collect();
+        let mut terms: Vec<(&str, u32)> = terms.to_vec();
         terms.sort();
-        Words { lead: vec![lead], terms }
+        Words::new(&[lead], terms.iter().map(|(term, score)| (term.as_bytes(), *score)))
     }
 
     /// The rows listed for a word, read the way a search reads them.
     fn rows_with(p: &MemPages, root: PageId, lead: u8, term: &str) -> Vec<(Vec<u8>, u32)> {
         let state = load(p, root).unwrap();
-        let start = word_key(&[lead], term);
+        let start = word_key(&[lead], term.as_bytes());
         let mut out = Vec::new();
         for segment in &state.segments {
             let mut cursor = Cursor::new(p, segment.root);
@@ -989,10 +1131,10 @@ mod tests {
             }
         }
         for_each_pending(p, state.pending, &mut |pk, stored| {
-            let w = decode_words(stored)?;
-            if w.lead == [lead] {
-                if let Some((_, score)) = w.terms.iter().find(|(t, _)| t == term) {
-                    out.push((pk.to_vec(), *score));
+            let w = Words::from_stored(stored)?;
+            if w.lead() == [lead] {
+                if let Some((_, score)) = w.terms().find(|(t, _)| *t == term.as_bytes()) {
+                    out.push((pk.to_vec(), score));
                 }
             }
             Ok(())
@@ -1050,7 +1192,7 @@ mod tests {
                     }
                 }
                 terms.sort();
-                let w = Words { lead: vec![(step % 2) as u8], terms };
+                let w = Words::new(&[(step % 2) as u8], terms.iter().map(|(term, score)| (term.as_bytes(), *score)));
                 root = add(&mut p, root, &pk, &w).unwrap();
                 model.insert(pk, w);
             }
@@ -1062,15 +1204,15 @@ mod tests {
         // No segment is mostly dead, and together they hold little more
         // than the rows that are left.
         assert!(state.segments.iter().all(|s| s.dead * 2 <= s.rows));
-        let live: u64 = model.values().map(|w| w.terms.len() as u64).sum();
+        let live: u64 = model.values().map(|w| w.terms().count() as u64).sum();
         let held: u64 = state.segments.iter().map(|s| s.entries).sum();
         assert!(held <= live * 2, "{held} entries held for {live} live");
         for lead in 0..2u8 {
             for term in ["w0", "w7", "w299"] {
                 let mut expected: Vec<(Vec<u8>, u32)> = model
                     .iter()
-                    .filter(|(_, w)| w.lead == [lead])
-                    .filter_map(|(pk, w)| w.terms.iter().find(|(t, _)| t == term).map(|(_, s)| (pk.clone(), *s)))
+                    .filter(|(_, w)| w.lead() == [lead])
+                    .filter_map(|(pk, w)| w.terms().find(|(t, _)| *t == term.as_bytes()).map(|(_, s)| (pk.clone(), s)))
                     .collect();
                 expected.sort();
                 assert_eq!(rows_with(&p, root, lead, term), expected, "{lead} {term}");

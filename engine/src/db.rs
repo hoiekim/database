@@ -791,6 +791,12 @@ impl WriteTxn {
         self.run(deadline, |tx| tx.insert(ins))
     }
 
+    /// `insert`, for an insert whose texts were cut into words before
+    /// the transaction began: see `fts::cut_ahead`.
+    pub fn insert_ahead(&mut self, ins: &Insert, ahead: Option<&crate::fts::Ahead>, deadline: Option<Instant>) -> Result<RowSet> {
+        self.run(deadline, |tx| tx.insert_ahead(ins, ahead))
+    }
+
     pub fn update(&mut self, upd: &Update, deadline: Option<Instant>) -> Result<RowSet> {
         self.run(deadline, |tx| tx.update(upd))
     }
