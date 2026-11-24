@@ -844,19 +844,29 @@ impl Session {
                 if self.txn.is_some() {
                     return Err(already_open());
                 }
-                // Refused before anything begins, a statement that is not
-                // kept can simply be sent again.
-                let statement = self.resolve(*statement)?;
-                if !is_statement(&statement.request) {
-                    return Err(not_a_statement());
+                // The client takes it that a transaction is open from
+                // here on, whatever this answers, and sends the rest of
+                // the transaction's statements as such. So a refusal, of
+                // the statement or of the begin, leaves a dead transaction
+                // that can only be ended: nothing sent after it may run
+                // outside the transaction it was meant for. The one
+                // exception is a statement the connection does not keep:
+                // that is said before anything begins, the client sends
+                // the same request again with the statement, and it is
+                // that one which begins the transaction.
+                let begun = match self.resolve(*statement) {
+                    Err(e) if e.code == ErrorCode::NotPrepared => return Err(e),
+                    Ok(statement) if !is_statement(&statement.request) => Err(not_a_statement()),
+                    Ok(statement) => self.begin(kind, Duration::from_millis(lock_wait_ms)).await.map(|()| statement),
+                    Err(e) => Err(e),
+                };
+                match begun {
+                    Ok(statement) => self.statement(statement, deadline).await,
+                    Err(e) => {
+                        self.txn = Some(Txn::Dead(e.clone()));
+                        Err(e)
+                    }
                 }
-                if let Err(e) = self.begin(kind, Duration::from_millis(lock_wait_ms)).await {
-                    // The statement was meant for a transaction, and so is
-                    // whatever follows it: none of it may run outside one.
-                    self.txn = Some(Txn::Dead(e.clone()));
-                    return Err(e);
-                }
-                self.statement(statement, deadline).await
             }
             Request::Batch(items) => self.batch(items, deadline).await,
             Request::Commit => match self.txn.take() {

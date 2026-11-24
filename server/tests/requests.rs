@@ -506,12 +506,42 @@ async fn a_first_statement_that_fails_leaves_a_transaction_to_end_not_a_statemen
     impatient.update(Update::table("accounts").key([1]).set("balance", 3)).await?;
     assert_eq!(balance(&impatient, 1).await?, 3);
 
-    // By hand: refused before it begins, a request leaves no transaction.
+    // The first statement is refused before the transaction could begin:
+    // here one too large for a connection to keep. The client has no way
+    // to tell that from a statement that failed, and goes on sending the
+    // transaction's statements: they must find a transaction that can
+    // only be ended, not run and commit one by one.
+    let too_large = Prepared::new(Query::table("accounts").filter(col("id").ne(val("x".repeat(70_000)))));
+    for exclusive in [true, false] {
+        let work = |tx: Transaction| {
+            let too_large = too_large.clone();
+            async move {
+                let e = tx.execute(&too_large, Vec::<i64>::new()).await.unwrap_err();
+                assert_eq!(e.code, ErrorCode::InvalidRequest, "{e}");
+                let e = tx.update(Update::table("accounts").key([1]).set("balance", 0)).await.unwrap_err();
+                assert_eq!(e.code, ErrorCode::TransactionAborted, "{e}");
+                Ok::<_, DbError>(())
+            }
+        };
+        let result = if exclusive { db.exclusive(work).await } else { db.transaction(work).await };
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidRequest, "the commit says why the transaction is gone");
+        assert_eq!(balance(&db, 1).await?, 3, "the update did not run alone");
+    }
+
+    // By hand. What is not a statement cannot begin a transaction, and
+    // leaves a dead one all the same, until it is ended.
     let e = db.call(Request::BeginWith { kind: TxnKind::Optimistic, lock_wait_ms: 0, statement: Box::new(Request::Commit) }).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidRequest, "{e}");
+    let e = db.query(Query::table("accounts")).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::TransactionAborted, "{e}");
+    assert!(matches!(db.call(Request::Rollback).await?, Response::Ok));
+    assert_eq!(db.query(Query::table("accounts")).await?.len(), 2);
+    // Only a statement the connection does not keep is refused with
+    // nothing begun: the client sends the request again with it.
     let e = db.call(Request::BeginWith { kind: TxnKind::Optimistic, lock_wait_ms: 0, statement: Box::new(Request::Prepared { id: u64::MAX, statement: None, params: Vec::new() }) }).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::NotPrepared, "{e}");
-    assert_eq!(db.call(Request::Commit).await.unwrap_err().code, ErrorCode::TransactionAborted, "no transaction is open");
+    assert_eq!(db.query(Query::table("accounts")).await?.len(), 2, "no transaction is open, dead or alive");
+    assert_eq!(db.call(Request::Commit).await.unwrap_err().code, ErrorCode::TransactionAborted, "nor is there one to commit");
     // And inside a transaction there is none to begin.
     let tx = db.begin().await?;
     let e = tx.call(Request::BeginWith { kind: TxnKind::Read, lock_wait_ms: 0, statement: Box::new(Request::Describe) }).await.unwrap_err();
