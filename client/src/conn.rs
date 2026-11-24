@@ -127,6 +127,9 @@ pub(crate) struct Conn {
     /// for each.
     sending: Vec<u8>,
     receiving: Vec<u8>,
+    /// Whether the last call ended without its request having left: it
+    /// was refused here, before a byte of it was written.
+    unsent: bool,
 }
 
 impl Conn {
@@ -141,6 +144,7 @@ impl Conn {
             kept: HashSet::new(),
             sending: Vec::new(),
             receiving: Vec::new(),
+            unsent: false,
         };
         let hello = Request::Hello {
             version: PROTOCOL_VERSION,
@@ -167,6 +171,7 @@ impl Conn {
         }
         frame[..4].copy_from_slice(&(len as u32).to_le_bytes());
         self.broken = true;
+        self.unsent = false;
         let sent = self.stream.get_mut().write_all(&frame).await.map_err(lost);
         if frame.capacity() <= KEPT_BUFFER {
             self.sending = frame;
@@ -197,6 +202,12 @@ impl Conn {
     pub(crate) fn settle(&mut self) {
         self.broken = false;
         self.last_used = Instant::now();
+    }
+
+    /// Whether the last call's request never left this side: the server
+    /// knows nothing of it, and the connection is as it was before.
+    pub(crate) fn never_left(&self) -> bool {
+        self.unsent
     }
 
     /// Reads one whole answer: a result that came in several frames is
@@ -349,6 +360,7 @@ impl Conn {
         // by a timeout, say) left its answer unread on this connection:
         // the next answer read would be that one. The connection is of
         // no further use, and whatever transaction it carried is over.
+        self.unsent = true;
         if self.broken {
             return Err(lost("an earlier request on this connection was abandoned before its answer was read"));
         }
