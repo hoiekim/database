@@ -570,3 +570,56 @@ async fn under_contention_every_transaction_counts_once() -> DbResult<()> {
     db.admin().check().await?;
     Ok(())
 }
+
+// A counter gives each of its numbers once, whoever asks and in whatever
+// order: a statement on its own, the database's only writer, or a
+// transaction that runs beside them and began before they wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_counter_gives_each_number_once_whoever_asks() -> DbResult<()> {
+    let (_server, db) = fresh().await;
+    // One counter that is the primary key, and one that is no key at all:
+    // nothing but the counter keeps the second from repeating.
+    db.create_table(TableDef::new("events").column(ColumnDef::new("id", Type::Int).auto_increment()).column(ColumnDef::new("name", Type::Text)).primary_key(["id"])).await?;
+    db.create_table(TableDef::new("notes").column(ColumnDef::new("name", Type::Text)).column(ColumnDef::new("n", Type::Int).auto_increment()).primary_key(["name"])).await?;
+    let event = |name: &str| Insert::into("events").set("name", name).returning(["id"]);
+    let note = |name: &str| Insert::into("notes").set("name", name).returning(["n"]);
+
+    // A lone insert between a transaction's beginning and its own insert.
+    let tx = db.begin_optimistic().await?;
+    let lone_event: i64 = db.insert(event("lone")).await?.one()?.get("id")?;
+    let lone_note: i64 = db.insert(note("lone")).await?.one()?.get("n")?;
+    let told_event: i64 = tx.insert(event("beside")).await?.one()?.get("id")?;
+    let told_note: i64 = tx.insert(note("beside")).await?.one()?.get("n")?;
+    assert_ne!(told_event, lone_event);
+    assert_ne!(told_note, lone_note);
+    // They touch no row in common, so the commit has nothing to conflict with.
+    tx.commit().await?;
+
+    // The same with the database's only writer holding its number, still
+    // uncommitted, while the transaction draws.
+    let exclusive = db.begin().await?;
+    let held_event: i64 = exclusive.insert(event("held")).await?.one()?.get("id")?;
+    let held_note: i64 = exclusive.insert(note("held")).await?.one()?.get("n")?;
+    let tx = db.begin_optimistic().await?;
+    let second_event: i64 = tx.insert(event("beside the writer")).await?.one()?.get("id")?;
+    let second_note: i64 = tx.insert(note("beside the writer")).await?.one()?.get("n")?;
+    exclusive.commit().await?;
+    tx.commit().await?;
+
+    let ids: Vec<i64> = db.query(Query::table("events").columns(["id"])).await?.column()?;
+    assert_eq!(ids.len(), 4);
+    let mut expected = vec![lone_event, told_event, held_event, second_event];
+    expected.sort();
+    assert_eq!(ids, expected, "every event has the number its insert was told");
+    let mut numbers: Vec<i64> = db.query(Query::table("notes").columns(["n"])).await?.column()?;
+    numbers.sort();
+    let mut told = vec![lone_note, told_note, held_note, second_note];
+    told.sort();
+    assert_eq!(numbers, told, "every note has the number its insert was told");
+    numbers.dedup();
+    assert_eq!(numbers.len(), 4, "no number was given twice");
+    // And the counters go on above all of them.
+    assert!(db.insert(event("next")).await?.one()?.get::<i64>("id")? > *expected.last().unwrap());
+    assert!(db.insert(note("next")).await?.one()?.get::<i64>("n")? > *told.last().unwrap());
+    Ok(())
+}

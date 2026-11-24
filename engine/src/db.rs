@@ -445,11 +445,10 @@ impl Database {
             let published = self.published.lock().unwrap();
             (published.clone(), self.store.pin())
         };
-        let tx = Tx::new(
-            Writer::fork(self.store.clone()),
-            (*base.catalog).clone(),
-            now_micros(),
-        );
+        let tx = Tx::new(Writer::fork(self.store.clone()), (*base.catalog).clone(), now_micros());
+        // Its owner will ask what each statement drew, to draw it again
+        // if the fork has to be run a second time.
+        tx.tape.record(true);
         Ok(WriteTxn {
             db: self.clone(),
             tx: Some(tx),
@@ -881,6 +880,8 @@ impl WriteTxn {
         self.guard = Some(guard);
         if let Some(tx) = self.tx.as_mut() {
             tx.writer.attach();
+            // It will not be run again: what it draws is asked for no more.
+            tx.tape.record(false);
         }
         // It builds on the newest version with no other writer about:
         // nothing it can reach will be freed under it.

@@ -51,7 +51,9 @@ db.create_table_if_not_exists(
 - A default is evaluated per inserted row: a constant, `default_now()`,
   `default_random_uuid()`, or any expression of constants.
 - `auto_increment()` numbers rows from 1. An insert may give the number
-  itself; later rows continue above the highest number ever stored.
+  itself; later rows continue above the highest number ever stored. A
+  number given to an insert that fails or is rolled back may be left
+  unused.
 - An index key is a column or an expression (`on_expr(col("email").lower())`).
   `on_desc` stores that key descending. `on_each(list_expr)` indexes the
   row once under each distinct item of the list. `.unique()` forbids two
@@ -368,8 +370,7 @@ Dropping a transaction rolls it back.
 - **Numbers and random ids are kept.** An `auto_increment` number or a
   `default_random_uuid()` value a statement returned is the one stored,
   however the transaction commits, and `now()` reads the same
-  throughout. A number given to a transaction that then rolls back may
-  be left unused.
+  throughout.
 - **Large work takes the write lock when it comes.** A statement that
   inserts more than eight rows, updates or deletes other than by key, or
   changes the schema, and a transaction grown past about a megabyte,

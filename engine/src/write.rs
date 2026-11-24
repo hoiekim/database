@@ -57,6 +57,8 @@ pub struct Tx {
     pub logging: bool,
     /// What its statements draw: random ids and counters' numbers.
     pub tape: Tape,
+    /// The tables it has made, which nobody else can see until it commits.
+    created: Vec<u32>,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -194,7 +196,7 @@ fn unique_holder(ctx: &Ctx, table: &Table, i: usize, entry: &Entry, own_pk: &[u8
 
 impl Tx {
     pub fn new(writer: Writer, catalog: Catalog, now: i64) -> Tx {
-        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default() }
+        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), created: Vec::new() }
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
@@ -773,9 +775,8 @@ impl Tx {
                     continue;
                 }
                 values[i] = if col.def.auto_increment {
-                    Value::Int(self.tape.serial(table.serials[i], |floor| {
-                        self.writer.next_serial(table.id, i, floor)
-                    }))
+                    let own = self.created.contains(&table.id);
+                    Value::Int(self.tape.serial(table.serials[i], |floor| self.writer.next_serial(table.id, i, floor, own)))
                 } else if let Some(default) = &col.def.default {
                     Self::fit_column(&table, i, eval(&self.ctx(), &Scope::default(), default)?)?
                 } else {
@@ -977,6 +978,7 @@ impl Tx {
         let id = self.catalog.next_table_id.max(1);
         let table = Table::create(def, id, &self.catalog)?;
         self.catalog.next_table_id = id + 1;
+        self.created.push(id);
         self.catalog.tables.insert(Arc::from(def.name.as_str()), Arc::new(table));
         self.log_op(OP_CREATE_TABLE, |w| codec::put_table(w, def));
         Ok(())

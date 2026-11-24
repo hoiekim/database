@@ -207,9 +207,9 @@ pub struct Store {
     /// Set when a write to the file failed: nothing more is written.
     failed: AtomicBool,
     /// Per table and column, one past the highest number an
-    /// `auto_increment` counter has given a fork. Forks run beside each
-    /// other, each on its own copy of the counter: this keeps them from
-    /// giving out the same number twice.
+    /// `auto_increment` counter has given any transaction. A writer and
+    /// the forks beside it each count on their own copy of the counter:
+    /// this keeps them from giving out the same number twice.
     serials: Mutex<HashMap<(u32, usize), i64>>,
     /// How many pages `mem` holds. A reader looks there, behind its lock,
     /// only when this says there is something to find: after a
@@ -427,14 +427,15 @@ impl Store {
     }
 
     /// The next number of a table's counter, which stands at `floor` in
-    /// the transaction that asks: `floor`, or more if forks have been
-    /// given that already. `claim` keeps the number from every fork that
-    /// asks later, whether or not the asker commits.
+    /// the transaction that asks: `floor`, or more if a transaction that
+    /// has not committed, or has since been undone, was given that
+    /// already. `claim` keeps the number from everyone who asks later,
+    /// whether or not the asker commits: a writer and the forks beside it
+    /// each count on their own copy of the counter, and this is all that
+    /// keeps them from giving out the same number.
     fn next_serial(&self, table: u32, column: usize, floor: i64, claim: bool) -> i64 {
         let mut serials = self.serials.lock().unwrap();
-        let number = serials
-            .get(&(table, column))
-            .map_or(floor, |given| floor.max(*given));
+        let number = serials.get(&(table, column)).map_or(floor, |given| floor.max(*given));
         if claim {
             serials.insert((table, column), number.saturating_add(1));
         }
@@ -823,9 +824,12 @@ impl Writer {
     }
 
     /// The next number of a table's `auto_increment` counter, which
-    /// stands at `floor` in this transaction.
-    pub fn next_serial(&self, table: u32, column: usize, floor: i64) -> i64 {
-        self.store.next_serial(table, column, floor, self.fork)
+    /// stands at `floor` in this transaction. `own` says the transaction
+    /// made the table itself and has not committed: nobody else can see
+    /// the table, so the number need not be kept from anyone, and is
+    /// not, since an undone table's number is given to the next table.
+    pub fn next_serial(&self, table: u32, column: usize, floor: i64, own: bool) -> i64 {
+        self.store.next_serial(table, column, floor, !own)
     }
 
     pub fn store(&self) -> &Arc<Store> {

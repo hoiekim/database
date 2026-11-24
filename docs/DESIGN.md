@@ -225,9 +225,10 @@ the same as having run alone at that moment; if one does not, the
 transaction fails with `Conflict`, having changed nothing. So that the
 second run can answer the same, what a statement draws rather than
 derives is kept from the first run and given to the second: random ids,
-and the numbers of `auto_increment` counters, which forks take from a
-count they share so that no two are given the same. The clock is the
-fork's own.
+and the numbers of `auto_increment` counters. Every transaction, a fork
+or not, takes those numbers from one count kept beside the tables, which
+moves on whether or not the transaction commits, so that no two are
+given the same. The clock is the fork's own.
 
 A statement on its own reads the newest commit, which may still be on
 its way to the disk. Whatever it then answers, rows or none or an error

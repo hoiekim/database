@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -49,12 +50,27 @@ pub enum Drawn {
 /// draw again.
 #[derive(Default)]
 pub struct Tape {
+    /// Whether what is drawn is kept: only a fork's draws are ever asked
+    /// for, so only a fork keeps them.
+    recording: AtomicBool,
     drawn: Mutex<Vec<Drawn>>,
+    /// Whether anything is left of what was given, so that a draw looks
+    /// for it only then.
+    giving: AtomicBool,
     given: Mutex<VecDeque<Drawn>>,
 }
 
 impl Tape {
-    /// What has been drawn since this was last asked.
+    /// Keeps what is drawn from now on, or stops keeping it and forgets
+    /// what was kept.
+    pub fn record(&self, on: bool) {
+        self.recording.store(on, Relaxed);
+        if !on {
+            self.drawn.lock().unwrap().clear();
+        }
+    }
+
+    /// What has been drawn, and kept, since this was last asked.
     pub fn take_drawn(&self) -> Vec<Drawn> {
         std::mem::take(&mut self.drawn.lock().unwrap())
     }
@@ -65,15 +81,31 @@ impl Tape {
         let mut given = self.given.lock().unwrap();
         given.clear();
         given.extend(values);
+        self.giving.store(!given.is_empty(), Relaxed);
+    }
+
+    fn next_given(&self) -> Option<Drawn> {
+        if !self.giving.load(Relaxed) {
+            return None;
+        }
+        let mut given = self.given.lock().unwrap();
+        let next = given.pop_front();
+        self.giving.store(!given.is_empty(), Relaxed);
+        next
+    }
+
+    fn keep(&self, drawn: Drawn) {
+        if self.recording.load(Relaxed) {
+            self.drawn.lock().unwrap().push(drawn);
+        }
     }
 
     pub fn uuid(&self) -> [u8; 16] {
-        let given = self.given.lock().unwrap().pop_front();
-        let uuid = match given {
+        let uuid = match self.next_given() {
             Some(Drawn::Uuid(uuid)) => uuid,
             _ => random_uuid(),
         };
-        self.drawn.lock().unwrap().push(Drawn::Uuid(uuid));
+        self.keep(Drawn::Uuid(uuid));
         uuid
     }
 
@@ -83,12 +115,11 @@ impl Tape {
     /// `Store::next_serial`), so it is used wherever the counter has got
     /// to since.
     pub fn serial(&self, floor: i64, fresh: impl FnOnce(i64) -> i64) -> i64 {
-        let given = self.given.lock().unwrap().pop_front();
-        let number = match given {
+        let number = match self.next_given() {
             Some(Drawn::Serial(number)) => number,
             _ => fresh(floor),
         };
-        self.drawn.lock().unwrap().push(Drawn::Serial(number));
+        self.keep(Drawn::Serial(number));
         number
     }
 }
