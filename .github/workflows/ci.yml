@@ -23,3 +23,30 @@ jobs:
           cargo test -p database-bench --features sqlite --locked
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked
+
+  # The clients in other languages: each must write the bytes of
+  # protocol/fixtures/vectors.json (which the Rust tests above keep true
+  # to the Rust code) and work against a real server.
+  clients:
+    runs-on: ubuntu-latest
+    env:
+      # Named, so that a missing server fails the tests instead of skipping them.
+      DATABASE_BIN: ${{ github.workspace }}/target/debug/database
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the server
+        run: cargo build -p database-server --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: TypeScript client
+        working-directory: clients/typescript
+        run: |
+          npm ci
+          npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Python client
+        working-directory: clients/python
+        run: python -m unittest discover -s tests -t .

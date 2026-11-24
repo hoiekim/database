@@ -6,6 +6,14 @@ and the server carries them out as written. This file is the contract:
 what each piece means, and how the things usually said in SQL are said
 here.
 
+The examples are Rust. The clients for TypeScript (`clients/typescript`)
+and Python (`clients/python`) have the same vocabulary under the same
+names, in each language's spelling, and everything this file says of
+what a request means holds for them: it is the server that gives a
+request its meaning. Each client's README lists where it differs (how a
+64-bit integer or a timestamp is held, which names the language had
+taken). The bytes all three send are `PROTOCOL.md`.
+
 ```rust
 use database_client::*;
 

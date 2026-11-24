@@ -3,12 +3,14 @@
 A map of the code for whoever changes it next: what each part does, the
 rule it keeps, and why it is built that way and not another. The
 requirements are in `REQUIREMENTS.md`; the client's contract is in
-`CLIENT.md`; running it is in `OPERATIONS.md`; how it compares with
-Postgres, and why, is in `PERFORMANCE.md`.
+`CLIENT.md`; the wire protocol is in `PROTOCOL.md`; running it is in
+`OPERATIONS.md`; how it compares with Postgres, and why, is in
+`PERFORMANCE.md`.
 
 ```text
 protocol/   values, expressions, queries, the wire format     (no I/O)
 client/     the typed async client applications use
+clients/    the same client for TypeScript and for Python     (from PROTOCOL.md, not from the Rust)
 engine/     storage, transactions, query execution            (no network, no async)
 server/     the network server and the `database` command
 bench/      the same workloads against this and against Postgres
