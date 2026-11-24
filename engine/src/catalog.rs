@@ -224,6 +224,12 @@ impl TableMeta {
         self.by_name.get(name).copied().ok_or_else(|| Error::Db(DbError::not_found(format!("table {:?} has no column {name:?}", self.name))))
     }
 
+    /// How many bytes of a value's start column `i` keeps in the row
+    /// when the value is stored outside it.
+    pub fn keep_start(&self, i: usize) -> usize {
+        self.cols.get(i).map_or(0, |col| col.def.keep_start as usize)
+    }
+
     pub fn index(&self, name: &str) -> Result<usize> {
         self.indexes
             .iter()
@@ -240,6 +246,14 @@ impl TableMeta {
             return Err(invalid(format!("column {:?} numbers rows, so it must be an int", def.name)));
         }
         check_type(&def.name, &def.ty)?;
+        if def.keep_start > 0 {
+            if !matches!(def.ty, Type::Text | Type::Bytes) {
+                return Err(invalid(format!("column {:?} keeps the start of its values in the row, which only a text or bytes column can", def.name)));
+            }
+            if def.keep_start > MAX_KEEP_START {
+                return Err(invalid(format!("column {:?} keeps {} bytes of its values in the row, and a row has room for {MAX_KEEP_START} at most", def.name, def.keep_start)));
+            }
+        }
         if let Some(default) = &def.default {
             check_stored_expr("a default", default, true)?;
             if !columns_read(default).is_empty() {

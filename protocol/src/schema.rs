@@ -35,7 +35,15 @@ pub struct ColumnDef {
     /// An integer column that numbers rows: an insert that leaves it out
     /// gets one more than the highest value the column has ever held.
     pub auto_increment: bool,
+    /// For a text or bytes column: how many bytes of a value's start stay
+    /// in the row when the value is too large for it and is stored
+    /// outside. 0 keeps none. See `ColumnDef::keep_start`.
+    pub keep_start: u32,
 }
+
+/// The most of a value's start that a column can ask to keep in its row:
+/// a row is at most a quarter of a page.
+pub const MAX_KEEP_START: u32 = 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IndexDef {
@@ -228,7 +236,7 @@ impl TableDef {
 impl ColumnDef {
     /// A column that cannot be NULL and has no default.
     pub fn new(name: &str, ty: Type) -> ColumnDef {
-        ColumnDef { name: name.to_string(), ty, nullable: false, default: None, auto_increment: false }
+        ColumnDef { name: name.to_string(), ty, nullable: false, default: None, auto_increment: false, keep_start: 0 }
     }
 
     pub fn nullable(mut self) -> ColumnDef {
@@ -256,6 +264,21 @@ impl ColumnDef {
 
     pub fn auto_increment(mut self) -> ColumnDef {
         self.auto_increment = true;
+        self
+    }
+
+    /// Keeps the first `bytes` bytes of a large value in its row, for a
+    /// text or bytes column. A value too large for its row lives outside
+    /// it, and reading any of it is a second lookup; with this, `left`,
+    /// `substr` from the start and `substr_bytes` from the start are
+    /// answered from the row when what they ask for lies within those
+    /// bytes: the preview of a body beside a page of rows, without the
+    /// body. The row grows by as much, so keep what is read, not more;
+    /// at most `MAX_KEEP_START`. A text is cut at a character, and where
+    /// a row has no room the start is shortened or left out: it is a
+    /// copy to read faster from, never the value.
+    pub fn keep_start(mut self, bytes: u32) -> ColumnDef {
+        self.keep_start = bytes;
         self
     }
 }

@@ -51,7 +51,7 @@ pub fn items() -> TableDef {
         .column(ColumnDef::new("id", Type::Int))
         .column(ColumnDef::new("owner", Type::Int))
         .column(ColumnDef::new("name", Type::Text))
-        .column(ColumnDef::new("body", Type::Text).default(""))
+        .column(ColumnDef::new("body", Type::Text).default("").keep_start(48))
         .column(ColumnDef::new("tags", Type::list(Type::Text)).default(Vec::<String>::new()))
         .primary_key(["id"])
         .unique("items_name", ["name"])
@@ -142,6 +142,12 @@ pub fn compare_indexes(db: &Arc<Database>, model: &Model) {
     let mut names: Vec<&String> = model.values().map(|i| &i.name).collect();
     names.sort();
     assert_eq!(by_name.rows.len(), names.len());
+    // The start a row keeps of a large body is how the body starts.
+    let heads = txn.query(&Query::table("items").select("id", col("id")).select("head", col("body").left(40)), None).unwrap();
+    for r in &heads.rows {
+        let (Value::Int(id), Value::Text(head)) = (&r[0], &r[1]) else { panic!("unexpected row {r:?}") };
+        assert_eq!(*head, model[id].body.chars().take(40).collect::<String>(), "the start of body {id}");
+    }
 }
 
 pub fn create(engine: &Engine) -> Arc<Database> {

@@ -258,11 +258,77 @@ row" under 1 is about. Encoding the rows is untouched.
 
 ### 1. The mailbox page (0.70×)
 
+*Done: the start of a large text kept in its row.* A column can keep
+the first bytes of its large values in the row (`ColumnDef::keep_start`,
+`DESIGN.md` "Rows"), and the benchmark's mails keep 256 bytes of their
+text. The page's fifty previews are then read from the fifty rows, and
+no body is looked up.
+
+What that does was counted, not timed: the instructions the server
+executes per request, from one connection, on the benchmark's 100,000
+mails, under callgrind, as the difference between a run of 3N requests
+and one of N, divided by 2N. Callgrind counts the same whatever else
+the machine is doing. The ratios above were not measured again.
+
+| Request | Before | Start kept | |
+|---|---:|---:|---:|
+| Mailbox page: newest 50, with a preview of each body | 1,036,000 | 878,000 | −15% |
+| Count over a user's 5,000 mails | 41.2 million | 45.4 million | +10% |
+| Flag update by key | 78,000 | 86,000 | +10% |
+| Session lookup (another table) | 54,500 | 54,600 | |
+
+A second run of each, with other N, came within 0.5% for the page and
+the lookup, 2.5% for the count and 5% for the flag update.
+
+The page loses a sixth of its work. The count and the flag update pay
+for it, as this option's cost said they would: a mail's row grows by
+the 256 bytes and their count, and the data file after the load from
+628 MB to 665 MB. The mails' rows no longer fit in the 32 MB cache
+beside the indexes, so a count reads pages from the file again: 3.5
+million of its 4.3 million added instructions, and a system call for
+each page, which callgrind does not count. With a cache the rows fit
+in, the price is smaller; a table that is counted more than it is paged
+through should keep less, or none.
+
+*Done: fewer allocations per row.* A row read from a table allocated
+three times (its bytes, where its columns start, a cell for each
+value), its key a fourth, and a value read from it was made, kept, and
+copied again on its way out. A row now keeps where its columns start
+in itself (up to fifteen columns), makes a number or a text from its
+bytes when asked, and keeps only what costs more to make than to copy
+(a document, a list, a large value). The key of a row is lent to what
+reads it, not copied, since only a write keeps it. A bound that asks
+for one key, or every key with the same start, is evaluated and encoded
+once rather than as both ends. Counted as above, on the same data, with
+the start kept:
+
+| Request | Start kept | Fewer allocations | | Allocations per request |
+|---|---:|---:|---:|---:|
+| Mailbox page | 878,000 | 738,000 | −16% | 606 to 354 |
+| Count over a user's 5,000 mails | 45.4 million | 36.5 million | −20% | 21,700 to 5,930 |
+| Flag update by key | 86,000 | 81,000 | −6% | 72 to 63 |
+| Session lookup | 54,600 | 48,600 | −11% | 71 to 58 |
+
+Most of it is the row: 136,000 of the page's 140,000 and 8.1 million
+of the count's 8.9 million. Against main as it was before both changes
+the page does 29% less work, the count 11% less and the lookup 11%
+less; the flag update is where it was, within the noise of its runs.
+
+The allocator was not changed. What it costs after a burst of writes is
+threads waiting for each other's locks, which is time, not
+instructions: callgrind runs one thread at a time and cannot show it,
+and this machine, shared with other work, could not time it. The C
+library's per-thread caches are set by its environment variables when
+a process starts, not by `mallopt`, so the server cannot enlarge them
+for itself. What was done takes away most of what threads contended
+for: a count makes a quarter of the allocations it made.
+
+What is left of the options:
+
 | Option | What it changes | Expected effect | Cost |
 |---|---|---|---|
-| **Keep the start of a large text in its row**, as a setting of the column (say the first 256 bytes) | `left` and a short `substr` need no second lookup, which is a fifth of the query's instructions now | About a fifth | Moderate: the stored form of a row, the schema and the dump gain a field; rows grow by the prefix, which costs the count and the flag update part of their lead |
-| **Fewer allocations per row**: read a row's bytes from its page instead of copying them, decode into one buffer | Less work in every read, and less for threads to contend over in the allocator | The 15% lost after writes, and some more | Moderate: the row's lifetime runs through the executor |
-| **An allocator with larger per-thread caches** | The same contention, without touching the code | The 15% lost after writes | A dependency, where there are three; or a setting of the C library's, which only a container image can make |
+| **Read a row's bytes where they lie** in their page, instead of copying them out: the one allocation a row still costs | A count makes about one allocation per row; this would make it none | A few percent of a count; little for a page of fifty | Moderate: the row's lifetime runs through the executor, and the page must stay pinned while the row is read |
+| **An allocator with larger per-thread caches** | Threads contend for its locks less | Whatever is still lost after writes, which has to be timed again first | A dependency, where there are three; or `GLIBC_TUNABLES=glibc.malloc.tcache_count=...`, which only the container image can set |
 | **A preview column** kept by the application | No large value is read | A fifth, with nothing to build | None in the server; a column to maintain |
 
 ### 2. Unlogged upserts from many connections (0.80×)

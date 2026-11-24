@@ -260,7 +260,7 @@ impl Tx {
             (entries, words)
         };
         let (mut blobs, mut next_blob) = (table.blobs, table.next_blob);
-        let moved = row::fitted(&mut self.writer, stored, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
+        let moved = row::fitted(&mut self.writer, stored, btree::max_value(pk.len()), &mut blobs, &mut next_blob, &|i| table.keep_start(i))?;
         let (root, existed) = btree::put(&mut self.writer, table.root, &pk, moved.as_deref().unwrap_or(stored.raw()))?;
         if existed {
             return Err(Error::corrupt(format!("a row of table {name:?} was inserted over another")));
@@ -368,7 +368,7 @@ impl Tx {
                 blobs = blob::free(&mut self.writer, blobs, b.id, b.len)?;
             }
         }
-        let moved = row::fitted(&mut self.writer, new, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
+        let moved = row::fitted(&mut self.writer, new, btree::max_value(pk.len()), &mut blobs, &mut next_blob, &|i| table.keep_start(i))?;
         let root = btree::put(&mut self.writer, table.root, pk, moved.as_deref().unwrap_or(new.raw()))?.0;
         let mut index_roots = table.index_roots.clone();
         for ((i, before), after) in touched.iter().zip(&before).zip(&after) {
@@ -932,11 +932,11 @@ impl Tx {
         let mut found: Vec<(Vec<Value>, Vec<u8>, T)> = Vec::new();
         let stopped = Cell::new(false);
         for_each_match(&ctx, q, &Scope::default(), &stopped, &mut |scope, hit| {
-            if !seen.insert(hit.pk.clone()) {
+            if !seen.insert(hit.pk.to_vec()) {
                 return Ok(true);
             }
             let keys = q.order_by.iter().map(|o| eval(&ctx, scope, &o.expr)).collect::<Result<Vec<_>>>()?;
-            found.push((keys, hit.pk.clone(), per_row(&ctx, scope, hit)?));
+            found.push((keys, hit.pk.to_vec(), per_row(&ctx, scope, hit)?));
             Ok(!q.order_by.is_empty() || wanted.is_none_or(|w| (found.len() as u64) < w))
         })?;
         if !q.order_by.is_empty() {

@@ -268,6 +268,22 @@ holds commits may begin with a record that says where the log file
 before it ended. Builds from before that record do not know it, and
 refuse to start on such a log rather than read past it.
 
+A database with a column that keeps the start of its large values in
+its rows (`keep_start`, `CLIENT.md`) is stored in a form that a build
+from before that setting cannot read. Such a build refuses to start on
+the directory, and so serves none of its databases:
+
+```text
+database: cannot start: corrupt database: the stored catalog is damaged: malformed message: flag is neither 0 nor 1
+```
+
+It refuses a dump of such a database in the same way (`the dump cannot
+be loaded: a record is malformed`) and restores none of it. It never
+reads such a database wrongly. A database whose columns keep no start
+is stored as before, and either build reads it. To go back to an older
+build, give each such table a copy without the setting, with the newer
+build, before taking the dump.
+
 ## Memory
 
 The server's memory is the page cache plus a part in proportion to it:

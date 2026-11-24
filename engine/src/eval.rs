@@ -239,7 +239,7 @@ fn arithmetic(message: impl Into<String>) -> Error {
 pub fn frame_value(ctx: &Ctx, frame: &Frame, i: usize) -> Result<Value> {
     let Some(row) = frame.row else { return Ok(Value::Null) };
     Ok(match row.value(ctx.pages, frame.table.blobs, i)? {
-        Some(value) => value.clone(),
+        Some(value) => value,
         None => frame.table.cols[i].fill.clone(),
     })
 }
@@ -827,6 +827,20 @@ fn substr(text: &str, start: i64, len: i64) -> String {
     chars(text, (from - 1) as usize, (end - from) as usize).to_string()
 }
 
+/// The start a row keeps of a large text, if the text's first `n`
+/// characters are all in it. (It is never the whole text: the text left
+/// its row for want of room.)
+fn kept_chars(row: &Row, i: usize, n: u64) -> Option<&str> {
+    let (start, _) = row.kept_start(i)?;
+    let head = std::str::from_utf8(start).ok()?;
+    let holds = if head.is_ascii() {
+        head.len() as u64 >= n
+    } else {
+        n == 0 || usize::try_from(n - 1).is_ok_and(|last| head.chars().nth(last).is_some())
+    };
+    holds.then_some(head)
+}
+
 /// Functions that can answer from a large value's length or a part of
 /// it. `None` when the argument is not a large stored value.
 fn call_on_blob(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Option<Value>> {
@@ -849,12 +863,18 @@ fn call_on_blob(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<O
             if n < 0 {
                 return Ok(None);
             }
+            if let Some(head) = kept_chars(row, i, n as u64) {
+                return Ok(Some(Value::Text(chars(head, 0, n as usize).to_string())));
+            }
             // A character is at most four bytes.
             row.byte_range(ctx.pages, blobs, i, 0, (n as u64).saturating_mul(4))?.map(|bytes| Value::Text(first_chars(&bytes, n as usize)))
         }
         Func::Substr if rest.len() == 2 && row.is_text(i) => {
             let (start, len) = (int_arg(&rest[0], "substr")?, int_arg(&rest[1], "substr")?);
             let end = start.saturating_add(len.max(0)).max(1);
+            if let Some(head) = kept_chars(row, i, (end - 1) as u64) {
+                return Ok(Some(Value::Text(substr(head, start, len))));
+            }
             // Everything up to the last character wanted, at most.
             row.byte_range(ctx.pages, blobs, i, 0, (end as u64).saturating_mul(4))?.map(|bytes| {
                 let head = match std::str::from_utf8(&bytes) {
@@ -1308,5 +1328,49 @@ mod tests {
         assert_eq!(substr("héllo", 2, 3), "éll");
         assert_eq!(substr("héllo", 0, 3), "hé");
         assert_eq!(substr("héllo", 9, 3), "");
+    }
+
+    #[test]
+    fn the_start_a_row_keeps_answers_for_as_many_characters_as_it_holds() {
+        use crate::btree::tests::MemPages;
+        use crate::page::NO_PAGE;
+        // Characters of one, two, three and four bytes, and mixtures in
+        // which they do not fall on any regular boundary.
+        let texts = ["x".repeat(5_000), "é".repeat(3_000), format!("a{}", "é".repeat(3_000)), "日本語".repeat(900), "𝄞".repeat(1_500), "aé日𝄞 ".repeat(700)];
+        for text in &texts {
+            for keep in [1usize, 2, 3, 4, 5, 64, 99, 100, 101, 256, 1_024] {
+                let mut p = MemPages::new();
+                let mut cols = vec![crate::row::encode_value(&Value::Int(1)), crate::row::encode_value(&Value::Text(text.clone()))];
+                crate::row::fit(&mut p, &mut cols, 1_500, &mut NO_PAGE.clone(), &mut 1, &|_| keep).unwrap();
+                let row = Row::parse(crate::row::assemble(&cols)).unwrap();
+                // What is kept is the text's start, cut after a whole
+                // character: as many bytes as asked, or up to three fewer.
+                let kept = row.kept_start(1).map_or(0, |(start, _)| start.len());
+                assert!(kept <= keep && kept + 4 > keep && text.is_char_boundary(kept), "{keep} asked, {kept} kept");
+                let held = text[..kept].chars().count() as u64;
+                for n in (0..held + 3).chain([10_000, u64::MAX]) {
+                    match kept_chars(&row, 1, n) {
+                        // All of the first `n` characters are there.
+                        Some(head) => {
+                            assert!(n <= held, "{keep} kept, {n} asked");
+                            assert_eq!(chars(head, 0, n as usize), text.chars().take(n as usize).collect::<String>());
+                            assert_eq!(substr(head, 2, n as i64 - 1), text.chars().skip(1).take((n as usize).saturating_sub(1)).collect::<String>());
+                        }
+                        // More is asked than the row holds (or it holds
+                        // nothing, the first character being longer than
+                        // what was to be kept): the value is looked up, as
+                        // it is with no start kept.
+                        None => assert!(n > held || kept == 0, "{keep} kept, {n} asked"),
+                    }
+                }
+            }
+        }
+        // A value in its row, and one outside it of which nothing is
+        // kept, have no start to answer from.
+        let mut p = MemPages::new();
+        let mut cols = vec![crate::row::encode_value(&Value::Text("short".into())), crate::row::encode_value(&Value::Text("y".repeat(9_000)))];
+        crate::row::fit(&mut p, &mut cols, 1_500, &mut NO_PAGE.clone(), &mut 1, &|_| 0).unwrap();
+        let row = Row::parse(crate::row::assemble(&cols)).unwrap();
+        assert!(kept_chars(&row, 0, 1).is_none() && kept_chars(&row, 1, 1).is_none() && kept_chars(&row, 2, 0).is_none());
     }
 }

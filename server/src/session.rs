@@ -205,6 +205,8 @@ struct Session {
     uses: u64,
     /// What the client called itself in its greeting, for the log.
     client: String,
+    /// The protocol version the client said in its greeting.
+    version: u32,
     /// What the statement being answered has read.
     read: Read,
     /// The named locks this connection holds.
@@ -294,6 +296,23 @@ async fn write_response<W: AsyncWrite + Unpin>(writer: &mut W, buf: &mut Vec<u8>
     sent
 }
 
+/// A response as a client of protocol `version` reads it. A client
+/// older than `COLUMN_FLAGS_VERSION` is described its tables without the
+/// columns' `keep_start`, which it could not decode: each column is then
+/// the bytes such a client has always read, and it loses nothing it could
+/// use, the setting changing where values are stored and not what a
+/// query answers.
+fn as_spoken_by(response: &mut Response, version: u32) {
+    if version >= COLUMN_FLAGS_VERSION {
+        return;
+    }
+    if let Response::Tables(tables) = response {
+        for column in tables.iter_mut().flat_map(|t| t.columns.iter_mut()) {
+            column.keep_start = 0;
+        }
+    }
+}
+
 /// Serves one connection, over whatever carries it: the two halves of a
 /// TCP stream, or of a Unix domain socket's.
 pub(crate) async fn serve<R, W>(reader: R, mut writer: W, state: Arc<State>, id: u64, mut stopping: watch::Receiver<bool>)
@@ -317,6 +336,7 @@ where
         kept_bytes: 0,
         uses: 0,
         client: String::new(),
+        version: 0,
         read: Read::default(),
         held: Vec::new(),
         restore: None,
@@ -328,6 +348,7 @@ where
         Ok(Ok(Some(frame))) => match decode_request(&frame) {
             Ok((Request::Hello { version, database, password, client }, _)) => {
                 session.client = client;
+                session.version = version;
                 session.greet(version, database, &password)
             }
             Ok(_) => Err(DbError::new(ErrorCode::InvalidRequest, "the first request must be a greeting")),
@@ -393,7 +414,10 @@ where
         if let Some(share) = share {
             share.give_back();
         }
-        let Ok(responses) = outcome else { break };
+        let Ok(mut responses) = outcome else { break };
+        for response in &mut responses {
+            as_spoken_by(response, session.version);
+        }
         let mut failed = false;
         for response in &responses {
             failed |= write_response(&mut writer, &mut sending, response).await.is_err();
