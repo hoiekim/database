@@ -155,7 +155,7 @@ fn check_stored_expr(what: &str, expr: &Expr, allow_clock: bool) -> Result<()> {
     expr.visit(&mut |e| match e {
         Expr::Subquery(..) => problem = Some("a subquery"),
         Expr::Agg { .. } => problem = Some("an aggregate"),
-        Expr::Excluded(_) | Expr::Old(_) | Expr::Depth | Expr::Rank => problem = Some("a value that only a statement has"),
+        Expr::Excluded(_) | Expr::Old(_) | Expr::Depth | Expr::Rank | Expr::Param(_) => problem = Some("a value that only a statement has"),
         Expr::Call(Func::Now | Func::RandomUuid, _) if !allow_clock => problem = Some("the clock or a random value"),
         _ => {}
     });

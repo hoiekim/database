@@ -45,12 +45,13 @@ use database_protocol::message::{Ddl, RowSet};
 use database_protocol::query::{Delete, Insert, Query, Update};
 use database_protocol::schema::TableDef;
 use database_protocol::time::now_micros;
+use database_protocol::value::Value;
 
 use crate::btree::{self, Pages};
 use crate::cache::PageCache;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
-use crate::eval::{Ctx, Drawn, Scope};
+use crate::eval::{Cost, Ctx, Drawn, Read, Scope};
 use crate::exec;
 use crate::page::{PageId, FIRST_DATA_PAGE};
 use crate::row::Row;
@@ -417,7 +418,7 @@ impl Database {
         let published = self.published.lock().unwrap();
         let pinned = self.store.pin();
         debug_assert_eq!(pinned, published.version);
-        ReadTxn { db: self.clone(), snapshot: published.clone(), pinned, now: now_micros() }
+        ReadTxn { db: self.clone(), snapshot: published.clone(), pinned, now: now_micros(), cost: Cost::default() }
     }
 
     /// Starts a transaction that may write, waiting up to `wait` for the
@@ -517,7 +518,8 @@ impl Database {
         let mut report = String::new();
         let mut rows_total = 0u64;
         for table in latest.catalog.tables.values() {
-            let ctx = Ctx { pages, catalog: &latest.catalog, now: 0, deadline: None, tape: None };
+            let cost = Cost::default();
+            let ctx = Ctx { pages, catalog: &latest.catalog, now: 0, deadline: None, tape: None, params: &[], cost: &cost };
             // The rows, and the large values they name.
             let mut rows = 0u64;
             let mut blob_bytes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
@@ -640,6 +642,8 @@ pub struct ReadTxn {
     snapshot: Arc<Snapshot>,
     pinned: u64,
     now: i64,
+    /// What its queries have read since it was last asked.
+    cost: Cost,
 }
 
 /// The pages one query has read, kept at hand for as long as it runs. A
@@ -684,21 +688,31 @@ impl Pages for Recent<'_> {
 
 impl ReadTxn {
     pub fn ctx(&self, deadline: Option<Instant>) -> Ctx<'_> {
-        Ctx { pages: &*self.db.store, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None }
+        Ctx { pages: &*self.db.store, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params: &[], cost: &self.cost }
+    }
+
+    /// What its queries have read since this was last asked: see `Read`.
+    pub fn take_read(&self) -> Read {
+        self.cost.take()
     }
 
     pub fn query(&self, q: &Query, deadline: Option<Instant>) -> Result<RowSet> {
+        self.query_with(q, &[], deadline)
+    }
+
+    /// Runs a query with `params` for its `Expr::Param`s.
+    pub fn query_with(&self, q: &Query, params: &[Value], deadline: Option<Instant>) -> Result<RowSet> {
         // A version's pages never change, so what the query has read
         // once it may read again from its own copy.
         let recent = Recent { store: &self.db.store, pages: Default::default() };
-        let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None };
+        let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params, cost: &self.cost };
         exec::query(&ctx, q, &Scope::default())
     }
 
     /// Tries a query for a moment: `None` if it has not finished by
     /// `until`.
-    pub fn query_within(&self, q: &Query, until: Instant) -> Result<Option<RowSet>> {
-        match self.query(q, Some(until)) {
+    pub fn query_within(&self, q: &Query, params: &[Value], until: Instant) -> Result<Option<RowSet>> {
+        match self.query_with(q, params, Some(until)) {
             Ok(rows) => Ok(Some(rows)),
             Err(Error::Db(e)) if e.code == ErrorCode::Timeout => Ok(None),
             Err(e) => Err(e),
@@ -847,6 +861,22 @@ impl WriteTxn {
         if let Some(tx) = self.tx.as_ref() {
             tx.tape.give(values);
         }
+    }
+
+    /// Gives the values the statements run from now on read for their
+    /// `Expr::Param`s, and hands back those given before: a prepared
+    /// statement's values are lent for its run and taken back after.
+    pub fn bind(&mut self, params: Vec<Value>) -> Vec<Value> {
+        match self.tx.as_mut() {
+            Some(tx) => std::mem::replace(&mut tx.params, params),
+            None => Vec::new(),
+        }
+    }
+
+    /// What its statements have read since this was last asked: see
+    /// `Read`.
+    pub fn take_read(&self) -> Read {
+        self.tx.as_ref().map_or_else(Read::default, |tx| tx.cost.take())
     }
 
     /// Whether this is a fork that still runs beside the writer.

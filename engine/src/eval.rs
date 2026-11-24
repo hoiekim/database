@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -31,6 +31,62 @@ pub struct Ctx<'a> {
     /// Where a writing transaction's statements draw the values that the
     /// rows do not decide. `None` for a reader, which draws them fresh.
     pub tape: Option<&'a Tape>,
+    /// The values a prepared statement is run with: what `Expr::Param`
+    /// reads. Empty for any other statement.
+    pub params: &'a [Value],
+    /// Where the statement counts what it reads.
+    pub cost: &'a Cost,
+}
+
+/// What statements have read since this was last asked: the figures a
+/// slow one is explained by. There is no planner to explain, so what a
+/// statement costs is what its access path made it read.
+///
+/// One statement counts at a time, on one thread. The counts are atomics
+/// only so that a transaction can be held by reference across a wait;
+/// they are read and written apart, which costs what a plain number
+/// would.
+#[derive(Default)]
+pub struct Cost {
+    entries: AtomicU64,
+    rows: AtomicU64,
+}
+
+/// What a statement read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Read {
+    /// Entries read from indexes: the entries of an ordered index's
+    /// range, the children found by a tree walk, a search's hits.
+    pub entries: u64,
+    /// Rows read from tables: in key order, through an index, by a join
+    /// or a subquery, or to be changed.
+    pub rows: u64,
+}
+
+impl Read {
+    pub fn add(&mut self, other: Read) {
+        self.entries += other.entries;
+        self.rows += other.rows;
+    }
+}
+
+impl Cost {
+    pub fn entry(&self) {
+        self.entries(1);
+    }
+
+    pub fn entries(&self, n: u64) {
+        self.entries.store(self.entries.load(Relaxed) + n, Relaxed);
+    }
+
+    pub fn row(&self) {
+        self.rows.store(self.rows.load(Relaxed) + 1, Relaxed);
+    }
+
+    /// What was read since this was last asked.
+    pub fn take(&self) -> Read {
+        Read { entries: self.entries.swap(0, Relaxed), rows: self.rows.swap(0, Relaxed) }
+    }
 }
 
 /// A value a statement drew that nothing in the database decides: a
@@ -359,6 +415,10 @@ pub fn eval(ctx: &Ctx, scope: &Scope, expr: &Expr) -> Result<Value> {
             let (row, frame) = found.ok_or_else(|| invalid("old(..) is only for an update's returning"))?;
             frame_value(ctx, &Frame { alias: frame.alias, table: frame.table, row: Some(row) }, frame.table.col(name)?)?
         }
+        Expr::Param(n) => match ctx.params.get(*n as usize) {
+            Some(value) => value.clone(),
+            None => return Err(invalid(format!("the statement reads value {n} of those it is run with, and was given {}", ctx.params.len()))),
+        },
         Expr::Depth => Value::Int(nearest(scope, |s| s.depth).ok_or_else(|| invalid("depth is only for a tree walk"))?),
         Expr::Rank => Value::Float(nearest(scope, |s| s.rank).ok_or_else(|| invalid("rank is only for a full-text search"))?),
         Expr::Not(e) => match truth(&eval(ctx, scope, e)?)? {
