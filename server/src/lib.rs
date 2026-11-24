@@ -177,7 +177,7 @@ impl Server {
         // quarter in the pages of an open transaction.
         let cache_pages = config.cache_bytes / database_engine::page::PAGE_SIZE;
         let limits = Limits { max_dirty: (cache_pages / 8).max(64), max_private: (cache_pages / 4).max(128) };
-        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, limits, ..Options::default() } };
+        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, limits, ..Options::default() }, ..EngineOptions::default() };
         let dir = config.data_dir.clone();
         // Recovery reads and writes files: keep it off the async threads.
         let engine = tokio::task::spawn_blocking(move || Engine::open(&dir, options)).await.map_err(std::io::Error::other)?.map_err(|e| std::io::Error::other(e.to_string()))?;

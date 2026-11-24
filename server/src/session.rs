@@ -375,24 +375,45 @@ where
             Some(Txn::Read(_) | Txn::Fork(_) | Txn::Dead(_)) => state.config.idle_transaction.saturating_mul(IDLE_READ_FACTOR),
             None => Duration::from_secs(u64::from(u32::MAX)),
         };
+        // The frame is read whole before anything shared is taken for
+        // it: a client slow to send its bytes keeps only itself waiting.
         let frame = tokio::select! {
             frame = tokio::time::timeout(patience, read_frame(&mut reader, MAX_FRAME)) => frame,
             _ = stopping.changed() => break,
         };
-        let frame = match frame {
-            Ok(Ok(Some(frame))) => frame,
-            _ => break,
+        let Ok(Ok(Some(frame))) = frame else { break };
+        // A large request's share of memory, taken before it is decoded
+        // (see `budget`). Whoever holds the turn between requests does
+        // not wait for it.
+        let holds_turn = matches!(session.txn, Some(Txn::Write(..)));
+        let mut share = tokio::select! {
+            share = budget::budget().take(frame.len(), !holds_turn) => Some(share),
+            _ = stopping.changed() => break,
         };
         state.requests.fetch_add(1, Ordering::Relaxed);
         let outcome = match decode_request(&frame) {
             Ok((request, timeout_ms)) => {
                 session.request_bytes = frame.len();
                 drop(frame);
+                // A dump writes to the client as it goes, and may wait on
+                // it: nothing shared is held meanwhile.
+                if matches!(request, Request::Admin(Admin::Dump { .. })) {
+                    if let Some(share) = share.take() {
+                        share.give_back();
+                    }
+                }
                 let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
-                session.handle(request, deadline, &mut writer).await
+                // The statement of a bulk load goes a way of its own.
+                match session.load(request, deadline).await {
+                    Ok(answer) => Ok(answer),
+                    Err(request) => session.handle(request, deadline, &mut writer).await,
+                }
             }
             Err(e) => Ok(vec![Response::Error(e)]),
         };
+        if let Some(share) = share {
+            share.give_back();
+        }
         let Ok(mut responses) = outcome else { break };
         for response in &mut responses {
             as_spoken_by(response, session.version);
@@ -406,6 +427,9 @@ where
         }
     }
 }
+
+mod budget;
+mod load;
 
 fn rows(set: RowSet) -> Vec<Response> {
     rows_responses(set)

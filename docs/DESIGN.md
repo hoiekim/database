@@ -409,11 +409,38 @@ would be hundreds of writes all over a tree for each row. Instead:
 - A row deleted or changed is forgotten (its number no longer leads to
   a row) and its entries are dropped when its segment is next merged,
   or at once when half a segment is dead.
+- Segments are **merged beside the writers.** A merge reads nothing but
+  segments, which never change once written, so the writer that makes
+  one due only says so. A thread of the engine's merges on a version
+  held as a reader holds one, into pages lent by the store as a fork's
+  are, and takes the write lock only to put the merged tree in place:
+  a commit with nothing in the log, which after a crash is simply not
+  there (the log's rows are indexed and merged again as it is
+  replayed). The tree is put in place only if the segments it read are
+  in the index as they were: the same trees, ranges of row numbers and
+  counts of dead rows. A tree is only ever replaced, its pages are not
+  given out again while the merge holds its version, and a row cannot
+  die without its segment's count rising; so equal segments hold
+  exactly the rows the merge kept. Otherwise the merge is dropped. A
+  writer still merges at once a segment that is mostly dead, and the
+  cheapest run of segments once more than 40 have gathered, so that a
+  search never meets many. A merge given up on when the engine stops is
+  made again when it next opens the database: the thread looks for due
+  segments in each database it opens.
 
 A search looks each word up in every segment (a handful), intersects the
 lists, and adds the scores. Text is cut into words and, for English,
 stemmed by the Porter algorithm, with the same code that `Func::Matches`
-and `Func::Headline` use without an index.
+and `Func::Headline` use without an index. A text's words are gathered
+sorted and packed in one buffer, and a row's words are held in the form
+a pending row stores them: nothing is allocated per word.
+
+Cutting text into words needs nothing but the text, so a large insert
+can have it done before its turn to write (see "The server"). Words cut
+ahead are used for a row only if the text the row is written with is
+the very text they were cut from, compared whole: a default in place of
+a text not given, an upsert that writes another text, or a table changed
+meanwhile only means that the row is cut again under the turn.
 
 ## The server (`server/`)
 
@@ -444,6 +471,12 @@ Postgres took 53, and a durable insert 400 µs against 170. So:
   nothing waits for a task to be woken, which costs more than the write.
 - Anything else, and every delete not by key, for what it may cascade
   to, takes the turn itself and runs on a thread of its own.
+- A **large insert** that is its own transaction, into a table with a
+  full-text index, first has its texts cut into words on the
+  connection's own thread, beside whoever has the turn
+  (`session/load.rs`). Several connections that load at once then cut
+  on as many cores, and take turns only to store rows and the words
+  already cut.
 - An **optimistic transaction** is a fork (see "Transactions"): its
   statements run without the turn, and the connection keeps each
   request with a digest of its answer and what it drew. Its commit is a
@@ -511,6 +544,29 @@ measured (`PERFORMANCE.md`).
 
 Named locks live in the server, per database and name, owned by a
 connection and released when it closes.
+
+**Large requests share a memory budget** (`session/budget.rs`). A
+request larger than 64 KiB, once its bytes have all come, takes a share
+of 4 MiB, counted in its bytes on the wire, before it is decoded, and
+gives it back once it is answered; one that finds the budget spent
+waits, in the order of arrival, with its bytes in memory as they would
+be without the budget. What the budget bounds is the decoding, the
+cutting of texts into words and the wait for the turn, where a request
+is held twice. Nothing shared is held while the server waits on a
+client: the share is taken only after the frame has come, so a client
+that sends a large statement slowly, or announces one and goes quiet,
+keeps only its own connection waiting; and a dump, which writes to the
+client as it goes, gives its share back before it starts. A request of
+ordinary size takes nothing and never waits; one larger than the budget
+takes all of it and runs alone. A connection that holds the turn between
+requests (an exclusive transaction) never waits for the budget, since
+whoever holds the budget may be waiting for that turn: it takes what is
+free and runs. As a large request is answered, the memory it held is
+handed back to the system, at most five times a second; left in the
+allocator's pool of the thread that decoded it, it was most of what the
+server held during a bulk load. Only the GNU C library keeps such pools
+and is asked to (`memory.rs`); built for any other, the server has the
+budget alone.
 
 ## Dump and restore (`dump.rs`)
 

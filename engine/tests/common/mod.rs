@@ -27,7 +27,11 @@ pub fn options() -> EngineOptions {
     // segments of a handful of rows, so that they are made, merged and
     // cleaned of dead rows all the time.
     database_engine::fts::set_pending_bytes(400);
-    EngineOptions { cache_bytes: 64 * 8192, db: Options { sync: true, limits: Limits { max_dirty: 24, max_private: 24 }, checkpoint_bytes: 64 * 1024 } }
+    // The engine's own thread merges no full-text segments here: what it
+    // does on the disk, and when, would differ from one run to the next,
+    // and these tests have every run be the same. A test that wants
+    // merges beside its writers makes them by hand, or lets the thread go.
+    EngineOptions { cache_bytes: 64 * 8192, db: Options { sync: true, limits: Limits { max_dirty: 24, max_private: 24 }, checkpoint_bytes: 64 * 1024 }, merging_paused: true }
 }
 
 pub fn try_open_with(vfs: &MemVfs, options: EngineOptions) -> database_engine::error::Result<Engine> {

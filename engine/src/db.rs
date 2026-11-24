@@ -33,6 +33,16 @@
 //! **Recovery.** Open the data file as of its last checkpoint, apply the
 //! log's records in order, checkpoint. A torn record at the log's end was
 //! never acknowledged and is ignored.
+//!
+//! **Merges beside the writers.** A full-text index is kept in segments
+//! that are merged as they gather (`fts.rs`), and merging reads nothing
+//! that changes. So it is done beside the writers, as a fork's work is:
+//! on a version held as a reader holds one, into pages lent by the
+//! store. Only putting the merged tree in place is a commit, made as
+//! the writer, and it is made only if the segments read are still as
+//! they were. It changes no row, puts nothing in the log, and after a
+//! crash is simply not there: the log's rows are indexed again as they
+//! are replayed, and their segments merged again.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -109,6 +119,17 @@ pub struct Database {
     last_commit: Mutex<Instant>,
     commits_since_checkpoint: AtomicU64,
     pub commits: AtomicU64,
+    /// Set by whoever merges full-text segments beside this database's
+    /// writers, and called when a commit leaves segments due. Until it
+    /// is set, writers merge what they make due themselves.
+    merger: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Held while segments are merged beside the writers: one merge at
+    /// a time, and none once the database is retired.
+    merging: Mutex<()>,
+    /// Merges made beside the writers and put in place; and merges
+    /// dropped, because the segments they read had changed meanwhile.
+    pub merges_beside: AtomicU64,
+    pub merges_dropped: AtomicU64,
 }
 
 fn data_path(dir: &Path, name: &str) -> PathBuf {
@@ -314,6 +335,10 @@ impl Database {
             last_commit: Mutex::new(Instant::now()),
             commits_since_checkpoint: AtomicU64::new(0),
             commits: AtomicU64::new(0),
+            merger: std::sync::OnceLock::new(),
+            merging: Mutex::new(()),
+            merges_beside: AtomicU64::new(0),
+            merges_dropped: AtomicU64::new(0),
         })
     }
 
@@ -348,6 +373,10 @@ impl Database {
         // name: it must be done before the name can be given to another
         // database. None starts after this, the database having failed.
         drop(self.checkpointing.lock().unwrap());
+        // Likewise a merge beside the writers, which writes pages to the
+        // data file: it gives up when it sees the database retired, and
+        // must have, before the file can be another database's.
+        drop(self.merging.lock().unwrap());
     }
 
     pub fn has_failed(&self) -> bool {
@@ -474,8 +503,102 @@ impl Database {
             let synced = self.fatal(self.wal.sync_to(base.version))?;
             self.publish_up_to(synced);
         }
-        let tx = Tx::new(Writer::new(self.store.clone()), (*base.catalog).clone(), now_micros());
+        let tx = Tx::new(self.writer(false), (*base.catalog).clone(), now_micros());
         Ok(WriteTxn { db: self.clone(), tx: Some(tx), base: base.version, failed: false, savepoints: Vec::new(), guard: Some(guard), pinned: None })
+    }
+
+    /// A transaction's view of the pages, told who merges the full-text
+    /// segments it leaves due.
+    fn writer(&self, fork: bool) -> Writer {
+        let mut writer = if fork { Writer::fork(self.store.clone()) } else { Writer::new(self.store.clone()) };
+        writer.leave_beside(self.merger.get().is_some());
+        writer
+    }
+
+    /// Leaves the merging of full-text segments to someone beside this
+    /// database's writers: `wake` is called each time a commit leaves
+    /// segments due, and whoever it wakes calls `merge_text_segments`
+    /// until nothing is. Without this, and always while the log is
+    /// replayed, a writer merges what it makes due before it goes on.
+    pub fn merge_beside(&self, wake: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.merger.set(wake);
+    }
+
+    /// Merges the cheapest run of full-text segments that is due in some
+    /// index, beside the writers, and puts the result in place. Returns
+    /// whether there was anything to merge: the caller then asks again.
+    ///
+    /// The merge reads the newest committed version and writes a tree
+    /// nothing refers to, as a fork writes. Then it takes the writer's
+    /// place for a moment: if the segments it read are in the index as
+    /// they were (see `fts::install`), the tree replaces them and that
+    /// is committed, with nothing in the log; if not, the tree is
+    /// dropped. `give_up` is asked now and then whether to stop.
+    pub fn merge_text_segments(self: &Arc<Self>, give_up: &dyn Fn() -> bool) -> Result<bool> {
+        let _one = self.merging.lock().unwrap();
+        self.check_failed()?;
+        // A version is held as a reader holds one, and held before the
+        // newest is looked up: no page of that version, nor of any made
+        // since, is given out again while the merge reads.
+        struct Held<'a>(&'a Store, u64);
+        impl Drop for Held<'_> {
+            fn drop(&mut self) {
+                self.0.unpin(self.1);
+            }
+        }
+        let _held = Held(&self.store, self.store.pin());
+        let read = self.latest.lock().unwrap().clone();
+        let stop = || give_up() || self.has_failed();
+        for table in read.catalog.tables.values() {
+            for (i, index) in table.indexes.iter().enumerate() {
+                if !matches!(index.def.kind, database_protocol::schema::IndexKind::FullText { .. }) {
+                    continue;
+                }
+                let mut writer = Writer::fork(self.store.clone());
+                let Some(merged) = self.fatal(crate::fts::merge_beside(&mut writer, table.index_roots[i], &stop))? else { continue };
+                // Its pages go to the file now, where they will lie: the
+                // commit below then has nothing to carry.
+                self.fatal(writer.spill_all())?;
+                // The write lock, waited for a little at a time: whoever
+                // holds it may hold it long (an exclusive transaction),
+                // and meanwhile the engine may be stopping or the
+                // database being dropped, which wait for this merge.
+                let guard = loop {
+                    if stop() {
+                        return Ok(false);
+                    }
+                    match self.lock_writes(Duration::from_millis(20)) {
+                        Ok(guard) => break guard,
+                        Err(Error::Db(e)) if e.code == ErrorCode::LockTimeout => continue,
+                        Err(e) => return Err(e),
+                    }
+                };
+                self.check_failed()?;
+                let base = self.latest.lock().unwrap().clone();
+                writer.attach();
+                let mut tx = Tx::new(writer, (*base.catalog).clone(), now_micros());
+                // The index as it is now: of the same table, by its
+                // number, and defined as it was.
+                let now = base.catalog.table_by_id(table.id).and_then(|now| Some((now, now.indexes.iter().position(|other| other.def == index.def)?)));
+                let mut installed = false;
+                if let Some((now, at)) = now {
+                    if let Some(root) = self.fatal(crate::fts::install(&mut tx.writer, now.index_roots[at], &merged))? {
+                        tx.set_index_root(&now.name, at, root)?;
+                        installed = true;
+                    }
+                }
+                if !installed {
+                    // What it read has changed: its tree goes, with `tx`.
+                    self.merges_dropped.fetch_add(1, Ordering::Relaxed);
+                    return Ok(true);
+                }
+                let txn = WriteTxn { db: self.clone(), tx: Some(tx), base: base.version, failed: false, savepoints: Vec::new(), guard: Some(guard), pinned: None };
+                let _ = txn.commit_start()?;
+                self.merges_beside.fetch_add(1, Ordering::Relaxed);
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Starts a transaction that may write but does not take the write
@@ -487,7 +610,7 @@ impl Database {
             let published = self.published.lock().unwrap();
             (published.clone(), self.store.pin())
         };
-        let tx = Tx::new(Writer::fork(self.store.clone()), (*base.catalog).clone(), now_micros());
+        let tx = Tx::new(self.writer(true), (*base.catalog).clone(), now_micros());
         // Its owner will ask what each statement drew, to draw it again
         // if the fork has to be run a second time.
         tx.tape.record(true);
@@ -661,7 +784,7 @@ impl Database {
     pub fn stats(&self) -> String {
         let latest = self.latest.lock().unwrap().clone();
         format!(
-            "database {}: version {}, {} tables, {} pages, {} free, {} dirty, log {} bytes, {} commits, {} disk reads, {} disk writes\n",
+            "database {}: version {}, {} tables, {} pages, {} free, {} dirty, log {} bytes, {} commits, {} disk reads, {} disk writes, {} merges of full-text segments beside the writers and {} dropped\n",
             self.name,
             latest.version,
             latest.catalog.tables.len(),
@@ -672,6 +795,8 @@ impl Database {
             self.commits.load(Ordering::Relaxed),
             self.store.disk_reads.load(Ordering::Relaxed),
             self.store.disk_writes.load(Ordering::Relaxed),
+            self.merges_beside.load(Ordering::Relaxed),
+            self.merges_dropped.load(Ordering::Relaxed),
         )
     }
 
@@ -860,6 +985,12 @@ impl WriteTxn {
 
     pub fn insert(&mut self, ins: &Insert, deadline: Option<Instant>) -> Result<RowSet> {
         self.run(deadline, |tx| tx.insert(ins))
+    }
+
+    /// `insert`, for an insert whose texts were cut into words before
+    /// the transaction began: see `fts::cut_ahead`.
+    pub fn insert_ahead(&mut self, ins: &Insert, ahead: Option<&crate::fts::Ahead>, deadline: Option<Instant>) -> Result<RowSet> {
+        self.run(deadline, |tx| tx.insert_ahead(ins, ahead))
     }
 
     pub fn update(&mut self, upd: &Update, deadline: Option<Instant>) -> Result<RowSet> {
@@ -1063,6 +1194,7 @@ impl WriteTxn {
         }
         let version = self.base + 1;
         let Tx { writer, catalog, log, .. } = tx;
+        let left_due = writer.left_due();
         if log.buf.is_empty() {
             db.wal.skip(version);
         } else {
@@ -1083,6 +1215,12 @@ impl WriteTxn {
         }
         // The next writer may start while this commit reaches the disk.
         self.guard.take();
+        // And whoever merges beside the writers, if it left segments due.
+        if left_due {
+            if let Some(wake) = db.merger.get() {
+                wake();
+            }
+        }
         Ok(Some(Committed { db, version }))
     }
 
