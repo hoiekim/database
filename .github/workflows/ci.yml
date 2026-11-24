@@ -15,5 +15,11 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: Test
         run: cargo test --workspace --locked
+      # Embedded SQLite in the benchmark is behind a feature the other
+      # steps leave off, because it compiles SQLite's C source.
+      - name: The benchmark with SQLite
+        run: |
+          cargo clippy -p database-bench --features sqlite --all-targets --locked
+          cargo test -p database-bench --features sqlite --locked
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked
