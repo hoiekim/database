@@ -654,6 +654,29 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_stored_without_a_start_reads_as_it_always_did() {
+        // Every reference was stored so before a column could keep a
+        // start, and one still is where a row has no room for it: its tag,
+        // the value's own tag, its number and its length.
+        let blob = BlobRef { tag: codec::TAG_TEXT, id: 300, len: 6_000 };
+        assert_eq!(encode_blob_ref(blob, &[]), [TAG_BLOB, codec::TAG_TEXT, 0xAC, 0x02, 0xF0, 0x2E]);
+
+        let mut tree = Tree::new();
+        let body = "é".repeat(3_000);
+        let old = tree.store_values(&[Value::Text(body.clone()), Value::Int(1)], 1_000, &[0, 0]);
+        assert_eq!((kept(&old, 0), old.blob(0).map(|b| b.len)), (None, Some(6_000)));
+        // Written again around it in a column that now keeps a start: the
+        // value is not read to make one, and the reference stays as it was.
+        let before = tree.next;
+        let row = tree.store(vec![old.raw_col(0).unwrap().to_vec(), encode_value(&Value::Int(2))], 1_000, &[256, 0]);
+        assert_eq!((row.raw_col(0), kept(&row, 0), tree.next), (old.raw_col(0), None, before));
+        // Every read goes to the value, and finds it.
+        assert_eq!(tree.value(&row, 0), Value::Text(body.clone()));
+        assert_eq!(row.byte_range(&tree.p, tree.blobs, 0, 0, 10).unwrap(), Some(body.as_bytes()[..10].to_vec()));
+        assert!(row.byte_range(&MemPages::new(), NO_PAGE, 0, 0, 10).is_err(), "nothing of it is in the row");
+    }
+
+    #[test]
     fn damaged_rows_are_errors() {
         let mut cols: Vec<Vec<u8>> = values().iter().map(encode_value).collect();
         cols.push(encode_blob_ref(BlobRef { tag: codec::TAG_TEXT, id: 9, len: 5_000 }, b"the start of it"));

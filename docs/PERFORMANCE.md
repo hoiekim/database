@@ -192,9 +192,42 @@ lookup for each preview and those allocations themselves.
 
 ### 1. The mailbox page (0.70×)
 
+*Done: the start of a large text kept in its row.* A column can keep
+the first bytes of its large values in the row (`ColumnDef::keep_start`,
+`DESIGN.md` "Rows"), and the benchmark's mails keep 256 bytes of their
+text. The page's fifty previews are then read from the fifty rows, and
+no body is looked up.
+
+What that does was counted, not timed: the instructions the server
+executes per request, from one connection, on the benchmark's 100,000
+mails, under callgrind, as the difference between a run of 3N requests
+and one of N, divided by 2N. Callgrind counts the same whatever else
+the machine is doing. The ratios above were not measured again.
+
+| Request | Before | Start kept | |
+|---|---:|---:|---:|
+| Mailbox page: newest 50, with a preview of each body | 1,036,000 | 878,000 | −15% |
+| Count over a user's 5,000 mails | 41.2 million | 45.4 million | +10% |
+| Flag update by key | 78,000 | 86,000 | +10% |
+| Session lookup (another table) | 54,500 | 54,600 | |
+
+A second run of each, with other N, came within 0.5% for the page and
+the lookup, 2.5% for the count and 5% for the flag update.
+
+The page loses a sixth of its work. The count and the flag update pay
+for it, as this option's cost said they would: a mail's row grows by
+the 256 bytes and their count, and the data file after the load from
+628 MB to 665 MB. The mails' rows no longer fit in the 32 MB cache
+beside the indexes, so a count reads pages from the file again: 3.5
+million of its 4.3 million added instructions, and a system call for
+each page, which callgrind does not count. With a cache the rows fit
+in, the price is smaller; a table that is counted more than it is paged
+through should keep less, or none.
+
+What is left of the options:
+
 | Option | What it changes | Expected effect | Cost |
 |---|---|---|---|
-| **Keep the start of a large text in its row**, as a setting of the column (say the first 256 bytes) | `left` and a short `substr` need no second lookup, which is a fifth of the query's instructions now | About a fifth | Moderate: the stored form of a row, the schema and the dump gain a field; rows grow by the prefix, which costs the count and the flag update part of their lead |
 | **Fewer allocations per row**: read a row's bytes from its page instead of copying them, decode into one buffer | Less work in every read, and less for threads to contend over in the allocator | The 15% lost after writes, and some more | Moderate: the row's lifetime runs through the executor |
 | **An allocator with larger per-thread caches** | The same contention, without touching the code | The 15% lost after writes | A dependency, where there are three; or a setting of the C library's, which only a container image can make |
 | **A preview column** kept by the application | No large value is read | A fifth, with nothing to build | None in the server; a column to maintain |

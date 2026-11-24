@@ -83,8 +83,11 @@ db.create_table_if_not_exists(
   after a whole character, so a start of 256 bytes holds between 64 and
   256 characters. Where a row has no room for all of it (a long key,
   many other columns) less is kept, or nothing. The setting is given
-  when the column is created, and a client from before it existed cannot
-  read the definition of a table that uses it.
+  when the column is created (`create_table` or `add_column`): a table
+  that exists already keeps its columns as they are, and
+  `create_table_if_not_exists` does not change them. A client from
+  before the setting existed cannot read the definition of a table that
+  uses it.
 - `describe()` returns every table as the server holds it. `add_column`
   adds a column to a table with rows; they read its default. Schema
   changes can run inside a transaction and roll back with it.

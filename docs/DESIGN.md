@@ -161,12 +161,17 @@ that is asked. Three rules keep this from changing anything else:
   row, and a row with a long key keeps a short one or none.
 - A row written again around a value that stays where it is (an update
   of another column) carries the reference over with its start, without
-  reading the value.
+  reading the value. A reference stored without a start (every one
+  written before the setting existed, and one written where the row had
+  no room) stays without one until the value itself is written again.
 
-The setting travels in the byte that ended a column's stored
-definition, once the flag for `auto_increment` alone: a definition that
-does not use it is stored, logged, dumped and sent byte for byte as it
-was, so files from before read as they did.
+A reference with a start has a tag of its own beside the plain one, so
+a row stored before reads as it did. The setting travels in the byte
+that ended a column's stored definition, once the flag for
+`auto_increment` alone: a definition that does not use it is stored,
+logged, dumped and sent byte for byte as it was, so files from before
+read as they did, and a server from before reads the files of a
+database that does not use the setting.
 
 ### The log (`wal.rs`)
 

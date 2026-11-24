@@ -41,7 +41,7 @@ db.transaction(|tx| async move {
 ## What it does
 
 - **What an ordinary web application asks of Postgres**, written down as
-  70 requirements (`docs/REQUIREMENTS.md`), each covered by tests that
+  71 requirements (`docs/REQUIREMENTS.md`), each covered by tests that
   cite it. Tables with defaults, checks and foreign keys; unique,
   partial, expression and multi-valued indexes; joins, subqueries and
   aggregates; upserts and compare-and-swap; JSON; exact decimals; trees;
