@@ -885,11 +885,11 @@ impl Tx {
         let mut found: Vec<(Vec<Value>, Vec<u8>, T)> = Vec::new();
         let stopped = Cell::new(false);
         for_each_match(&ctx, q, &Scope::default(), &stopped, &mut |scope, hit| {
-            if !seen.insert(hit.pk.clone()) {
+            if !seen.insert(hit.pk.to_vec()) {
                 return Ok(true);
             }
             let keys = q.order_by.iter().map(|o| eval(&ctx, scope, &o.expr)).collect::<Result<Vec<_>>>()?;
-            found.push((keys, hit.pk.clone(), per_row(&ctx, scope, hit)?));
+            found.push((keys, hit.pk.to_vec(), per_row(&ctx, scope, hit)?));
             Ok(!q.order_by.is_empty() || wanted.is_none_or(|w| (found.len() as u64) < w))
         })?;
         if !q.order_by.is_empty() {

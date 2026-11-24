@@ -29,9 +29,10 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 /// A row an access path produced.
-pub struct Hit {
-    /// The row's primary key, as stored.
-    pub pk: Vec<u8>,
+pub struct Hit<'a> {
+    /// The row's primary key, as stored: lent by whoever found the row,
+    /// and copied only by who keeps it.
+    pub pk: &'a [u8],
     pub row: Row,
     pub depth: Option<i64>,
     pub rank: Option<f64>,
@@ -115,6 +116,17 @@ fn range_bytes(ctx: &Ctx, scope: &Scope, range: &KeyRange, parts: &KeyParts) -> 
         }
         encode_prefix(values, parts).map(Some)
     };
+    // One key, or every key that starts with the same values, is asked
+    // for by giving them as both bounds: they are read and made into
+    // bytes once, and the end is what follows them.
+    if let (Bound::Included(lower), Bound::Included(upper)) = (&range.lower, &range.upper) {
+        if lower == upper {
+            return Ok(prefix(lower)?.map(|start| {
+                let end = keys::successor(&start);
+                (Some(start), end)
+            }));
+        }
+    }
     let start = match &range.lower {
         Bound::Unbounded => None,
         Bound::Included(exprs) => match prefix(exprs)? {
@@ -212,7 +224,7 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
             for range in ranges {
                 let Some((start, end)) = range_bytes(ctx, outer, range, parts)? else { continue };
                 let done = walk_range(ctx, table.root, start.as_deref(), end.as_deref(), *reverse, &mut |key, value| {
-                    on_hit(&Hit { pk: key.to_vec(), row: Row::parse(value.to_vec())?, depth: None, rank: None })
+                    on_hit(&Hit { pk: key, row: Row::parse(value.to_vec())?, depth: None, rank: None })
                 })?;
                 if !done {
                     return Ok(false);
@@ -238,7 +250,7 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
                             return Ok(true);
                         }
                     }
-                    on_hit(&Hit { pk: pk.to_vec(), row: fetch_indexed(ctx, table, pk)?, depth: None, rank: None })
+                    on_hit(&Hit { pk, row: fetch_indexed(ctx, table, pk)?, depth: None, rank: None })
                 })?;
                 if !done {
                     return Ok(false);
@@ -305,7 +317,7 @@ fn walk_tree(
         let Some(row) = fetch(ctx, table, &pk)? else { continue };
         let follow = !test(&row, stop, false)?;
         let next = link(&row)?;
-        if !on_hit(&Hit { pk, row, depth: Some(0), rank: None })? {
+        if !on_hit(&Hit { pk: &pk, row, depth: Some(0), rank: None })? {
             return Ok(false);
         }
         if follow {
@@ -324,7 +336,7 @@ fn walk_tree(
             seen.insert(pk.clone());
             let follow = !test(&row, stop, false)?;
             let next = link(&row)?;
-            if !on_hit(&Hit { pk, row, depth: Some(depth), rank: None })? {
+            if !on_hit(&Hit { pk: &pk, row, depth: Some(depth), rank: None })? {
                 return Ok(false);
             }
             if follow {
@@ -389,7 +401,7 @@ fn search(ctx: &Ctx, table: &Table, outer: &Scope, index: &str, prefix: &[Expr],
             ctx.check_deadline()?;
         }
         let row = fetch_indexed(ctx, table, &pk)?;
-        if !on_hit(&Hit { pk, row, depth: None, rank: Some(rank) })? {
+        if !on_hit(&Hit { pk: &pk, row, depth: None, rank: Some(rank) })? {
             return Ok(false);
         }
     }
@@ -419,7 +431,7 @@ pub fn for_each_match(ctx: &Ctx, q: &Query, outer: &Scope, stopped: &Cell<bool>,
     let table = table_of(ctx, &q.table)?;
     let alias = q.alias.as_deref().unwrap_or(&table.name);
     if q.table.is_empty() {
-        let hit = Hit { pk: Vec::new(), row: Row::from_values(&[]), depth: None, rank: None };
+        let hit = Hit { pk: &[], row: Row::from_values(&[]), depth: None, rank: None };
         let frame = [Frame { alias, table: &table, row: Some(&hit.row) }];
         let scope = Scope { frames: &frame, outer: Some(outer), ..Scope::default() };
         return join_level(ctx, q, 0, &scope, &hit, stopped, f);

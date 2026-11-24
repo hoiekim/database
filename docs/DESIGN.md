@@ -132,9 +132,13 @@ the same leading bytes.
 ### Rows (`row.rs`, `blob.rs`)
 
 A row is its column values in the protocol's encoding, with a count in
-front. A row read from disk is kept as bytes and each column is decoded
-when first asked for, so a query that selects two columns of a wide row
-pays for two.
+front. A row read from disk is kept as bytes, with where each column
+starts beside them, and a column is decoded when asked for, so a query
+that selects two columns of a wide row pays for two. Reading a row of
+up to fifteen columns is one allocation, for its bytes. A number or a
+text is made from them each time it is asked for, which costs what
+copying a kept value would; only a value that costs more to make (a
+document, a list, a large value) is kept once made.
 
 A value too large to share a page with its row (a long text) is moved to
 the table's tree of large values, cut into chunks keyed by `(id, chunk

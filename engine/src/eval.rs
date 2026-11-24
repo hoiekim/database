@@ -183,7 +183,7 @@ fn arithmetic(message: impl Into<String>) -> Error {
 pub fn frame_value(ctx: &Ctx, frame: &Frame, i: usize) -> Result<Value> {
     let Some(row) = frame.row else { return Ok(Value::Null) };
     Ok(match row.value(ctx.pages, frame.table.blobs, i)? {
-        Some(value) => value.clone(),
+        Some(value) => value,
         None => frame.table.cols[i].fill.clone(),
     })
 }

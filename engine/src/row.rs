@@ -45,47 +45,134 @@ fn malformed() -> Error {
     Error::corrupt("a stored row is malformed")
 }
 
-/// Moves the reader past one stored column.
-fn skip(r: &mut Reader) -> Option<()> {
-    match r.u8().ok()? {
-        codec::TAG_NULL | codec::TAG_FALSE | codec::TAG_TRUE => {}
+/// A count at `pos`, and where the bytes after it start. Nearly every
+/// count in a row is below 128 and takes one byte.
+fn count_at(raw: &[u8], mut pos: usize) -> Option<(usize, usize)> {
+    match *raw.get(pos)? {
+        short if short < 0x80 => Some((short as usize, pos + 1)),
+        _ => {
+            let n = crate::page::get_varint(raw, &mut pos)?;
+            Some((usize::try_from(n).ok()?, pos))
+        }
+    }
+}
+
+/// Where the stored column that starts at `pos` ends: `None` if it is
+/// not a column, or runs past the row. Every read of a row begins by
+/// finding its columns, so this is done on the bytes where they lie,
+/// with no reader between.
+fn skip(raw: &[u8], pos: usize) -> Option<usize> {
+    let after = pos + 1;
+    let end = match *raw.get(pos)? {
+        codec::TAG_NULL | codec::TAG_FALSE | codec::TAG_TRUE => after,
         codec::TAG_INT | codec::TAG_TIMESTAMP | codec::TAG_DATE => {
-            r.varint().ok()?;
+            let mut end = after;
+            crate::page::get_varint(raw, &mut end)?;
+            end
         }
-        codec::TAG_FLOAT => {
-            r.u64().ok()?;
-        }
-        codec::TAG_DECIMAL => {
-            r.u8().ok()?;
-            r.u64().ok()?;
-            r.u64().ok()?;
-        }
+        codec::TAG_FLOAT => after + 8,
+        codec::TAG_DECIMAL => after + 17,
+        codec::TAG_UUID => after + 16,
         codec::TAG_TEXT | codec::TAG_BYTES | codec::TAG_JSON => {
-            r.bytes().ok()?;
-        }
-        codec::TAG_UUID => {
-            r.u64().ok()?;
-            r.u64().ok()?;
+            let (n, at) = count_at(raw, after)?;
+            at.checked_add(n)?
         }
         codec::TAG_LIST => {
-            for _ in 0..r.count().ok()? {
-                skip(r)?;
+            let (n, mut at) = count_at(raw, after)?;
+            // An item takes a byte at least: more items than bytes left
+            // is a lie, and must not be walked.
+            if n > raw.len() - at {
+                return None;
             }
+            for _ in 0..n {
+                at = skip(raw, at)?;
+            }
+            at
         }
-        TAG_BLOB => {
-            r.u8().ok()?;
-            r.varint().ok()?;
-            r.varint().ok()?;
-        }
-        TAG_BLOB_START => {
-            r.u8().ok()?;
-            r.varint().ok()?;
-            r.varint().ok()?;
-            r.bytes().ok()?;
+        tag @ (TAG_BLOB | TAG_BLOB_START) => {
+            let mut end = after + 1;
+            crate::page::get_varint(raw, &mut end)?;
+            crate::page::get_varint(raw, &mut end)?;
+            if tag == TAG_BLOB_START {
+                let (n, at) = count_at(raw, end)?;
+                end = at.checked_add(n)?;
+            }
+            end
         }
         _ => return None,
+    };
+    (end <= raw.len()).then_some(end)
+}
+
+/// A value that is in its row, from its stored bytes. The kinds a row is
+/// mostly made of are read where they lie; the others by the codec, which
+/// reads them all and is the measure of what these must give.
+fn decode(col: &[u8]) -> Result<Value> {
+    let signed = |col: &[u8]| -> Option<i64> {
+        let mut pos = 1;
+        let v = crate::page::get_varint(col, &mut pos)?;
+        (pos == col.len()).then_some(((v >> 1) as i64) ^ -((v & 1) as i64))
+    };
+    let counted = |col: &'_ [u8]| -> Option<Vec<u8>> {
+        let (n, at) = count_at(col, 1)?;
+        (at.checked_add(n)? == col.len()).then(|| col[at..].to_vec())
+    };
+    let value = match *col.first().ok_or_else(malformed)? {
+        codec::TAG_NULL if col.len() == 1 => Some(Value::Null),
+        codec::TAG_FALSE if col.len() == 1 => Some(Value::Bool(false)),
+        codec::TAG_TRUE if col.len() == 1 => Some(Value::Bool(true)),
+        codec::TAG_INT => signed(col).map(Value::Int),
+        codec::TAG_TIMESTAMP => signed(col).map(Value::Timestamp),
+        codec::TAG_UUID => col[1..].try_into().ok().map(Value::Uuid),
+        codec::TAG_TEXT => counted(col).and_then(|bytes| String::from_utf8(bytes).ok()).map(Value::Text),
+        codec::TAG_BYTES => counted(col).map(Value::Bytes),
+        _ => {
+            let mut r = Reader::new(col);
+            codec::get_value(&mut r).ok().filter(|_| r.is_empty())
+        }
+    };
+    value.ok_or_else(malformed)
+}
+
+/// Whether a stored column's value costs more to make than to copy: one
+/// that is parsed (JSON), built of others (a list), or read from the
+/// blob tree. A row keeps such a value once it has made it.
+fn costly(col: &[u8]) -> bool {
+    matches!(col.first(), Some(&(codec::TAG_JSON | codec::TAG_LIST | TAG_BLOB | TAG_BLOB_START)))
+}
+
+/// A row of this many columns keeps their places in itself; one of more
+/// has a list of them made for it.
+const FEW: usize = 15;
+
+/// Where each stored column starts, and where the last one ends.
+enum Starts {
+    Few([u32; FEW + 1]),
+    Many(Vec<u32>),
+}
+
+impl Starts {
+    fn for_columns(n: usize) -> Starts {
+        if n <= FEW {
+            Starts::Few([0; FEW + 1])
+        } else {
+            Starts::Many(vec![0; n + 1])
+        }
     }
-    Some(())
+
+    fn set(&mut self, i: usize, at: usize) {
+        match self {
+            Starts::Few(starts) => starts[i] = at as u32,
+            Starts::Many(starts) => starts[i] = at as u32,
+        }
+    }
+
+    fn at(&self, i: usize) -> usize {
+        match self {
+            Starts::Few(starts) => starts[i] as usize,
+            Starts::Many(starts) => starts[i] as usize,
+        }
+    }
 }
 
 /// One column's stored bytes for a value kept inline.
@@ -257,35 +344,49 @@ pub fn fit<P: PagesMut>(p: &mut P, cols: &mut [Vec<u8>], budget: usize, blobs: &
 }
 
 /// A row read from a table, decoded column by column as each is asked for.
+///
+/// Reading a row allocates once, for its bytes. Where its columns are
+/// is kept in the row itself, and a value is made from the bytes each
+/// time it is asked for: for a number or a text that is no more than
+/// copying a value kept ready would be. Only what costs more to make
+/// (see `costly`) is kept.
 pub struct Row {
     raw: Vec<u8>,
-    /// Where each stored column starts, and where the last one ends.
-    starts: Vec<u32>,
-    values: Vec<OnceCell<Value>>,
+    /// How many columns the row was stored with.
+    cols: usize,
+    starts: Starts,
+    /// The costly values made so far, by column. Not made at all for a
+    /// row of which none is read.
+    made: OnceCell<Box<[OnceCell<Value>]>>,
 }
 
 impl Row {
     pub fn parse(raw: Vec<u8>) -> Result<Row> {
-        let mut r = Reader::new(&raw);
-        let n = r.count().map_err(|_| malformed())?;
-        let mut starts = Vec::with_capacity(n + 1);
-        for _ in 0..n {
-            starts.push(r.position() as u32);
-            skip(&mut r).ok_or_else(malformed)?;
-        }
-        starts.push(r.position() as u32);
-        if !r.is_empty() {
+        let (cols, mut pos) = count_at(&raw, 0).ok_or_else(malformed)?;
+        // A column takes a byte at least.
+        if cols > raw.len() - pos {
             return Err(malformed());
         }
-        let values = (0..n).map(|_| OnceCell::new()).collect();
-        Ok(Row { raw, starts, values })
+        let mut starts = Starts::for_columns(cols);
+        for i in 0..cols {
+            starts.set(i, pos);
+            pos = skip(&raw, pos).ok_or_else(malformed)?;
+        }
+        starts.set(cols, pos);
+        if pos != raw.len() {
+            return Err(malformed());
+        }
+        Ok(Row { raw, cols, starts, made: OnceCell::new() })
     }
 
     /// A row that was never stored, from its values.
     pub fn from_values(values: &[Value]) -> Row {
         let row = Row::build(values.len(), |i, out| codec::put_value(out, &values[i]));
-        for (cell, value) in row.values.iter().zip(values) {
-            let _ = cell.set(value.clone());
+        // What would be costly to make again from the bytes is at hand.
+        for (i, value) in values.iter().enumerate() {
+            if matches!(value, Value::Json(_) | Value::List(_)) {
+                let _ = row.made()[i].set(value.clone());
+            }
         }
         row
     }
@@ -296,17 +397,17 @@ impl Row {
         // Room for a row of ordinary size at once, not by doubling.
         let mut w = Writer::with_capacity(32 + 24 * n);
         w.varint(n as u64);
-        let mut starts = Vec::with_capacity(n + 1);
+        let mut starts = Starts::for_columns(n);
         for i in 0..n {
-            starts.push(w.buf.len() as u32);
+            starts.set(i, w.buf.len());
             column(i, &mut w);
         }
-        starts.push(w.buf.len() as u32);
-        Row {
-            raw: w.buf,
-            starts,
-            values: (0..n).map(|_| OnceCell::new()).collect(),
-        }
+        starts.set(n, w.buf.len());
+        Row { raw: w.buf, cols: n, starts, made: OnceCell::new() }
+    }
+
+    fn made(&self) -> &[OnceCell<Value>] {
+        self.made.get_or_init(|| (0..self.cols).map(|_| OnceCell::new()).collect())
     }
 
     /// The row as it is stored.
@@ -316,17 +417,17 @@ impl Row {
 
     /// The bytes its columns take, without the count before them.
     pub fn columns_len(&self) -> usize {
-        self.raw.len() - self.starts.first().map_or(0, |s| *s as usize)
+        self.raw.len() - self.starts.at(0)
     }
 
     /// How many columns the row was stored with.
     pub fn stored(&self) -> usize {
-        self.values.len()
+        self.cols
     }
 
     /// A column's stored bytes, if the row has that column.
     pub fn raw_col(&self, i: usize) -> Option<&[u8]> {
-        (i < self.stored()).then(|| &self.raw[self.starts[i] as usize..self.starts[i + 1] as usize])
+        (i < self.cols).then(|| &self.raw[self.starts.at(i)..self.starts.at(i + 1)])
     }
 
     pub fn blob(&self, i: usize) -> Option<BlobRef> {
@@ -348,10 +449,13 @@ impl Row {
 
     /// A stored column's value, reading it from the blob tree if it lives
     /// there. `None` if the row was stored before the column existed.
-    pub fn value<P: Pages + ?Sized>(&self, p: &P, blobs: PageId, i: usize) -> Result<Option<&Value>> {
-        let Some(cell) = self.values.get(i) else { return Ok(None) };
+    pub fn value<P: Pages + ?Sized>(&self, p: &P, blobs: PageId, i: usize) -> Result<Option<Value>> {
+        let Some(col) = self.raw_col(i) else { return Ok(None) };
+        if !costly(col) {
+            return decode(col).map(Some);
+        }
+        let cell = &self.made()[i];
         if cell.get().is_none() {
-            let col = self.raw_col(i).unwrap();
             let value = match decode_blob_ref(col) {
                 Some(blob) => {
                     let bytes = blob::read(p, blobs, blob.id, blob.len)?;
@@ -362,11 +466,11 @@ impl Row {
                         _ => codec::get_value(&mut Reader::new(&bytes)).map_err(|_| malformed())?,
                     }
                 }
-                None => codec::get_value(&mut Reader::new(col)).map_err(|_| malformed())?,
+                None => decode(col)?,
             };
             let _ = cell.set(value);
         }
-        Ok(cell.get())
+        Ok(cell.get().cloned())
     }
 
     /// The length in bytes of a text or bytes column, without reading a
@@ -425,6 +529,7 @@ impl Row {
 mod tests {
     use super::*;
     use crate::btree::tests::MemPages;
+    use crate::vfs::Rng;
     use crate::page::NO_PAGE;
     use serde_json::json;
 
@@ -452,13 +557,174 @@ mod tests {
         let row = Row::parse(assemble(&cols)).unwrap();
         assert_eq!(row.stored(), 12);
         for (i, want) in values().iter().enumerate() {
-            assert_eq!(row.value(&p, NO_PAGE, i).unwrap(), Some(want));
+            assert_eq!(row.value(&p, NO_PAGE, i).unwrap().as_ref(), Some(want));
+            assert_eq!(row.value(&p, NO_PAGE, i).unwrap().as_ref(), Some(want), "and when asked again");
             assert_eq!(row.blob(i), None);
         }
         assert_eq!(row.value(&p, NO_PAGE, 12).unwrap(), None, "a column added later");
+        // A row made of values reads as the same row read from its bytes.
+        let made = Row::from_values(&values());
+        assert_eq!(made.raw(), row.raw());
+        for (i, want) in values().iter().enumerate() {
+            assert_eq!(made.value(&p, NO_PAGE, i).unwrap().as_ref(), Some(want));
+        }
         assert_eq!(row.octet_length(2), Some(6));
         assert_eq!(row.octet_length(0), None);
         assert_eq!(row.byte_range(&p, NO_PAGE, 2, 1, 2).unwrap(), Some("é".as_bytes().to_vec()));
+    }
+
+    /// Where a stored column ends, found by the codec's own reader: slow,
+    /// and what `skip` must agree with on every column, and on bytes that
+    /// are none.
+    fn skip_by_reader(r: &mut Reader) -> Option<()> {
+        match r.u8().ok()? {
+            codec::TAG_NULL | codec::TAG_FALSE | codec::TAG_TRUE => {}
+            codec::TAG_INT | codec::TAG_TIMESTAMP | codec::TAG_DATE => {
+                r.varint().ok()?;
+            }
+            codec::TAG_FLOAT => {
+                r.u64().ok()?;
+            }
+            codec::TAG_DECIMAL => {
+                r.u8().ok()?;
+                r.u64().ok()?;
+                r.u64().ok()?;
+            }
+            codec::TAG_TEXT | codec::TAG_BYTES | codec::TAG_JSON => {
+                r.bytes().ok()?;
+            }
+            codec::TAG_UUID => {
+                r.u64().ok()?;
+                r.u64().ok()?;
+            }
+            codec::TAG_LIST => {
+                for _ in 0..r.count().ok()? {
+                    skip_by_reader(r)?;
+                }
+            }
+            TAG_BLOB => {
+                r.u8().ok()?;
+                r.varint().ok()?;
+                r.varint().ok()?;
+            }
+            TAG_BLOB_START => {
+                r.u8().ok()?;
+                r.varint().ok()?;
+                r.varint().ok()?;
+                r.bytes().ok()?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// Where a row's columns start and the last one ends, by the reader.
+    fn starts_by_reader(raw: &[u8]) -> Option<Vec<usize>> {
+        let mut r = Reader::new(raw);
+        let n = r.count().ok()?;
+        let mut starts = Vec::new();
+        for _ in 0..n {
+            starts.push(r.position());
+            skip_by_reader(&mut r)?;
+        }
+        starts.push(r.position());
+        r.is_empty().then_some(starts)
+    }
+
+    fn random_text(rng: &mut Rng) -> String {
+        let alphabet = ["a", "Z", " ", "é", "ß", "日", "本", "📧", "\u{0}", "\u{7f}"];
+        (0..rng.below(40)).map(|_| alphabet[rng.below(alphabet.len() as u64) as usize]).collect()
+    }
+
+    fn random_value(rng: &mut Rng, depth: u32) -> Value {
+        let extreme = [0, 1, -1, 63, 64, -64, -65, i64::MAX, i64::MIN, 1 << 40];
+        let int = |rng: &mut Rng| if rng.chance(3) { extreme[rng.below(extreme.len() as u64) as usize] } else { rng.next() as i64 >> rng.below(64) };
+        match rng.below(if depth == 0 { 11 } else { 13 }) {
+            0 => Value::Null,
+            1 => Value::Bool(rng.chance(2)),
+            2 => Value::Int(int(rng)),
+            3 => Value::Float(int(rng) as f64 / 7.0),
+            4 => Value::Decimal(database_protocol::decimal::Decimal::new(i128::from(int(rng)), rng.below(10) as u8)),
+            5 => Value::Text(random_text(rng)),
+            6 => Value::Bytes((0..rng.below(300)).map(|_| rng.next() as u8).collect()),
+            7 => Value::Uuid(std::array::from_fn(|_| rng.next() as u8)),
+            8 => Value::Timestamp(int(rng)),
+            9 => Value::Date(int(rng) as i32),
+            10 => Value::Text(String::new()),
+            11 => Value::Json(json!({"n": int(rng), "s": random_text(rng), "list": [1, null, {"deep": true}]})),
+            _ => Value::List((0..rng.below(5)).map(|_| random_value(rng, depth - 1)).collect()),
+        }
+    }
+
+    #[test]
+    fn columns_are_found_and_made_as_the_codec_finds_and_makes_them() {
+        let p = MemPages::new();
+        let mut rng = Rng::new(11);
+        for round in 0..3_000 {
+            // Rows of few columns and of many, of every kind of value,
+            // with a reference to a value kept elsewhere now and then.
+            let values: Vec<Value> = (0..rng.below(if round % 10 == 0 { 60 } else { 12 })).map(|_| random_value(&mut rng, 2)).collect();
+            let mut cols: Vec<Vec<u8>> = values.iter().map(encode_value).collect();
+            let mut references = Vec::new();
+            for (i, col) in cols.iter_mut().enumerate() {
+                if rng.chance(8) {
+                    let start: Vec<u8> = (0..rng.below(3) * rng.below(200)).map(|_| rng.next() as u8).collect();
+                    *col = encode_blob_ref(BlobRef { tag: codec::TAG_BYTES, id: rng.next() >> rng.below(64), len: rng.next() >> rng.below(64) }, &start);
+                    references.push(i);
+                }
+            }
+            let raw = assemble(&cols);
+            let row = Row::parse(raw.clone()).unwrap();
+            assert_eq!(row.stored(), values.len());
+            for (i, want) in values.iter().enumerate() {
+                assert_eq!(row.raw_col(i), Some(&cols[i][..]));
+                if !references.contains(&i) {
+                    assert_eq!(row.value(&p, NO_PAGE, i).unwrap().as_ref(), Some(want), "column {i} of {values:?}");
+                }
+            }
+            assert_eq!(Row::from_values(&values).raw(), assemble(&values.iter().map(encode_value).collect::<Vec<_>>()));
+
+            // The same bytes damaged: a byte changed, some cut off, some
+            // added. Whether they are still a row, and where its columns
+            // then are, is what the reader says; and a column that can
+            // still be read gives what the codec makes of its bytes.
+            for _ in 0..12 {
+                let mut bad = raw.clone();
+                match rng.below(4) {
+                    0 => bad.truncate(rng.below(bad.len() as u64 + 1) as usize),
+                    1 => bad.extend((0..1 + rng.below(3)).map(|_| rng.next() as u8)),
+                    _ => {
+                        for _ in 0..1 + rng.below(3) {
+                            if !bad.is_empty() {
+                                let at = rng.below(bad.len() as u64) as usize;
+                                bad[at] = if rng.chance(2) { rng.next() as u8 } else { bad[at] ^ (1 << rng.below(8)) };
+                            }
+                        }
+                    }
+                }
+                let by_reader = starts_by_reader(&bad);
+                let Ok(row) = Row::parse(bad.clone()) else {
+                    assert_eq!(by_reader, None, "{bad:?} is a row to the reader");
+                    continue;
+                };
+                let starts = by_reader.unwrap_or_else(|| panic!("{bad:?} is no row to the reader"));
+                assert_eq!(row.stored() + 1, starts.len());
+                for i in 0..row.stored() {
+                    let col = &bad[starts[i]..starts[i + 1]];
+                    assert_eq!(row.raw_col(i), Some(col));
+                    if blob_parts(col).is_some() {
+                        continue;
+                    }
+                    let mut r = Reader::new(col);
+                    let by_codec = codec::get_value(&mut r).ok().filter(|_| r.is_empty());
+                    match (row.value(&p, NO_PAGE, i), by_codec) {
+                        (Ok(Some(made)), Some(want)) => assert!(made.same(&want) || made == want, "{col:?}: {made:?} for {want:?}"),
+                        (Err(_), None) => {}
+                        (made, want) => panic!("{col:?}: {made:?} where the codec gives {want:?}"),
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -479,7 +745,7 @@ mod tests {
         assert_eq!(row.blob(1).unwrap().len, body.len() as u64);
         assert_eq!(row.blob(2), None, "small values stay in the row");
         for (i, want) in all.iter().enumerate() {
-            assert_eq!(row.value(&p, blobs, i).unwrap(), Some(want));
+            assert_eq!(row.value(&p, blobs, i).unwrap().as_ref(), Some(want));
         }
         // Length and ranges of the body, without the body.
         assert_eq!(row.octet_length(1), Some(50_002));
@@ -521,7 +787,7 @@ mod tests {
         }
 
         fn value(&self, row: &Row, i: usize) -> Value {
-            row.value(&self.p, self.blobs, i).unwrap().unwrap().clone()
+            row.value(&self.p, self.blobs, i).unwrap().unwrap()
         }
     }
 
