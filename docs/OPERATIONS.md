@@ -186,13 +186,14 @@ docker rm -f drill
   milliseconds or more:
 
   ```text
-  database: slow: 153 ms, database "shop", client "shop-web": query mails by the whole table, filtered, limit 50: read 0 index entries and 98112 rows
+  database: slow: 153 ms, database "shop", client "shop-web": query "mails" by the whole table, filtered, limit 50: read 0 index entries and 98112 rows
   ```
 
   How long it took, on which database, for which client (the `name` of
   its URL), what the statement was, and how much it read to answer. The
   statement is described by its table, its way in and its clauses,
-  never by its values. For a statement on its own and for a batch the
+  never by its values. Names are written quoted and escaped, as the
+  client sent them, so each line of the log is one line. For a statement on its own and for a batch the
   time includes the wait for the write lock and for the disk. In a
   transaction those waits are the `begin`'s and the `commit`'s, which
   are timed and logged as statements are: a `begin` line is a wait for

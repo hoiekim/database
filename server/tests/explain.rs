@@ -235,6 +235,13 @@ async fn a_slow_statement_is_written_to_the_log_with_what_it_read() -> DbResult<
     db.batch(Batch::new().add(Query::table("notes").key([2])).add(Query::table("owners"))).await?;
     let by_body = Prepared::new(Query::table("notes").index("notes_owner_day", KeyRange::eq([param(0)])).filter(col("body").eq(param(1))));
     db.execute(&by_body, [Value::from(5), Value::from("secret-parameter-value")]).await?;
+    // A statement can name what does not exist, and the name is then
+    // whatever the client sent: here, one that tries to end the line and
+    // begin another.
+    let forged = "notes\ndatabase: slow: 9 ms, database \"forged\"";
+    assert!(db.query(Query::table(forged)).await.is_err());
+    assert!(db.query(Query::table("notes").index(forged, KeyRange::eq([1]))).await.is_err());
+    assert!(db.insert(Insert::into(forged).columns(["id"]).values([val(1)])).await.is_err());
     drop(db);
     // Asked to stop, the server ends its log.
     server.stop();
@@ -243,24 +250,30 @@ async fn a_slow_statement_is_written_to_the_log_with_what_it_read() -> DbResult<
     let find = |what: &str| slow.iter().find(|line| line.contains(what)).unwrap_or_else(|| panic!("no line about {what:?} in {slow:#?}"));
 
     // Who, what, and what it read.
-    let scan = find("query notes by the whole table, filtered");
+    let scan = find("query \"notes\" by the whole table, filtered");
     assert!(scan.contains("database \"test\", client \"the test\""), "{scan}");
     assert!(scan.ends_with("read 0 index entries and 1000 rows"), "{scan}");
-    let joined = find("query notes by index notes_owner_day, 1 joined, sorted, limit 5");
+    let joined = find("query \"notes\" by index \"notes_owner_day\", 1 joined, sorted, limit 5");
     assert!(joined.ends_with("read 50 index entries and 100 rows"), "{joined}");
-    let update = find("update notes by index notes_owner_day");
+    let update = find("update \"notes\" by index \"notes_owner_day\"");
     assert!(update.contains("read 50 index entries"), "{update}");
-    find("delete from notes by its primary key");
+    find("delete from \"notes\" by its primary key");
     let batch = find("batch of 2 statements");
     assert!(batch.ends_with("read 0 index entries and 21 rows"), "{batch}");
-    find("insert into notes, 250 rows");
-    let prepared = find("query notes by index notes_owner_day, filtered");
+    find("insert into \"notes\", 250 rows");
+    let prepared = find("query \"notes\" by index \"notes_owner_day\", filtered");
     assert!(prepared.ends_with("read 50 index entries and 50 rows"), "{prepared}");
     // A transaction's begin and its commit can be what was slow (the wait
     // for the write lock, the wait for the disk), and have lines of
     // their own.
     find(": begin: ");
     find(": commit: ");
+    // A name is written quoted and escaped, so it stays inside its line:
+    // every line of the log is one the server wrote.
+    find(r#"query "notes\ndatabase: slow: 9 ms, database \"forged\"" by the whole table"#);
+    find(r#"by index "notes\ndatabase: slow: 9 ms, database \"forged\"""#);
+    find(r#"insert into "notes\ndatabase: slow: 9 ms, database \"forged\"", 1 rows"#);
+    assert!(lines.iter().all(|line| !line.contains("database \"forged\"") && !line.starts_with("database: slow: 9 ms")), "{lines:#?}");
     // Never a statement's values: not what it filters by, not what it
     // writes, not what a prepared one is run with.
     for line in &lines {

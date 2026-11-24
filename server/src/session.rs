@@ -680,17 +680,19 @@ fn batch_read(db: &Arc<Database>, parts: &[Part], deadline: Option<Instant>) -> 
 }
 
 /// A statement in a few words, for the log: what it is, on which table
-/// and by which way in, never its values.
+/// and by which way in, never its values. A statement can name a table
+/// or an index that does not exist, so a name is whatever a client sent:
+/// it is written quoted, with anything that would end the line escaped.
 fn shape(request: &Request) -> String {
     fn query(q: &Query) -> String {
         let way = match &q.access {
             Access::Primary { ranges, .. } if ranges.iter().any(|r| matches!((&r.lower, &r.upper), (Bound::Unbounded, Bound::Unbounded))) => "the whole table".to_string(),
             Access::Primary { .. } => "its primary key".to_string(),
-            Access::Index { index, .. } => format!("index {index}"),
+            Access::Index { index, .. } => format!("index {index:?}"),
             Access::Walk { .. } => "a tree walk".to_string(),
-            Access::Search { index, .. } => format!("a search of {index}"),
+            Access::Search { index, .. } => format!("a search of {index:?}"),
         };
-        let mut out = format!("{} by {way}", if q.table.is_empty() { "no table" } else { &q.table });
+        let mut out = if q.table.is_empty() { format!("no table by {way}") } else { format!("{:?} by {way}", q.table) };
         if !q.joins.is_empty() {
             out.push_str(&format!(", {} joined", q.joins.len()));
         }
@@ -708,8 +710,8 @@ fn shape(request: &Request) -> String {
     match request {
         Request::Query(q) => format!("query {}", query(q)),
         Request::Insert(insert) => match &insert.source {
-            InsertSource::Values(rows) => format!("insert into {}, {} rows", insert.table, rows.len()),
-            InsertSource::Query(q) => format!("insert into {} from {}", insert.table, query(q)),
+            InsertSource::Values(rows) => format!("insert into {:?}, {} rows", insert.table, rows.len()),
+            InsertSource::Query(q) => format!("insert into {:?} from {}", insert.table, query(q)),
         },
         Request::Update(update) => format!("update {}", query(&update.rows)),
         Request::Delete(delete) => format!("delete from {}", query(&delete.rows)),
