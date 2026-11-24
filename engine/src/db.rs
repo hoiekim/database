@@ -115,6 +115,9 @@ fn data_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.db"))
 }
 
+/// Ends the name a data file is made under, before it is whole.
+pub const CREATING: &str = "--creating";
+
 fn random_uuid() -> [u8; 16] {
     use std::io::Read;
     let mut bytes = [0u8; 16];
@@ -183,10 +186,20 @@ impl Database {
         let uuid = random_uuid();
         // Log files left by an earlier database of this name are not ours.
         wal::remove_logs(&*vfs, dir, name, |_| true)?;
-        let file = vfs.open(&path, true)?;
+        // The data file is made under another name and given its own
+        // only when it is whole and on disk. A process killed before
+        // that leaves a file the next start sweeps away; under its own
+        // name, a file without a header would be a database that cannot
+        // be opened, and a server that cannot start.
+        let making = dir.join(format!("{name}{CREATING}.db"));
+        if vfs.exists(&making) {
+            vfs.remove(&making)?;
+        }
+        let file = vfs.open(&making, true)?;
         let store = Arc::new(Store::create(file, cache, store_id, uuid, options.limits)?);
-        vfs.sync_dir(dir)?;
         let wal = Wal::create(vfs.clone(), dir, name, uuid, 1, 0, options.sync)?;
+        vfs.rename(&making, &path)?;
+        vfs.sync_dir(dir)?;
         let catalog = Catalog { next_table_id: 1, ..Catalog::default() };
         Ok(Self::assemble(vfs, dir, name, store, wal, 0, catalog, options))
     }
@@ -212,22 +225,49 @@ impl Database {
             changed = true;
         }
         // A log file is synced whole before the next is begun, so only
-        // the newest can end in a torn record. Records in a file after
-        // one that ended torn mean commits were lost in between, and
-        // applying the later ones without them would give a database
-        // that never existed.
+        // the newest can end in a torn record, or short of where its
+        // records ended when the next was begun, which the next one
+        // says. Records in a file after one that did mean commits were
+        // lost in between, and applying the later ones without them
+        // would give a database that never existed.
+        let gap = |damaged: u64| Error::corrupt(format!("log file {damaged} of database {name:?} is damaged before its end, and commits were made after it"));
         let mut torn: Option<u64> = None;
+        // The file before: its generation, and where its records ended
+        // if it held any.
+        let mut before: Option<(u64, u64)> = None;
         for generation in &generations {
-            let end = wal::replay(&*vfs, dir, name, &meta.uuid, *generation, &mut |record| {
+            let mut records = 0u64;
+            let read = wal::replay(&*vfs, dir, name, &meta.uuid, *generation, &mut |record| {
                 if let Some(damaged) = torn {
-                    return Err(Error::corrupt(format!("log file {damaged} of database {name:?} is damaged before its end, and commits were made after it")));
+                    return Err(gap(damaged));
                 }
+                records += 1;
                 changed = true;
-                tx.replay(record)
+                // A record applied once when it was committed. If it does
+                // not apply now, the data file is not the one it was
+                // logged against: a disk lost pages it said were synced.
+                tx.replay(record).map_err(|e| match e {
+                    Error::Io(_) | Error::Corrupt(_) => e,
+                    other => Error::corrupt(format!("log file {generation} of database {name:?} does not apply to its data file: {other}")),
+                })
             })?;
-            if end == wal::End::Torn {
+            if read.after > 0 {
+                let whole = match before {
+                    Some((it, ended)) if it + 1 == *generation => ended == read.after,
+                    // Not there: removed, if the checkpoint covers it.
+                    _ => *generation <= meta.wal_gen,
+                };
+                if !whole {
+                    if records > 0 {
+                        return Err(gap(generation - 1));
+                    }
+                    torn.get_or_insert(generation - 1);
+                }
+            }
+            if read.end == wal::End::Torn {
                 torn.get_or_insert(*generation);
             }
+            before = Some((*generation, if records > 0 { read.at } else { 0 }));
         }
         let mut version = meta.version;
         let Tx { writer, catalog, .. } = tx;
@@ -239,7 +279,8 @@ impl Database {
             writer.rollback();
         }
         let next_generation = generations.last().map_or(meta.wal_gen, |g| g + 1).max(meta.wal_gen);
-        let wal = Wal::create(vfs.clone(), dir, name, meta.uuid, next_generation, version, options.sync)?;
+        let previous = before.filter(|(it, _)| it + 1 == next_generation).map_or(0, |(_, ended)| ended);
+        let wal = Wal::create_after(vfs.clone(), dir, name, meta.uuid, next_generation, version, options.sync, previous)?;
         let db = Self::assemble(vfs.clone(), dir, name, store, wal, version, catalog, options);
         if changed {
             // Put what was replayed into the data file now, so the log
@@ -492,13 +533,16 @@ impl Database {
 
     /// Deletes the database's files. The caller makes sure nobody uses it.
     pub fn destroy(vfs: &dyn Vfs, dir: &Path, name: &str) -> Result<()> {
-        wal::remove_logs(vfs, dir, name, |_| true)?;
+        // The data file goes first, and with it the database. Stopped
+        // between the two, a server that had removed the log first would
+        // start with the database back, as of its last checkpoint and
+        // without the commits made since.
         let path = data_path(dir, name);
         if vfs.exists(&path) {
             vfs.remove(&path)?;
+            vfs.sync_dir(dir)?;
         }
-        vfs.sync_dir(dir)?;
-        Ok(())
+        wal::remove_logs(vfs, dir, name, |_| true)
     }
 
     /// Reads every page and checks that the trees, the indexes and the
@@ -506,6 +550,11 @@ impl Database {
     pub fn check(self: &Arc<Self>) -> Result<String> {
         let _one = self.checkpointing.lock().unwrap();
         let _guard = self.lock_writes(Duration::from_secs(3600))?;
+        // After a disk error the files are as the last sync left them,
+        // but what is held in memory may be a commit or a checkpoint
+        // half made: there is nothing here to check until a restart has
+        // read the files again.
+        self.check_failed()?;
         let latest = self.latest.lock().unwrap().clone();
         let pages: &dyn Pages = &*self.store;
         let mut used: HashSet<PageId> = HashSet::new();
@@ -539,7 +588,7 @@ impl Database {
             }
             let mut stored: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
             btree::walk(pages, table.blobs, &mut |id| claim(id, &table.name), &mut |key, value| {
-                let id = u64::from_be_bytes(key[..8].try_into().map_err(|_| Error::corrupt("a large value's key is malformed"))?);
+                let id = u64::from_be_bytes(key.get(..8).and_then(|id| id.try_into().ok()).ok_or_else(|| Error::corrupt("a large value's key is malformed"))?);
                 *stored.entry(id).or_insert(0) += value.len() as u64;
                 Ok(())
             })?;
