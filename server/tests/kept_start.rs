@@ -296,3 +296,60 @@ async fn a_start_is_kept_only_where_it_can_be() -> DbResult<()> {
     db.admin().check().await?;
     Ok(())
 }
+
+/// Sends frames as they are and reads one answer to each, as the bytes
+/// that came back.
+async fn raw_frames(port: u16, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut answers = Vec::new();
+    for frame in frames {
+        stream.write_all(&(frame.len() as u32).to_le_bytes()).await.unwrap();
+        stream.write_all(frame).await.unwrap();
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).await.unwrap();
+        let mut answer = vec![0u8; u32::from_le_bytes(len) as usize];
+        stream.read_exact(&mut answer).await.unwrap();
+        answers.push(answer);
+    }
+    answers
+}
+
+// R-T10
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_older_than_the_setting_is_described_its_tables_without_it() -> DbResult<()> {
+    use database_protocol::message::{decode_response, encode_request, encode_response, Request, Response, COLUMN_FLAGS_VERSION, OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION};
+    let (server, db) = fresh().await;
+    db.create_table(notes("kept", 256)).await?;
+    db.create_table(notes("plain", 0)).await?;
+    let hello = |version: u32| encode_request(&Request::Hello { version, database: "test".into(), password: PASSWORD.into(), client: "raw".into() }, 0);
+    let describe = encode_request(&Request::Describe, 0);
+    // Described inside a transaction too, which answers by another path.
+    let begin = encode_request(&Request::Begin { kind: database_protocol::message::TxnKind::Read, lock_wait_ms: 0 }, 0);
+
+    for version in OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION {
+        let answers = raw_frames(server.port, &[hello(version), describe.clone(), begin.clone(), describe.clone()]).await;
+        for frame in [&answers[1], &answers[3]] {
+            let Ok(Response::Tables(tables)) = decode_response(frame) else { panic!("version {version}: {:?}", decode_response(frame)) };
+            let kept = tables.iter().find(|t| t.name == "kept").expect("the table");
+            let settings: Vec<u32> = kept.columns.iter().map(|c| c.keep_start).collect();
+            if version >= COLUMN_FLAGS_VERSION {
+                assert_eq!(settings, [0, 0, 256, 256], "version {version}");
+            } else {
+                // Nothing of the setting, and the bytes are the
+                // description of a table that never had it: each column
+                // ends in the auto_increment flag, 0 or 1, as it always
+                // did (see codec.rs's test of the old encoding).
+                assert_eq!(settings, [0, 0, 0, 0], "version {version}");
+                let plain_kept = notes("kept", 0);
+                let as_if_plain: Vec<_> = tables.iter().map(|t| if t.name == "kept" { plain_kept.clone() } else { t.clone() }).collect();
+                assert_eq!(*frame, encode_response(&Response::Tables(as_if_plain)), "version {version}");
+            }
+        }
+    }
+    // The rows read the same whoever asks: the setting changes only where
+    // the values are stored.
+    let n = fill(&db, "kept").await?;
+    assert_eq!(db.query(Query::table("kept").select("head", col("body").left(10))).await?.len() as i64, n);
+    Ok(())
+}

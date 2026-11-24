@@ -220,6 +220,22 @@ A copy of the directory taken while the server is **stopped** is a
 complete backup. A copy taken while it runs is not guaranteed to be
 (the data file and the log are read at different moments): use `dump`.
 
+A database with a column that keeps the start of its large values in
+its rows (`keep_start`, `CLIENT.md`) is stored in a form that a build
+from before that setting cannot read. Such a build refuses to start on
+the directory, and so serves none of its databases:
+
+```text
+database: cannot start: corrupt database: the stored catalog is damaged: malformed message: flag is neither 0 nor 1
+```
+
+It refuses a dump of such a database in the same way (`the dump cannot
+be loaded: a record is malformed`) and restores none of it. It never
+reads such a database wrongly. A database whose columns keep no start
+is stored as before, and either build reads it. To go back to an older
+build, give each such table a copy without the setting, with the newer
+build, before taking the dump.
+
 ## Memory
 
 The server's memory is the page cache plus a part in proportion to it:

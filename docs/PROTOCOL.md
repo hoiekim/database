@@ -531,6 +531,10 @@ TableDef:
   volatile      bool                  rows need not survive a restart
 
 ColumnDef:   name str, type Type, nullable bool, default opt(Expr), auto_increment bool
+             from version 5, the last field is flags u8 in place of auto_increment:
+               bit 0  auto_increment
+               bit 1  keep_start varint follows: bytes of a large value's start kept in its row
+             a server sends a column with bit 1 set only to a client that said 5 or more
 
 IndexDef:
   name     str
@@ -751,6 +755,15 @@ are not to be used for anything else:
 
 A version 2 client never sends the first two, and reads the third as it
 reads any code it does not know: as `Internal`.
+
+**Version 5** changes one thing a client reads: the last byte of a
+`ColumnDef` is a byte of flags, bit 0 `auto_increment` and bit 1 a
+`keep_start` varint after it (see "Definitions"). A column without
+`keep_start` is the same bytes in every version. A server describes its
+tables to a client that said less than 5 with `keep_start` left out, so
+such a client never meets the bit; the setting changes where a server
+stores values, not what any request answers. A client of any version
+may send a column with `keep_start` in `CreateTable` or `AddColumn`.
 
 **What a client does with what it does not know:**
 

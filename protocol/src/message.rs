@@ -18,8 +18,17 @@ use crate::value::Value;
 /// What a client says it speaks, in its `Hello`: bumped when a frame's
 /// meaning changes, or when the client comes to send something an older
 /// server would not know (version 3: `Prepared`, `BeginWith`, `Batch`,
-/// `Expr::Param`; version 4: `Explain`).
-pub const PROTOCOL_VERSION: u32 = 4;
+/// `Expr::Param`; version 4: `Explain`; version 5: see
+/// `COLUMN_FLAGS_VERSION`).
+pub const PROTOCOL_VERSION: u32 = 5;
+
+/// From this version a column's last byte is a byte of flags, and a
+/// column may carry `keep_start` after it (`codec::put_column`). A
+/// server describes its tables to an older client with `keep_start`
+/// cleared, so that each column is the bytes that client has always
+/// read: the setting changes where values are stored, never what a
+/// query answers.
+pub const COLUMN_FLAGS_VERSION: u32 = 5;
 
 /// The oldest version a server still answers. Everything a client of
 /// that version sends means what it meant, so a server is upgraded
