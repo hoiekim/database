@@ -61,7 +61,7 @@ services:
     # On the host's loopback only, if at all.
     ports:
       - "127.0.0.1:5454:5454"
-    mem_limit: 128m
+    mem_limit: 192m
 
   shop:
     image: example/shop
@@ -179,12 +179,16 @@ The server's memory is the page cache plus a part in proportion to it:
 | Requests and results in flight | their size |
 
 An idle server with nothing cached holds about 3 MB. Under the
-benchmark's load (`bench/`) it moves between 60 and 110 MB: about 60 in
-use, and the rest freed memory that the allocator has not yet returned
-(the server asks it to every five seconds while requests arrive). A
-container limit of 128 MB fits that load; give it 192 MB if requests or
-rows of many megabytes are common, and raise `DATABASE_CACHE_MB` only if
-`stats` shows many disk reads for the working set.
+benchmark's load (`bench/`) it holds 45 to 50 MB once the load has
+passed, and at most 130 to 150 MB while four connections load megabyte
+statements into a table with a full-text index: the cache, the requests
+and their log records in flight, and freed memory that the allocator
+has not yet returned (the server asks it to every five seconds while
+requests arrive). A container limit of 128 MB fits ordinary requests;
+give it 192 MB if requests or rows of a megabyte and more are common,
+and raise `DATABASE_CACHE_MB` only if `stats` shows many disk reads for
+the working set. A transaction that runs beside other writers keeps at
+most about a megabyte of its own before it takes the write lock.
 
 The largest single request or result is 256 MiB, and it is held in
 memory while it is handled. A text of tens of megabytes works; a habit

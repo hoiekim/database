@@ -76,42 +76,43 @@ server its default 32 MB cache. One run on a 4-core machine:
 
 | | this | Postgres 16 |
 |---|---:|---:|
-| Memory idle | 3.3 MB | 46.3 MB |
-| Memory after the run | 99.4 MB | 155.0 MB |
-| CPU for the whole run | 90.0 s | 120.3 s |
-| Data files on disk | 626 MB | 1,152 MB |
+| Memory idle | 3.5 MB | 46.0 MB |
+| Memory after the run | 45.9 MB | 152.3 MB |
+| CPU for the whole run | 58.9 s | 120.6 s |
+| Data files on disk | 641 MB | 1,142 MB |
 
 | Workload | this ÷ Postgres |
 |---|---:|
-| Count over 5,000 rows | 2.38× |
-| Full-text search | 2.28× |
-| Flag update by key | 2.06× |
-| Durable upsert (8 connections) | 1.07× |
-| Session lookup (16 connections) | 0.91× |
-| Session lookup (1 connection) | 0.89× |
-| Durable insert (16 connections) | 0.88× |
-| Durable insert (1 connection) | 0.82× |
-| Mailbox page: newest 50, with a preview of each body | 0.67× |
-| Unlogged upsert (8 connections) | 0.57× |
-| Bulk load of 100,000 mails | 0.39× |
-| Transaction of several requests (8 connections) | 0.32× |
+| Count over 5,000 rows | 3.08× |
+| Flag update by key | 2.53× |
+| Full-text search | 2.51× |
+| Session lookup (16 connections) | 1.06× |
+| Transaction of several requests, all on one row (8 connections) | 0.98× |
+| Durable upsert (8 connections) | 0.97× |
+| Durable insert (1 connection) | 0.93× |
+| Transaction of several requests (8 connections) | 0.91× |
+| Durable insert (16 connections) | 0.86× |
+| Session lookup (1 connection) | 0.85× |
+| Unlogged upsert (8 connections) | 0.80× |
+| Bulk load of 100,000 mails | 0.73× |
+| Mailbox page: newest 50, with a preview of each body | 0.70× |
 
-It uses less memory, CPU and disk, and is faster where it reads many
-rows, searches text or updates in place. It is within a fifth of
-Postgres, mostly just behind, on point lookups and durable writes. And
-it is well **behind** in four places, each a consequence of the design:
+It uses a third of the memory and half the CPU and disk, and is faster
+where it reads many rows, searches text or updates in place. On point
+lookups, durable writes and transactions it is within about a tenth of
+Postgres, on either side from run to run. It is **behind** in three
+places:
 
-- **A transaction of several requests** holds the database's one write
-  turn from `begin` to `commit`, round trips included.
-- **Unlogged upserts** from many connections queue for that same turn.
 - **A page of mails with a preview of each body** makes a second lookup
   per mail, because large values live outside their rows.
 - **A bulk load** is one writer keeping a full-text index current at
-  every commit.
+  every commit, where Postgres has a process per connection.
+- **Unlogged upserts** from many connections are written one at a time,
+  each a new version of the database.
 
 `docs/PERFORMANCE.md` has the full table, what was traced and profiled
-to explain each gap, and the options for closing it with what each would
-cost.
+to explain each gap, what has been done about them so far, and the
+options for what is left with what each would cost.
 
 ## Layout
 
@@ -142,9 +143,10 @@ The tests, by what they prove:
 |---|---|
 | `server/tests/scenario_*.rs` | the requirements as four kinds of application use them (an identity service, a mail store, a document workspace, a personal-finance ledger), against a real server over TCP (236 tests) |
 | `server/tests/acid.rs` | atomicity, isolation, once-only races, savepoints, lock and statement timeouts |
+| `server/tests/optimistic.rs` | transactions that run beside other writers: committed as they stand, run again, or in conflict; what they were told is what is stored |
 | `server/tests/durability.rs` | a server killed with `SIGKILL` under load, six times over, loses nothing acknowledged; memory stays bounded with data many times the cache |
 | `server/tests/operations.rs` | dump under load, restore, a damaged dump refused, passwords, restarts |
-| `engine/tests/recovery.rs` | a random workload on a simulated disk that loses power at any write, keeping, dropping or tearing each unsynced write; after every cut the database equals a model of what was committed |
+| `engine/tests/recovery.rs` | a random workload on a simulated disk that loses power at any write, keeping, dropping or tearing each unsynced write, with transactions open beside the writer; after every cut the database equals a model of what was committed and no page is lost |
 
 ## Running
 
