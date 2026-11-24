@@ -30,7 +30,7 @@ mod config;
 mod conn;
 mod row;
 
-pub use client::{Admin, Batch, Client, Db, LockGuard, Prepared, Statement, Transaction};
+pub use client::{Admin, Batch, Client, Db, Explained, LockGuard, Prepared, Statement, Transaction};
 pub use config::{Config, DEFAULT_PORT};
 pub use row::{FromRow, Row, Rows};
 

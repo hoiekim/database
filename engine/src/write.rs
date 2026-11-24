@@ -25,7 +25,7 @@ use crate::blob;
 use crate::btree::{self, Cursor};
 use crate::catalog::{plain_columns, Catalog, Table, TableMeta};
 use crate::error::{Error, Result};
-use crate::eval::{eval, frame_value, holds, Ctx, Frame, Scope, Tape};
+use crate::eval::{eval, frame_value, holds, Cost, Ctx, Frame, Scope, Tape};
 use crate::exec::{self, encode_prefix, entry_pk, fetch, for_each_match, index_parts, pk_parts};
 use crate::fts;
 use crate::keys;
@@ -59,6 +59,8 @@ pub struct Tx {
     pub tape: Tape,
     /// The values the statement being run was given for its parameters.
     pub params: Vec<Value>,
+    /// What its statements have read since it was last asked.
+    pub cost: Cost,
     /// The tables it has made, which nobody else can see until it commits.
     created: Vec<u32>,
 }
@@ -198,11 +200,11 @@ fn unique_holder(ctx: &Ctx, table: &Table, i: usize, entry: &Entry, own_pk: &[u8
 
 impl Tx {
     pub fn new(writer: Writer, catalog: Catalog, now: i64) -> Tx {
-        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), params: Vec::new(), created: Vec::new() }
+        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), params: Vec::new(), cost: Cost::default(), created: Vec::new() }
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape), params: &self.params }
+        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape), params: &self.params, cost: &self.cost }
     }
 
     fn table(&self, name: &str) -> Result<Arc<Table>> {

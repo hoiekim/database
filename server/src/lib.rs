@@ -55,6 +55,10 @@ pub struct ServerConfig {
     /// without sending anything before the server rolls it back and
     /// closes the connection. It holds every other writer up meanwhile.
     pub idle_transaction: Duration,
+    /// A statement that takes this long or longer is written to the
+    /// server's log (standard error) with what it read: see
+    /// `session::slow`. `None` logs none.
+    pub slow_statement: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -68,6 +72,7 @@ impl ServerConfig {
             sync: true,
             lock_wait: Duration::from_secs(30),
             idle_transaction: Duration::from_secs(60),
+            slow_statement: None,
         }
     }
 }

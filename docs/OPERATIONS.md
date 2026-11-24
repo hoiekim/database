@@ -27,6 +27,7 @@ database stats
 | `DATABASE_LISTEN` | `0.0.0.0:5454` | address to listen on |
 | `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well (see "On the same host") |
 | `DATABASE_CACHE_MB` | `32` | memory for cached pages (see "Memory") |
+| `DATABASE_SLOW_MS` | (none) | log every statement that takes this many milliseconds or more (see "Checking") |
 
 It recovers every database in the data directory, then listens. On
 `SIGTERM` or `SIGINT` it stops taking connections, lets requests in
@@ -180,6 +181,24 @@ docker rm -f drill
 - `database checkpoint`: writes everything committed into the data
   files now and empties the logs. Never needed; useful before copying
   the files of a stopped server.
+- **Slow statements.** With `DATABASE_SLOW_MS=100` the server writes a
+  line to its log (standard error) for every statement that takes 100
+  milliseconds or more:
+
+  ```text
+  database: slow: 153 ms, database "shop", client "shop-web": query mails by the whole table, filtered, limit 50: read 0 index entries and 98112 rows
+  ```
+
+  How long it took (waiting for the write lock and for the disk
+  included), on which database, for which client (the `name` of its
+  URL), what the statement was, and how much it read to answer. The
+  statement is described by its table, its way in and its clauses,
+  never by its values. There is no planner whose choice could be at
+  fault: a statement is slow because of what its own access path made
+  the server read, and the two counts say which it was. This one read
+  the whole table to return 50 rows, and wants an index range. The
+  same counts for any query, slow or not, are `db.explain(query)`
+  (`CLIENT.md`).
 
 ## Files
 

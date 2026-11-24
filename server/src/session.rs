@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use database_engine::db::{Database, ReadTxn, WriteTxn};
 use database_engine::dump::{self, Restore};
-use database_engine::eval::Drawn;
+use database_engine::eval::{Drawn, Read};
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::message::*;
 use database_protocol::query::{Access, Bound, InsertSource, Query};
@@ -203,6 +203,10 @@ struct Session {
     kept_bytes: usize,
     /// How many times a kept statement has been asked for.
     uses: u64,
+    /// What the client called itself in its greeting, for the log.
+    client: String,
+    /// What the statement being answered has read.
+    read: Read,
     /// The named locks this connection holds.
     held: Vec<String>,
     restore: Option<(mpsc::Sender<Vec<u8>>, RestoreTask)>,
@@ -312,6 +316,8 @@ where
         kept: HashMap::new(),
         kept_bytes: 0,
         uses: 0,
+        client: String::new(),
+        read: Read::default(),
         held: Vec::new(),
         restore: None,
     };
@@ -320,7 +326,10 @@ where
     let hello = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut reader, GREETING_FRAME)).await;
     let greeted = match hello {
         Ok(Ok(Some(frame))) => match decode_request(&frame) {
-            Ok((Request::Hello { version, database, password, .. }, _)) => session.greet(version, database, &password),
+            Ok((Request::Hello { version, database, password, client }, _)) => {
+                session.client = client;
+                session.greet(version, database, &password)
+            }
             Ok(_) => Err(DbError::new(ErrorCode::InvalidRequest, "the first request must be a greeting")),
             Err(e) => Err(e),
         },
@@ -480,6 +489,14 @@ fn not_a_statement() -> DbError {
     DbError::invalid("that request is not a statement")
 }
 
+/// Only a query is run to be explained: a write would take effect.
+fn explainable(statement: &Stmt) -> DbResult<()> {
+    match *statement.request {
+        Request::Query(_) => Ok(()),
+        _ => Err(DbError::invalid("only a query can be explained: explaining runs the statement, and a write would take effect")),
+    }
+}
+
 /// Whether a statement names its rows by their primary keys, a few of
 /// them.
 fn by_key(q: &Query) -> bool {
@@ -571,20 +588,22 @@ fn lone_write(
     statement: &mut Stmt,
     deadline: Option<Instant>,
     wait: Duration,
-) -> (DbResult<Vec<Response>>, u64) {
+) -> (DbResult<Vec<Response>>, u64, Read) {
     let mut txn = match begin_write(db, wait, false) {
         Ok(txn) => txn,
-        Err(e) => return (Err(e), 0),
+        Err(e) => return (Err(e), 0, Read::default()),
     };
     let base = txn.base();
-    match run_write(&mut txn, statement, deadline) {
+    let outcome = run_write(&mut txn, statement, deadline);
+    let read = txn.take_read();
+    match outcome {
         Ok(responses) => match txn.commit_start() {
-            Ok(committed) => (Ok(responses), committed.map_or(base, |c| c.version())),
-            Err(e) => (Err(e.into_db()), base),
+            Ok(committed) => (Ok(responses), committed.map_or(base, |c| c.version()), read),
+            Err(e) => (Err(e.into_db()), base, read),
         },
         Err(e) => {
             drop(txn);
-            (Err(e), base)
+            (Err(e), base, read)
         }
     }
 }
@@ -622,10 +641,10 @@ fn part_answer(n: usize, part: &Part, answer: DbResult<Vec<Response>>) -> DbResu
 
 /// Runs a batch as a transaction of its own, with the turn held: every
 /// statement, then the commit, or nothing. Returns as `lone_write` does.
-fn batch_write(db: &Arc<Database>, parts: &mut [Part], deadline: Option<Instant>, wait: Duration) -> (DbResult<Vec<Response>>, u64) {
+fn batch_write(db: &Arc<Database>, parts: &mut [Part], deadline: Option<Instant>, wait: Duration) -> (DbResult<Vec<Response>>, u64, Read) {
     let mut txn = match begin_write(db, wait, false) {
         Ok(txn) => txn,
-        Err(e) => return (Err(e), 0),
+        Err(e) => return (Err(e), 0, Read::default()),
     };
     let base = txn.base();
     let mut responses = Vec::with_capacity(parts.len());
@@ -634,25 +653,69 @@ fn batch_write(db: &Arc<Database>, parts: &mut [Part], deadline: Option<Instant>
         match part_answer(n, part, answer) {
             Ok(answer) => responses.extend(answer),
             Err(e) => {
+                let read = txn.take_read();
                 drop(txn);
-                return (Err(e), base);
+                return (Err(e), base, read);
             }
         }
     }
+    let read = txn.take_read();
     match txn.commit_start() {
-        Ok(committed) => (Ok(responses), committed.map_or(base, |c| c.version())),
-        Err(e) => (Err(e.into_db()), base),
+        Ok(committed) => (Ok(responses), committed.map_or(base, |c| c.version()), read),
+        Err(e) => (Err(e.into_db()), base, read),
     }
 }
 
 /// Runs a batch that only reads: every query sees the same moment.
-fn batch_read(db: &Arc<Database>, parts: &[Part], deadline: Option<Instant>) -> DbResult<Vec<Response>> {
+fn batch_read(db: &Arc<Database>, parts: &[Part], deadline: Option<Instant>) -> (DbResult<Vec<Response>>, Read) {
     let txn = db.begin_read();
     let mut responses = Vec::with_capacity(parts.len());
     for (n, part) in parts.iter().enumerate() {
-        responses.extend(part_answer(n, part, run_read(&txn, &part.stmt, deadline))?);
+        match part_answer(n, part, run_read(&txn, &part.stmt, deadline)) {
+            Ok(answer) => responses.extend(answer),
+            Err(e) => return (Err(e), txn.take_read()),
+        }
     }
-    Ok(responses)
+    (Ok(responses), txn.take_read())
+}
+
+/// A statement in a few words, for the log: what it is, on which table
+/// and by which way in, never its values.
+fn shape(request: &Request) -> String {
+    fn query(q: &Query) -> String {
+        let way = match &q.access {
+            Access::Primary { ranges, .. } if ranges.iter().any(|r| matches!((&r.lower, &r.upper), (Bound::Unbounded, Bound::Unbounded))) => "the whole table".to_string(),
+            Access::Primary { .. } => "its primary key".to_string(),
+            Access::Index { index, .. } => format!("index {index}"),
+            Access::Walk { .. } => "a tree walk".to_string(),
+            Access::Search { index, .. } => format!("a search of {index}"),
+        };
+        let mut out = format!("{} by {way}", if q.table.is_empty() { "no table" } else { &q.table });
+        if !q.joins.is_empty() {
+            out.push_str(&format!(", {} joined", q.joins.len()));
+        }
+        for (has, what) in [(q.filter.is_some(), "filtered"), (q.is_aggregate(), "grouped"), (!q.order_by.is_empty(), "sorted")] {
+            if has {
+                out.push_str(", ");
+                out.push_str(what);
+            }
+        }
+        if let Some(limit) = q.limit {
+            out.push_str(&format!(", limit {limit}"));
+        }
+        out
+    }
+    match request {
+        Request::Query(q) => format!("query {}", query(q)),
+        Request::Insert(insert) => match &insert.source {
+            InsertSource::Values(rows) => format!("insert into {}, {} rows", insert.table, rows.len()),
+            InsertSource::Query(q) => format!("insert into {} from {}", insert.table, query(q)),
+        },
+        Request::Update(update) => format!("update {}", query(&update.rows)),
+        Request::Delete(delete) => format!("delete from {}", query(&delete.rows)),
+        Request::Ddl(_) => "schema change".to_string(),
+        _ => "statement".to_string(),
+    }
 }
 
 /// Commits a fork, with the turn held: as it stands if nothing has been
@@ -844,10 +907,17 @@ impl Session {
                 if self.txn.is_some() {
                     return Err(already_open());
                 }
+                // The first statement may be one to explain.
+                let (statement, explain) = match *statement {
+                    Request::Explain(statement) => (*statement, true),
+                    statement => (statement, false),
+                };
                 // Refused before anything begins, a statement that is not
                 // kept can simply be sent again.
-                let statement = self.resolve(*statement)?;
-                if !is_statement(&statement.request) {
+                let statement = self.resolve(statement)?;
+                if explain {
+                    explainable(&statement)?;
+                } else if !is_statement(&statement.request) {
                     return Err(not_a_statement());
                 }
                 if let Err(e) = self.begin(kind, Duration::from_millis(lock_wait_ms)).await {
@@ -856,9 +926,25 @@ impl Session {
                     self.txn = Some(Txn::Dead(e.clone()));
                     return Err(e);
                 }
-                self.statement(statement, deadline).await
+                if explain {
+                    self.explain(statement, deadline).await
+                } else {
+                    self.timed(statement, deadline).await
+                }
             }
-            Request::Batch(items) => self.batch(items, deadline).await,
+            Request::Batch(items) => {
+                let started = Instant::now();
+                self.read = Read::default();
+                let statements = items.len();
+                let answer = self.batch(items, deadline).await;
+                self.slow(started, || format!("batch of {statements} statements"));
+                answer
+            }
+            Request::Explain(statement) => {
+                let statement = self.resolve(*statement)?;
+                explainable(&statement)?;
+                self.explain(statement, deadline).await
+            }
             Request::Commit => match self.txn.take() {
                 Some(Txn::Write(txn, turn)) => {
                     let db = self.database()?;
@@ -891,9 +977,57 @@ impl Session {
             Request::Admin(admin) => self.admin(admin).await,
             statement => {
                 let statement = self.resolve(statement)?;
-                self.statement(statement, deadline).await
+                self.timed(statement, deadline).await
             }
         }
+    }
+
+    /// Runs a query and answers with what it read: see `Request::Explain`.
+    async fn explain(&mut self, statement: Stmt, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
+        let started = Instant::now();
+        let answer = self.timed(statement, deadline).await?;
+        let micros = started.elapsed().as_micros() as i64;
+        let returned = match answer.first() {
+            Some(Response::Rows { set, .. }) => set.affected,
+            _ => 0,
+        };
+        let figures = [self.read.entries as i64, self.read.rows as i64, returned as i64, micros];
+        Ok(rows(RowSet { columns: EXPLAIN_COLUMNS.iter().map(|c| c.to_string()).collect(), rows: vec![figures.into_iter().map(Value::Int).collect()], affected: 1, total: None }))
+    }
+
+    /// Runs a statement, noting what it read, and says so in the log if
+    /// it was slow.
+    async fn timed(&mut self, statement: Stmt, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
+        let started = Instant::now();
+        self.read = Read::default();
+        // Described before it runs, since running it gives it away; and
+        // only where slow statements are logged at all.
+        let described = self.state.config.slow_statement.map(|_| shape(&statement.request));
+        let answer = self.statement(statement, deadline).await;
+        self.slow(started, || described.unwrap_or_default());
+        answer
+    }
+
+    /// Writes a line to the server's log about what has just been
+    /// answered, if it took as long as the server was told to call slow:
+    /// how long it took, for whom, what it was and what it read. What it
+    /// read is what there is to explain it by: an index range that takes
+    /// in too much, a filter over a whole table.
+    fn slow(&self, started: Instant, what: impl FnOnce() -> String) {
+        let Some(limit) = self.state.config.slow_statement else { return };
+        let took = started.elapsed();
+        if took < limit {
+            return;
+        }
+        let client = if self.client.is_empty() { String::new() } else { format!(", client {:?}", self.client) };
+        eprintln!(
+            "database: slow: {} ms, database {:?}{client}: {}: read {} index entries and {} rows",
+            took.as_millis(),
+            self.name,
+            what(),
+            self.read.entries,
+            self.read.rows
+        );
     }
 
     /// Starts a transaction on the connection, which has none.
@@ -984,7 +1118,9 @@ impl Session {
             parts.push(Part { stmt, expect: item.expect });
         }
         if parts.iter().all(|part| matches!(*part.stmt.request, Request::Query(_))) {
-            return blocking(move || batch_read(&db, &parts, deadline)).await?;
+            let (result, read) = blocking(move || batch_read(&db, &parts, deadline)).await?;
+            self.read = read;
+            return result;
         }
         let wait = self.state.config.lock_wait;
         let brief = self.request_bytes <= BRIEF_BYTES
@@ -993,7 +1129,7 @@ impl Session {
                 Request::Query(q) => by_key(q),
                 other => brief(other, part.stmt.bytes),
             });
-        let (result, version) = if brief {
+        let (result, version, read) = if brief {
             let db = db.clone();
             // The statements come back with the outcome, to be taken
             // apart here and not while the turn is held.
@@ -1011,6 +1147,7 @@ impl Session {
             drop(turn);
             outcome
         };
+        self.read = read;
         durable(&db, version).await?;
         result
     }
@@ -1042,12 +1179,17 @@ impl Session {
             let quick = started + QUICK;
             if deadline.is_none_or(|d| d > quick) {
                 let params = &mut statement.params;
-                let tried = match &mut self.txn {
-                    Some(Txn::Read(txn)) => txn.query_within(q, params, quick),
-                    Some(Txn::Write(txn, _)) => query_within(txn, q, params, quick),
-                    Some(Txn::Fork(fork)) => query_within(&mut fork.txn, q, params, quick),
+                // What the try read is the statement's count if the try
+                // is its answer, and forgotten if it is begun again.
+                let (tried, read) = match &mut self.txn {
+                    Some(Txn::Read(txn)) => (txn.query_within(q, params, quick), txn.take_read()),
+                    Some(Txn::Write(txn, _)) => (query_within(txn, q, params, quick), txn.take_read()),
+                    Some(Txn::Fork(fork)) => (query_within(&mut fork.txn, q, params, quick), fork.txn.take_read()),
                     Some(Txn::Dead(_)) => unreachable!("answered above"),
-                    None => db.begin_read().query_within(q, params, quick),
+                    None => {
+                        let txn = db.begin_read();
+                        (txn.query_within(q, params, quick), txn.take_read())
+                    }
                 };
                 let outcome: Option<DbResult<Vec<Response>>> = match tried {
                     Ok(Some(set)) => Some(Ok(rows(set))),
@@ -1055,6 +1197,7 @@ impl Session {
                     Err(e) => Some(Err(e.into_db())),
                 };
                 if let Some(outcome) = outcome {
+                    self.read = read;
                     if let Some(Txn::Fork(fork)) = &mut self.txn {
                         fork.record(statement, &outcome, started.elapsed());
                     }
@@ -1076,6 +1219,7 @@ impl Session {
                     })
                     .await?
                 };
+                self.read = fork.txn.take_read();
                 fork.record(statement, &result, started.elapsed());
                 self.txn = Some(Txn::Fork(fork));
                 result
@@ -1096,6 +1240,11 @@ impl Session {
                     })
                     .await?
                 };
+                self.read = match &txn {
+                    Txn::Read(txn) => txn.take_read(),
+                    Txn::Write(txn, _) => txn.take_read(),
+                    Txn::Fork(_) | Txn::Dead(_) => Read::default(),
+                };
                 self.txn = Some(txn);
                 result
             }
@@ -1103,7 +1252,7 @@ impl Session {
             // its turn, runs, and answers once it is on disk.
             None if is_write(&statement.request) => {
                 let wait = self.state.config.lock_wait;
-                let (result, version) = if brief {
+                let (result, version, read) = if brief {
                     let db = db.clone();
                     // The request comes back with the outcome, to be
                     // taken apart here and not while the turn is held.
@@ -1122,10 +1271,20 @@ impl Session {
                     drop(turn);
                     outcome
                 };
+                self.read = read;
                 durable(&db, version).await?;
                 result
             }
-            None => blocking(move || run_read(&db.begin_read(), &statement, deadline)).await?,
+            None => {
+                let (result, read) = blocking(move || {
+                    let txn = db.begin_read();
+                    let result = run_read(&txn, &statement, deadline);
+                    (result, txn.take_read())
+                })
+                .await?;
+                self.read = read;
+                result
+            }
         }
     }
 
