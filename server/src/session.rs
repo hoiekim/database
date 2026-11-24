@@ -726,7 +726,7 @@ fn commit_fork(
     db: &Arc<Database>,
     fork: Fork,
     deadline: Option<Instant>,
-) -> (DbResult<()>, u64) {
+) -> (DbResult<()>, u64, Read) {
     let (outcome, how) = commit_fork_as(db, fork, deadline);
     if let Some(how) = how {
         state.forks[how].fetch_add(1, Ordering::Relaxed);
@@ -743,7 +743,7 @@ fn commit_fork_as(
     db: &Arc<Database>,
     fork: Fork,
     deadline: Option<Instant>,
-) -> ((DbResult<()>, u64), Option<usize>) {
+) -> ((DbResult<()>, u64, Read), Option<usize>) {
     let (outcome, how) = commit_fork_how(db, fork, deadline);
     let how = match (&outcome.0, how) {
         (Ok(()), how) => Some(how),
@@ -757,20 +757,22 @@ fn commit_fork_how(
     db: &Arc<Database>,
     fork: Fork,
     deadline: Option<Instant>,
-) -> ((DbResult<()>, u64), usize) {
+) -> ((DbResult<()>, u64, Read), usize) {
     let Fork {
         mut txn,
         mut steps,
         wait,
         ..
     } = fork;
+    // Committed as it stands, the commit itself reads nothing.
+    let nothing = Read::default();
     match attach(&mut txn, wait) {
-        Err(e) => return ((Err(e), 0), AS_IT_STOOD),
+        Err(e) => return ((Err(e), 0, nothing), AS_IT_STOOD),
         Ok(true) => {
             let base = txn.base();
             let outcome = match txn.commit_start() {
-                Ok(committed) => (Ok(()), committed.map_or(base, |c| c.version())),
-                Err(e) => (Err(e.into_db()), base),
+                Ok(committed) => (Ok(()), committed.map_or(base, |c| c.version()), nothing),
+                Err(e) => (Err(e.into_db()), base, nothing),
             };
             return (outcome, AS_IT_STOOD);
         }
@@ -780,18 +782,21 @@ fn commit_fork_how(
     drop(txn);
     let mut again = match begin_write(db, wait, false) {
         Ok(txn) => txn,
-        Err(e) => return ((Err(e), 0), RUN_AGAIN),
+        Err(e) => return ((Err(e), 0, nothing), RUN_AGAIN),
     };
     again.set_now(now);
     let base = again.base();
-    let outcome = match replay(&mut again, &mut steps, deadline) {
+    let replayed = replay(&mut again, &mut steps, deadline);
+    // Run again, the commit read what its statements read once more.
+    let read = again.take_read();
+    let outcome = match replayed {
         Ok(()) => match again.commit_start() {
-            Ok(committed) => (Ok(()), committed.map_or(base, |c| c.version())),
-            Err(e) => (Err(e.into_db()), base),
+            Ok(committed) => (Ok(()), committed.map_or(base, |c| c.version()), read),
+            Err(e) => (Err(e.into_db()), base, read),
         },
         Err(e) => {
             drop(again);
-            (Err(e), base)
+            (Err(e), base, read)
         }
     };
     (outcome, RUN_AGAIN)
@@ -900,36 +905,54 @@ impl Session {
                 if self.txn.is_some() {
                     return Err(already_open());
                 }
-                self.begin(kind, Duration::from_millis(lock_wait_ms)).await?;
+                // A begin that waited for the write lock is as slow as a
+                // statement that did.
+                let started = Instant::now();
+                self.read = Read::default();
+                let begun = self.begin(kind, Duration::from_millis(lock_wait_ms)).await;
+                self.slow(started, || "begin".to_string());
+                begun?;
                 Ok(vec![Response::Ok])
             }
             Request::BeginWith { kind, lock_wait_ms, statement } => {
                 if self.txn.is_some() {
                     return Err(already_open());
                 }
+                // What the begin waits for, the write lock, is part of what
+                // its first statement took.
+                let started = Instant::now();
                 // The first statement may be one to explain.
                 let (statement, explain) = match *statement {
                     Request::Explain(statement) => (*statement, true),
                     statement => (statement, false),
                 };
-                // Refused before anything begins, a statement that is not
-                // kept can simply be sent again.
-                let statement = self.resolve(statement)?;
-                if explain {
-                    explainable(&statement)?;
-                } else if !is_statement(&statement.request) {
-                    return Err(not_a_statement());
-                }
-                if let Err(e) = self.begin(kind, Duration::from_millis(lock_wait_ms)).await {
-                    // The statement was meant for a transaction, and so is
-                    // whatever follows it: none of it may run outside one.
-                    self.txn = Some(Txn::Dead(e.clone()));
-                    return Err(e);
-                }
-                if explain {
-                    self.explain(statement, deadline).await
-                } else {
-                    self.timed(statement, deadline).await
+                // The client takes it that a transaction is open from
+                // here on, whatever this answers, and sends the rest of
+                // the transaction's statements as such. So a refusal, of
+                // the statement or of the begin, leaves a dead transaction
+                // that can only be ended: nothing sent after it may run
+                // outside the transaction it was meant for. The one
+                // exception is a statement the connection does not keep:
+                // that is said before anything begins, the client sends
+                // the same request again with the statement, and it is
+                // that one which begins the transaction.
+                let allowed = match self.resolve(statement) {
+                    Err(e) if e.code == ErrorCode::NotPrepared => return Err(e),
+                    Ok(statement) if explain => explainable(&statement).map(|()| statement),
+                    Ok(statement) if !is_statement(&statement.request) => Err(not_a_statement()),
+                    other => other,
+                };
+                let begun = match allowed {
+                    Ok(statement) => self.begin(kind, Duration::from_millis(lock_wait_ms)).await.map(|()| statement),
+                    Err(e) => Err(e),
+                };
+                match begun {
+                    Ok(statement) if explain => self.explain(started, statement, deadline).await,
+                    Ok(statement) => self.timed(started, statement, deadline).await,
+                    Err(e) => {
+                        self.txn = Some(Txn::Dead(e.clone()));
+                        Err(e)
+                    }
                 }
             }
             Request::Batch(items) => {
@@ -943,24 +966,18 @@ impl Session {
             Request::Explain(statement) => {
                 let statement = self.resolve(*statement)?;
                 explainable(&statement)?;
-                self.explain(statement, deadline).await
+                self.explain(Instant::now(), statement, deadline).await
             }
-            Request::Commit => match self.txn.take() {
-                Some(Txn::Write(txn, turn)) => {
-                    let db = self.database()?;
-                    let committed = txn.commit_start().map_err(|e| e.into_db())?;
-                    // The next writer may start while this reaches the disk.
-                    drop(turn);
-                    if let Some(committed) = committed {
-                        durable(&db, committed.version()).await?;
-                    }
-                    Ok(vec![Response::Ok])
-                }
-                Some(Txn::Fork(fork)) => self.commit_fork(*fork, deadline).await,
-                Some(Txn::Read(_)) => Ok(vec![Response::Ok]),
-                Some(Txn::Dead(e)) => Err(e),
-                None => Err(DbError::new(ErrorCode::TransactionAborted, "no transaction is open")),
-            },
+            Request::Commit => {
+                // A commit waits for the disk, and an optimistic one may
+                // first wait for its turn and run its statements again:
+                // it can be what was slow, and is logged as one is.
+                let started = Instant::now();
+                self.read = Read::default();
+                let committed = self.commit(deadline).await;
+                self.slow(started, || "commit".to_string());
+                committed
+            }
             Request::Rollback => {
                 if let Some(txn) = self.txn.take() {
                     // Dropping it gives pages back: off the async thread.
@@ -977,15 +994,14 @@ impl Session {
             Request::Admin(admin) => self.admin(admin).await,
             statement => {
                 let statement = self.resolve(statement)?;
-                self.timed(statement, deadline).await
+                self.timed(Instant::now(), statement, deadline).await
             }
         }
     }
 
     /// Runs a query and answers with what it read: see `Request::Explain`.
-    async fn explain(&mut self, statement: Stmt, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
-        let started = Instant::now();
-        let answer = self.timed(statement, deadline).await?;
+    async fn explain(&mut self, started: Instant, statement: Stmt, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
+        let answer = self.timed(started, statement, deadline).await?;
         let micros = started.elapsed().as_micros() as i64;
         let returned = match answer.first() {
             Some(Response::Rows { set, .. }) => set.affected,
@@ -996,9 +1012,8 @@ impl Session {
     }
 
     /// Runs a statement, noting what it read, and says so in the log if
-    /// it was slow.
-    async fn timed(&mut self, statement: Stmt, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
-        let started = Instant::now();
+    /// it was slow, counting from `started`.
+    async fn timed(&mut self, started: Instant, statement: Stmt, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
         self.read = Read::default();
         // Described before it runs, since running it gives it away; and
         // only where slow statements are logged at all.
@@ -1028,6 +1043,26 @@ impl Session {
             self.read.entries,
             self.read.rows
         );
+    }
+
+    /// Commits the connection's transaction, of whatever kind.
+    async fn commit(&mut self, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
+        match self.txn.take() {
+            Some(Txn::Write(txn, turn)) => {
+                let db = self.database()?;
+                let committed = txn.commit_start().map_err(|e| e.into_db())?;
+                // The next writer may start while this reaches the disk.
+                drop(turn);
+                if let Some(committed) = committed {
+                    durable(&db, committed.version()).await?;
+                }
+                Ok(vec![Response::Ok])
+            }
+            Some(Txn::Fork(fork)) => self.commit_fork(*fork, deadline).await,
+            Some(Txn::Read(_)) => Ok(vec![Response::Ok]),
+            Some(Txn::Dead(e)) => Err(e),
+            None => Err(DbError::new(ErrorCode::TransactionAborted, "no transaction is open")),
+        }
     }
 
     /// Starts a transaction on the connection, which has none.
@@ -1309,7 +1344,7 @@ impl Session {
             return Ok(vec![Response::Ok]);
         }
         let wait = fork.wait;
-        let (result, version) = if fork.spent <= BRIEF_FORK {
+        let (result, version, read) = if fork.spent <= BRIEF_FORK {
             let (db, state) = (db.clone(), self.state.clone());
             self.in_turn(wait, move || commit_fork(&state, &db, fork, deadline))
                 .await?
@@ -1320,6 +1355,7 @@ impl Session {
             drop(turn);
             outcome
         };
+        self.read = read;
         durable(&db, version).await?;
         result.map(|()| vec![Response::Ok])
     }
@@ -1364,6 +1400,9 @@ impl Session {
             let mut again = begin_write(&db, wait, true)?;
             again.set_now(now);
             replay(&mut again, &mut steps, deadline)?;
+            // What running it again read was counted when each statement
+            // first ran: it is not the next statement's to report.
+            again.take_read();
             Ok::<_, DbError>(again)
         })
         .await??;

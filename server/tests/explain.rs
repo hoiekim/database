@@ -61,6 +61,35 @@ impl Drop for Process {
     }
 }
 
+/// Starts the server as its own process on an empty directory, with
+/// `DATABASE_SLOW_MS` set to `slow` if that is given, and a client on a
+/// new database named `test`. The server's log is gathered to be read
+/// once it has stopped.
+async fn logged(dir: &TempDir, slow: Option<&str>) -> (Process, std::thread::JoinHandle<Vec<String>>, Client) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_database"));
+    command.arg("serve").env("DATABASE_DATA", dir.path()).env("DATABASE_LISTEN", format!("127.0.0.1:{port}")).env("DATABASE_ADMIN_PASSWORD", ADMIN_PASSWORD).env_remove("DATABASE_SLOW_MS").stderr(Stdio::piped());
+    if let Some(slow) = slow {
+        command.env("DATABASE_SLOW_MS", slow);
+    }
+    let mut server = Process(command.spawn().expect("the server binary starts"));
+    let log = server.0.stderr.take().unwrap();
+    let lines = std::thread::spawn(move || BufReader::new(log).lines().map_while(Result::ok).collect::<Vec<String>>());
+    let admin = loop {
+        let mut config = Config::new("127.0.0.1", port, "", ADMIN_PASSWORD);
+        config.connect_timeout = Duration::from_secs(2);
+        match Client::connect(config).await {
+            Ok(admin) => break admin,
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    };
+    admin.admin().create_database("test", PASSWORD).await.expect("the database is created");
+    let mut config = Config::new("127.0.0.1", port, "test", PASSWORD);
+    config.name = "the test".to_string();
+    let db = Client::connect(config).await.expect("the client connects");
+    (server, lines, db)
+}
+
 fn read(e: Explained) -> (u64, u64, u64) {
     (e.index_entries, e.rows_read, e.rows_returned)
 }
@@ -161,55 +190,59 @@ async fn explaining_runs_only_queries_and_changes_nothing() -> DbResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_run_again_does_not_count_twice() -> DbResult<()> {
+    // R-O7
+    let (server, db) = fresh().await;
+    notes(&db).await?;
+    let other = server.client("test").await;
+    // An optimistic transaction reads 250 rows in five queries. Another
+    // writer commits beside it. Its next statement is too large to run
+    // beside the others, so the transaction becomes the writer first:
+    // its five queries are run again on the newest version, to see that
+    // they answer as they did.
+    let tx = db.begin_optimistic().await?;
+    for _ in 0..5 {
+        assert_eq!(tx.query(Query::table("notes").index("notes_owner_day", KeyRange::eq([3]))).await?.len(), 50);
+    }
+    other.insert(Insert::into("owners").set("id", 50).set("name", "a newcomer")).await?;
+    let large = Query::table("notes").key([7]).filter(col("body").ne("x".repeat(70_000)));
+    // What that second run read is not this statement's to report.
+    assert_eq!(read(tx.explain(large).await?), (0, 1, 1));
+    assert_eq!(read(tx.explain(Query::table("notes").key([8])).await?), (0, 1, 1));
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_slow_statement_is_written_to_the_log_with_what_it_read() -> DbResult<()> {
     // R-O7
-    // The server as its own process, told that every statement is slow,
-    // with its log read back.
+    // The server as its own process, told that everything is slow, with
+    // its log read back.
     let dir = TempDir::new();
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let child = Command::new(env!("CARGO_BIN_EXE_database"))
-        .arg("serve")
-        .env("DATABASE_DATA", dir.path())
-        .env("DATABASE_LISTEN", format!("127.0.0.1:{port}"))
-        .env("DATABASE_ADMIN_PASSWORD", ADMIN_PASSWORD)
-        .env("DATABASE_SLOW_MS", "0")
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the server binary starts");
-    let mut server = Process(child);
-    let log = server.0.stderr.take().unwrap();
-    let lines = std::thread::spawn(move || BufReader::new(log).lines().map_while(Result::ok).collect::<Vec<String>>());
-
-    let admin = loop {
-        let mut config = Config::new("127.0.0.1", port, "", ADMIN_PASSWORD);
-        config.connect_timeout = Duration::from_secs(2);
-        match Client::connect(config).await {
-            Ok(admin) => break admin,
-            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-        }
-    };
-    admin.admin().create_database("test", PASSWORD).await?;
-    let mut config = Config::new("127.0.0.1", port, "test", PASSWORD);
-    config.name = "the test".to_string();
-    let db = Client::connect(config).await?;
+    let (mut server, lines, db) = logged(&dir, Some("0")).await;
     notes(&db).await?;
-    db.query(Query::table("notes").filter(col("day").eq(10))).await?;
+    db.query(Query::table("notes").filter(col("body").eq("secret-filter-value"))).await?;
     db.query(Query::table("notes").alias("n").index("notes_owner_day", KeyRange::eq([3])).join(Query::table("owners").alias("o").key([col("n.owner")])).order_by(col("n.day")).limit(5)).await?;
-    db.update(Update::table("notes").index("notes_owner_day", KeyRange::eq([4])).set("day", 0)).await?;
+    db.update(Update::table("notes").index("notes_owner_day", KeyRange::eq([4])).set("body", "secret-new-value")).await?;
     db.transaction(|tx| async move {
         tx.delete(Delete::from("notes").key([1])).await?;
         Ok::<_, DbError>(())
     })
     .await?;
+    let tx = db.begin().await?;
+    tx.query(Query::table("owners").key([1])).await?;
+    tx.rollback().await?;
     db.batch(Batch::new().add(Query::table("notes").key([2])).add(Query::table("owners"))).await?;
-    drop((db, admin));
+    let by_body = Prepared::new(Query::table("notes").index("notes_owner_day", KeyRange::eq([param(0)])).filter(col("body").eq(param(1))));
+    db.execute(&by_body, [Value::from(5), Value::from("secret-parameter-value")]).await?;
+    drop(db);
     // Asked to stop, the server ends its log.
     server.stop();
     let lines = lines.join().unwrap();
     let slow: Vec<&String> = lines.iter().filter(|line| line.starts_with("database: slow: ")).collect();
     let find = |what: &str| slow.iter().find(|line| line.contains(what)).unwrap_or_else(|| panic!("no line about {what:?} in {slow:#?}"));
 
-    // Who, what, and what it read. Never the values.
+    // Who, what, and what it read.
     let scan = find("query notes by the whole table, filtered");
     assert!(scan.contains("database \"test\", client \"the test\""), "{scan}");
     assert!(scan.ends_with("read 0 index entries and 1000 rows"), "{scan}");
@@ -221,16 +254,40 @@ async fn a_slow_statement_is_written_to_the_log_with_what_it_read() -> DbResult<
     let batch = find("batch of 2 statements");
     assert!(batch.ends_with("read 0 index entries and 21 rows"), "{batch}");
     find("insert into notes, 250 rows");
-    assert!(lines.iter().all(|line| !line.contains("note 7 is")), "a statement's values stay out of the log");
+    let prepared = find("query notes by index notes_owner_day, filtered");
+    assert!(prepared.ends_with("read 50 index entries and 50 rows"), "{prepared}");
+    // A transaction's begin and its commit can be what was slow (the wait
+    // for the write lock, the wait for the disk), and have lines of
+    // their own.
+    find(": begin: ");
+    find(": commit: ");
+    // Never a statement's values: not what it filters by, not what it
+    // writes, not what a prepared one is run with.
+    for line in &lines {
+        assert!(!line.contains("secret") && !line.contains("note 7 is"), "{line}");
+    }
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_is_logged_unless_asked_for() -> DbResult<()> {
-    // Not told what slow is, the server calls nothing slow: this server,
-    // started the way every other test starts one, has no such setting.
-    let (_server, db) = fresh().await;
+    // R-O7
+    // The same statements against a server that was not told what slow
+    // is: it calls nothing slow.
+    let dir = TempDir::new();
+    let (mut server, lines, db) = logged(&dir, None).await;
     notes(&db).await?;
+    db.query(Query::table("notes").filter(col("day").eq(10))).await?;
+    db.transaction(|tx| async move {
+        tx.delete(Delete::from("notes").key([1])).await?;
+        Ok::<_, DbError>(())
+    })
+    .await?;
     assert_eq!(read(db.explain(Query::table("notes").limit(1)).await?), (0, 1, 1));
+    drop(db);
+    server.stop();
+    let lines = lines.join().unwrap();
+    assert!(lines.iter().any(|line| line.starts_with("database: serving")), "the log was read: {lines:#?}");
+    assert!(lines.iter().all(|line| !line.contains("slow")), "{lines:#?}");
     Ok(())
 }

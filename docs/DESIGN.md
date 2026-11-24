@@ -358,9 +358,13 @@ things cut that, each a request kind of its own (`message.rs`):
   went from 54,700 instructions in the server to 37,800.
 - A **transaction begins with its first statement** (`BeginWith`): one
   request, answered as the statement. If the transaction cannot begin,
-  the connection is left with a dead one that can only be ended, as
-  after a failed statement, so that whatever the client sends next
-  cannot run outside the transaction it was meant for.
+  or the statement is refused before it could (it is not a statement,
+  or one too large to keep), the connection is left with a dead
+  transaction that can only be ended, as after a failed statement, so
+  that whatever the client sends next cannot run outside the
+  transaction it was meant for. Only a statement the connection no
+  longer keeps is answered with nothing begun: the client sends that
+  request again.
 - A **batch** is a whole transaction in one request, for statements
   that need no answers from each other. It runs as one job in the
   gate, like a brief write: it has the turn while it runs, so there is

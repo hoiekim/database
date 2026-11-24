@@ -189,11 +189,17 @@ docker rm -f drill
   database: slow: 153 ms, database "shop", client "shop-web": query mails by the whole table, filtered, limit 50: read 0 index entries and 98112 rows
   ```
 
-  How long it took (waiting for the write lock and for the disk
-  included), on which database, for which client (the `name` of its
-  URL), what the statement was, and how much it read to answer. The
+  How long it took, on which database, for which client (the `name` of
+  its URL), what the statement was, and how much it read to answer. The
   statement is described by its table, its way in and its clauses,
-  never by its values. There is no planner whose choice could be at
+  never by its values. For a statement on its own and for a batch the
+  time includes the wait for the write lock and for the disk. In a
+  transaction those waits are the `begin`'s and the `commit`'s, which
+  are timed and logged as statements are: a `begin` line is a wait for
+  the write lock, and a `commit` line a wait for the disk, or for an
+  optimistic transaction's turn and its statements run again (it then
+  counts what that second run read). A transaction's first statement,
+  when it brings the begin with it, includes the begin's wait. There is no planner whose choice could be at
   fault: a statement is slow because of what its own access path made
   the server read, and the two counts say which it was. This one read
   the whole table to return 50 rows, and wants an index range. The

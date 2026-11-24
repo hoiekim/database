@@ -93,9 +93,13 @@ pub enum Request {
     /// request: answered as the statement is.
     ///
     /// Whatever the answer, a transaction is open afterwards and has to
-    /// be ended. If it could not begin, or the statement failed, it is
-    /// one that can only be rolled back, so that nothing sent after it
-    /// runs outside the transaction it was meant for.
+    /// be ended. If it could not begin, or the statement was refused or
+    /// failed, it is one that can only be rolled back, so that nothing
+    /// sent after it runs outside the transaction it was meant for.
+    /// There are two exceptions, both answered before anything begins:
+    /// `NotPrepared`, after which the same request is sent again with the
+    /// statement; and a connection that already has a transaction open,
+    /// which keeps that one.
     BeginWith { kind: TxnKind, lock_wait_ms: u64, statement: Box<Request> },
     /// Statements run one after another as one transaction, sent whole:
     /// for a transaction whose statements do not depend on each other's
