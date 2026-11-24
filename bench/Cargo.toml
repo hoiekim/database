@@ -10,7 +10,16 @@ publish.workspace = true
 name = "bench"
 path = "src/main.rs"
 
+# Embedded SQLite as a target (`--only sqlite`). Off by default, because
+# it compiles SQLite's C source: an ordinary build of the workspace then
+# needs neither a C compiler for it nor the minute it takes.
+[features]
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 database-client = { path = "../client" }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "process"] }
 tokio-postgres = "0.7"
+# What rqlite and libSQL's server are spoken to in.
+serde_json.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
