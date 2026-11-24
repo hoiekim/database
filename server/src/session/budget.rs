@@ -30,8 +30,9 @@
 //!   alone among large requests.
 //! - A connection that holds the turn to write between its requests (an
 //!   exclusive transaction) never waits: another connection may hold the
-//!   budget while it waits for that turn. It takes what is free, if any,
-//!   and runs.
+//!   budget while it waits for that turn. It takes what is free of its
+//!   share, if any, and runs: so what it takes is counted against the
+//!   others, and only what was not free is held beyond the budget.
 //! - The budget is taken in arrival order, so a large request is not
 //!   passed over for ever by smaller large ones.
 
@@ -118,15 +119,28 @@ impl Budget {
     }
 
     /// Takes the share of a request of `bytes`, waiting for it if
-    /// `may_wait`; otherwise takes it only if it is free, and returns an
-    /// empty share if not.
+    /// `may_wait`; otherwise takes at once as much of it as is free,
+    /// which may be none.
     pub(super) async fn take(&'static self, bytes: usize, may_wait: bool) -> Share {
         let units = self.units_for(bytes);
         if units == 0 {
             return Share(None);
         }
         if !may_wait {
-            return Share(self.units.try_acquire_many(units).ok());
+            // What is free is counted against the others even where it
+            // is less than the request takes: left free, another large
+            // request would be decoded into it beside this one. Taken
+            // between the look and the take by someone else, it is
+            // looked at again.
+            loop {
+                let free = self.units.available_permits().min(units as usize) as u32;
+                if free == 0 {
+                    return Share(None);
+                }
+                if let Ok(permit) = self.units.try_acquire_many(free) {
+                    return Share(Some(permit));
+                }
+            }
         }
         // The semaphore is never closed.
         Share(self.units.acquire_many(units).await.ok())
@@ -191,6 +205,19 @@ mod tests {
         drop(all);
         let share = budget.take(512 * 1024, false).await;
         assert!(share.0.is_some(), "it takes what is free");
+        assert_eq!(budget.free(), 512 * 1024 / UNIT);
+        // More is asked than is free: the rest of the budget is taken,
+        // so that no other large request is decoded into it meanwhile.
+        let rest = tokio::time::timeout(Duration::from_millis(100), budget.take(4 * 1024 * 1024, false)).await.expect("it does not wait");
+        assert!(rest.0.is_some());
+        assert_eq!(budget.free(), 0);
+        let waiting = tokio::spawn(budget.take(200 * 1024, true));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "another large request waits for what the holder took");
+        drop(rest);
+        drop(tokio::time::timeout(Duration::from_secs(5), waiting).await.expect("and goes when it is given back").unwrap());
+        drop(share);
+        assert_eq!(budget.free(), 1024 * 1024 / UNIT);
     }
 
     #[tokio::test]

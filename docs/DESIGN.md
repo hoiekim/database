@@ -435,8 +435,9 @@ and `Func::Headline` use without an index. A text's words are gathered
 sorted and packed in one buffer, and a row's words are held in the form
 a pending row stores them: nothing is allocated per word.
 
-Cutting text into words needs nothing but the text, so a large insert
-can have it done before its turn to write (see "The server"). Words cut
+Cutting text into words needs nothing but the text, so an insert of
+more than a few rows can have it done before its turn to write (see
+"The server"). Words cut
 ahead are used for a row only if the text the row is written with is
 the very text they were cut from, compared whole: a default in place of
 a text not given, an upsert that writes another text, or a table changed
@@ -471,10 +472,12 @@ Postgres took 53, and a durable insert 400 µs against 170. So:
   nothing waits for a task to be woken, which costs more than the write.
 - Anything else, and every delete not by key, for what it may cascade
   to, takes the turn itself and runs on a thread of its own.
-- A **large insert** that is its own transaction, into a table with a
-  full-text index, first has its texts cut into words on the
-  connection's own thread, beside whoever has the turn
-  (`session/load.rs`). Several connections that load at once then cut
+- An **insert of more than 8 rows, or of more than 64 KiB**, that is
+  its own transaction, into a table with a full-text index, first has
+  its texts cut into words on the connection's own thread, beside
+  whoever has the turn (`session/load.rs`). An upsert is one of these:
+  its rows that are written as they were sent use the words cut ahead.
+  Several connections that load at once then cut
   on as many cores, and take turns only to store rows and the words
   already cut.
 - An **optimistic transaction** is a fork (see "Transactions"): its
@@ -561,7 +564,8 @@ ordinary size takes nothing and never waits; one larger than the budget
 takes all of it and runs alone. A connection that holds the turn between
 requests (an exclusive transaction) never waits for the budget, since
 whoever holds the budget may be waiting for that turn: it takes what is
-free and runs. As a large request is answered, the memory it held is
+free of its share, which may be less than the share or nothing, and
+runs. As a large request is answered, the memory it held is
 handed back to the system, at most five times a second; left in the
 allocator's pool of the thread that decoded it, it was most of what the
 server held during a bulk load. Only the GNU C library keeps such pools
