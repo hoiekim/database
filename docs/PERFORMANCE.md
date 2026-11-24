@@ -172,6 +172,72 @@ locks, in the allocations a row costs (about ten: its key, its bytes,
 its values). With that gone, what separates the two is the second
 lookup for each preview and those allocations themselves.
 
+### What a request costs: prepared statements, one request for a transaction, a Unix socket
+
+*What was wrong.* For a small request the engine is the lesser part of
+the cost. The rest is the trip through the network stack, decoding the
+request into a tree of expressions (and encoding it, in the client),
+and for a transaction one round trip per statement plus one to begin
+and one to commit.
+
+*What changed.* Four things, none of them in the engine:
+
+- **Prepared statements** (`Prepared`, `param(n)`, `Db::execute`). A
+  connection is sent a statement once and keeps it decoded; after that
+  a request is the statement's number and its values, which the
+  evaluator reads from its context.
+- **A transaction begins with its first statement.** `transaction`,
+  `exclusive` and `read` send the begin with the first statement: a
+  transfer is six round trips, as in Postgres, where it was seven.
+- **A batch** (`Client::batch`) sends a transaction whole when its
+  statements need no answers from each other. It is one round trip, and
+  it runs once, as a job that holds the write turn: nothing is run a
+  second time at the commit, and nothing conflicts. `Batch::expect`
+  makes a statement a condition of the rest.
+- **A Unix domain socket** beside the TCP port, for a client on the
+  server's own host.
+
+And where conflicts are the rule, the client now goes straight to the
+write lock after a transaction's first conflict (see 4 below).
+
+The benchmark prepares this server's statements as it does Postgres',
+and runs the transfers a second time sent whole: a batch here, and for
+Postgres one statement of chained `WITH` updates, which is the nearest
+it has. `BENCH_SOCKET=1` reaches both servers through Unix sockets.
+
+What the server executes for one request, counted by a profiler with
+one connection, before and after (the counts do not depend on the
+machine or on what else it is doing):
+
+| Request | instructions before | after | |
+|---|---:|---:|---:|
+| Session lookup with user | 54,700 | 37,800 | 0.69× |
+| Rate-limit upsert, unlogged | 67,100 | 52,600 | 0.78× |
+| Durable insert | 63,800 | 62,000 | 0.97× |
+| Transfer as a transaction of 2 reads and 3 writes | 202,500 | 178,500 | 0.88× |
+| The same transfer sent whole | | 106,700 | 0.53× |
+
+A statement gains by how much of it is expressions: the lookup's join
+and filters and the upsert's `when(..)` are trees that are no longer
+rebuilt, where the insert was three values to begin with. The transfer
+gains a request less and five statements not decoded; sent whole it
+also loses its fork, its digests and five requests' worth of reading
+and answering. (With one connection nothing is run twice at the commit.
+With eight, nearly every transfer was: that second run is what a batch
+also saves, and the count above does not show it.)
+
+What the socket saves depends on the system. A round trip that asks
+for nothing (a ping) was measured at 23 to 25 µs over TCP on the
+loopback address and 8 to 11 µs over a Unix socket on macOS, and at 10
+to 11 µs against 9 µs on Linux: a third of a point lookup on the one,
+a few percent on the other.
+
+*What is left.* The table at the top of this file was measured before
+these changes and has not been run again on that machine. Of a prepared
+lookup's 37,800 instructions about 26,000 are the query itself; a sixth
+of all of them is the allocator, which is what "fewer allocations per
+row" under 1 is about. Encoding the rows is untouched.
+
 ## Where it is ahead, and why
 
 - **Counting 5,000 rows of a user** (3.1×) and **updating a flag**
@@ -204,8 +270,11 @@ lookup for each preview and those allocations themselves.
 | Option | What it changes | Expected effect | Cost |
 |---|---|---|---|
 | **Keep volatile tables in memory only**: they are empty after a restart anyway | No page copies and no version per write; such a table could take a lock of its own and be written beside the database's writer | Probably past Postgres for this workload | Moderate; such a table would no longer roll back with a transaction or be read from a snapshot, which has to be acceptable for what is kept in it |
-| **A prepared form of a request**: sent once, then named with its values | The statement is not decoded and its tree of expressions not built for each call | A few microseconds of the 13; helps every small request | Moderate: a new request type and a cache per connection |
 | **One version for a batch of jobs**: the thread that runs waiting writes back to back begins and commits once for all of them | About 4 µs of the 17 | About a fifth at eight connections, nothing at one | Small to moderate: a failed statement must undo only itself |
+
+A prepared form of the request, which was a third option here, is done:
+an upsert is 52,600 instructions in the server where it was 67,100 (see
+"What a request costs").
 
 ### 3. The bulk load (0.73×)
 
@@ -227,18 +296,39 @@ syncing on other threads.
 
 ### 4. Transactions of several requests (0.91×)
 
+Three of the four options that stood here are done (see "What a
+request costs"):
+
+- **`begin` travels with the first statement**: six round trips where
+  there were seven. If the begin fails the server leaves the connection
+  with a dead transaction, so that the statements meant for it cannot
+  run outside one.
+- **A batch**: one round trip, and nothing to run twice. For the
+  contended workload it is more than that: a batch never conflicts,
+  because it is the writer while it runs, so eight connections crediting
+  one account go as fast as eight crediting different ones.
+- **Straight to the write lock after one conflict, where conflicts are
+  the rule.** `optimistic_runs` sets how many runs beside other writers
+  a transaction gets (2 unless set). And without being told, a client
+  counts how its transactions' first runs end: while more than a third
+  of them conflict, one that conflicts is not run beside the others
+  again, where it would mostly conflict again, but as the only writer.
+  In the workload where every transfer credits the same account that
+  halves the conflicts (one per transaction, not two); where conflicts
+  are rare nothing changes.
+
 | Option | What it changes | Expected effect | Cost |
 |---|---|---|---|
-| **Send `begin` with the first statement** | Six round trips instead of seven | About a seventh | Small; the server must refuse the statement if the begin failed |
-| **A batch request**: a transaction whose statements do not depend on each other's answers, sent whole | One round trip, and nothing to run twice | Several times, for transactions that fit | Moderate: a new request type |
-| **Go straight to the write lock after one conflict**, where conflicts are the rule | A contended transaction runs twice, not three times | A third of the round trips in the contended workload; a few percent lost where conflicts are rare, since each then holds every writer up once | Small: a setting of the client's |
 | **Wait instead of running again**, for rows that have just conflicted: a transaction that is about to read such a row waits for the one that holds it | Contended transactions queue for the row, as in Postgres, without holding up the writers of other rows | The runs that conflict; and transactions on other rows no longer wait behind the contended ones | Large: this is row locking, with its waits and its deadlocks to time out |
 
 ### 5. Point lookups and durable inserts (0.85× to 1.06×)
 
-Within a tenth, sometimes ahead. A lookup's cost is mostly outside the
+Within a tenth, sometimes ahead. A lookup's cost was mostly outside the
 engine: decoding the request into a query value and encoding the rows.
-The prepared form under 2 would cut the first. A durable insert on one
+A prepared statement now skips the first (see "What a request costs");
+what is left outside the engine is encoding the rows and the trip
+through the network stack, which a client on the server's own host
+shortens with the Unix socket. A durable insert on one
 connection is the disk's sync and little else on both servers.
 
 ## Running it
@@ -252,6 +342,7 @@ BENCH_WORKLOADS="transfer,upsert" ./target/release/bench # only the workloads na
 BENCH_REPEAT="mailbox:30" BENCH_WORKLOADS=mailbox ./target/release/bench --only ours   # one workload, longer, to profile
 BENCH_KEEP=1 BENCH_WORKLOADS=mailbox ./target/release/bench --only ours   # keep this server's loaded data for the next run
 BENCH_CONNECTIONS=1 BENCH_WORKLOADS=upsert ./target/release/bench --only ours
+BENCH_SOCKET=1 ./target/release/bench  # both servers through Unix domain sockets, not TCP
 BENCH_SERVER_LOG=server.log ./target/release/bench --only ours
 ```
 

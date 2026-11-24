@@ -36,10 +36,9 @@ pub struct ServerConfig {
     /// The address to listen on. Port 0 picks a free one.
     pub listen: SocketAddr,
     /// A Unix domain socket to listen on as well, for clients on the same
-    /// host: a request and its answer then skip the network stack, which
-    /// is a good part of what a small one costs. Who may connect is
-    /// decided by the file's permissions, and then by the password, as
-    /// on TCP. Not on systems without such sockets.
+    /// host: a request and its answer then skip the network stack. Who
+    /// may connect is decided by the file's permissions, and then by the
+    /// password, as on TCP. Not on systems without such sockets.
     pub socket: Option<PathBuf>,
     /// The password for administering: creating and dropping databases,
     /// dumping, restoring.

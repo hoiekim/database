@@ -375,7 +375,8 @@ there. A connection is served the same whichever way it came (the
 session is written over any pair of byte streams), and is asked for the
 same password; what differs is that the file's permissions decide who
 may connect at all, and that each request and answer skip the loopback
-network's work, about 15 µs of the 50 a point lookup takes.
+network's work: 15 µs of a round trip on macOS, 2 µs on Linux, as
+measured (`PERFORMANCE.md`).
 
 Named locks live in the server, per database and name, owned by a
 connection and released when it closes.

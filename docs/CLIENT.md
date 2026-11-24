@@ -19,9 +19,9 @@ function can take `db: &impl Db` and run either way.
 
 An application on the server's own host can connect through the
 server's Unix domain socket instead of TCP, which saves every request
-its trip through the network stack: add
-`?socket=/run/database/database.sock` (the server's `DATABASE_SOCKET`)
-to the URL. The host and port are then not used.
+its trip through the network stack (a little on Linux, a good deal on
+macOS): add `?socket=/run/database/database.sock` (the server's
+`DATABASE_SOCKET`) to the URL. The host and port are then not used.
 
 ## Tables
 

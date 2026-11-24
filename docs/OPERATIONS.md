@@ -53,9 +53,10 @@ socket there as well as on TCP; the client names the same path:
 database://shop:<password>@localhost?socket=/run/database/database.sock
 ```
 
-A request and its answer then cost about 15 µs less of the 50 µs a point
-lookup takes over the loopback address (`PERFORMANCE.md`). Between
-containers, mount one volume at the socket's directory in both.
+What that saves each request depends on the system's loopback: about
+15 µs of a round trip where it was measured on macOS, about 2 µs on
+Linux (`PERFORMANCE.md`). Between containers, mount one volume at the
+socket's directory in both.
 
 - The socket file is created with the server's umask, and a client
   needs write permission on it to connect: that decides which users of
