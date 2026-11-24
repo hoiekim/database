@@ -14,7 +14,7 @@ mod common;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 
@@ -89,9 +89,10 @@ async fn schema(db: &Client) -> DbResult<()> {
 }
 
 /// Writes batches until the server goes away: each is one transaction of
-/// a row in `batches` and several in `entries`. Returns the batches whose
-/// commit was acknowledged.
-async fn writer(db: Client, next: Arc<AtomicI64>, stop: Arc<AtomicBool>, acknowledged: Arc<Mutex<Vec<(i64, i64)>>>) {
+/// a row in `batches` and several in `entries`. The batches whose commit
+/// was acknowledged are added to `acknowledged`. Returns the error that
+/// ended it, if one did.
+async fn writer(db: Client, next: Arc<AtomicI64>, stop: Arc<AtomicBool>, acknowledged: Arc<Mutex<Vec<(i64, i64)>>>) -> Option<DbError> {
     while !stop.load(Ordering::Relaxed) {
         let batch = next.fetch_add(1, Ordering::Relaxed);
         let rows = batch % 7 + 1;
@@ -108,10 +109,14 @@ async fn writer(db: Client, next: Arc<AtomicI64>, stop: Arc<AtomicBool>, acknowl
             .await;
         match result {
             Ok(()) => acknowledged.lock().unwrap().push((batch, rows)),
-            Err(_) => return,
+            Err(e) => return Some(e),
         }
     }
+    None
 }
+
+/// Batches each round sees acknowledged before it kills the server.
+const ROUND_BATCHES: usize = 20;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_acknowledged_is_lost_when_the_server_is_killed() -> DbResult<()> {
@@ -147,11 +152,26 @@ async fn nothing_acknowledged_is_lost_when_the_server_is_killed() -> DbResult<()
 
         // Load it from several connections, then kill it mid-flight.
         let stop = Arc::new(AtomicBool::new(false));
+        let before = acknowledged.lock().unwrap().len();
         let mut writers = Vec::new();
         for _ in 0..4 {
             writers.push(tokio::spawn(writer(server.connect("test").await?, next.clone(), stop.clone(), acknowledged.clone())));
         }
         tokio::time::sleep(Duration::from_millis(150 + round * 90)).await;
+        // On a slow disk that is time for few commits, and a round that
+        // commits nothing has nothing to lose: it goes on until it has some.
+        let waiting = Instant::now();
+        while acknowledged.lock().unwrap().len() < before + ROUND_BATCHES {
+            if writers.iter().all(|writer| writer.is_finished()) {
+                let mut ends = Vec::new();
+                for writer in writers {
+                    ends.push(writer.await.unwrap());
+                }
+                panic!("round {round}: every writer ended while the server ran: {ends:?}");
+            }
+            assert!(waiting.elapsed() < Duration::from_secs(60), "round {round}: {} batches were committed in a minute", acknowledged.lock().unwrap().len() - before);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         if round % 3 == 2 {
             // Sometimes mid-checkpoint.
             let admin = server.connect("test").await?;
@@ -163,10 +183,13 @@ async fn nothing_acknowledged_is_lost_when_the_server_is_killed() -> DbResult<()
         server.kill();
         stop.store(true, Ordering::Relaxed);
         for writer in writers {
-            writer.await.unwrap();
+            // Nothing but the server's death ends a writer.
+            if let Some(e) = writer.await.unwrap() {
+                assert_eq!(e.code, ErrorCode::Connection, "round {round}: a writer was ended by: {}", e.message);
+            }
         }
     }
-    assert!(acknowledged.lock().unwrap().len() > 100, "the rounds committed work");
+    assert!(acknowledged.lock().unwrap().len() >= 6 * ROUND_BATCHES, "the rounds committed work");
 
     // A last start, to check the final round's commits.
     let server = Process::start(&dir, 8).await;
