@@ -432,20 +432,8 @@ impl Database {
             let synced = self.fatal(self.wal.sync_to(base.version))?;
             self.publish_up_to(synced);
         }
-        let tx = Tx::new(
-            Writer::new(self.store.clone()),
-            (*base.catalog).clone(),
-            now_micros(),
-        );
-        Ok(WriteTxn {
-            db: self.clone(),
-            tx: Some(tx),
-            base: base.version,
-            failed: false,
-            savepoints: Vec::new(),
-            guard: Some(guard),
-            pinned: None,
-        })
+        let tx = Tx::new(Writer::new(self.store.clone()), (*base.catalog).clone(), now_micros());
+        Ok(WriteTxn { db: self.clone(), tx: Some(tx), base: base.version, failed: false, savepoints: Vec::new(), guard: Some(guard), pinned: None })
     }
 
     /// Starts a transaction that may write but does not take the write
@@ -530,13 +518,7 @@ impl Database {
         let mut report = String::new();
         let mut rows_total = 0u64;
         for table in latest.catalog.tables.values() {
-            let ctx = Ctx {
-                pages,
-                catalog: &latest.catalog,
-                now: 0,
-                deadline: None,
-                tape: None,
-            };
+            let ctx = Ctx { pages, catalog: &latest.catalog, now: 0, deadline: None, tape: None };
             // The rows, and the large values they name.
             let mut rows = 0u64;
             let mut blob_bytes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
@@ -695,29 +677,14 @@ impl Pages for Recent<'_> {
 
 impl ReadTxn {
     pub fn ctx(&self, deadline: Option<Instant>) -> Ctx<'_> {
-        Ctx {
-            pages: &*self.db.store,
-            catalog: &self.snapshot.catalog,
-            now: self.now,
-            deadline,
-            tape: None,
-        }
+        Ctx { pages: &*self.db.store, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None }
     }
 
     pub fn query(&self, q: &Query, deadline: Option<Instant>) -> Result<RowSet> {
         // A version's pages never change, so what the query has read
         // once it may read again from its own copy.
-        let recent = Recent {
-            store: &self.db.store,
-            pages: Default::default(),
-        };
-        let ctx = Ctx {
-            pages: &recent,
-            catalog: &self.snapshot.catalog,
-            now: self.now,
-            deadline,
-            tape: None,
-        };
+        let recent = Recent { store: &self.db.store, pages: Default::default() };
+        let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None };
         exec::query(&ctx, q, &Scope::default())
     }
 

@@ -182,10 +182,7 @@ async fn blocking<T>(f: impl FnOnce() -> T) -> DbResult<T> {
 /// it is: room for a greeting and little else.
 const GREETING_FRAME: usize = 16 * 1024;
 
-async fn read_frame(
-    reader: &mut BufReader<OwnedReadHalf>,
-    largest: usize,
-) -> std::io::Result<Option<Vec<u8>>> {
+async fn read_frame(reader: &mut BufReader<OwnedReadHalf>, largest: usize) -> std::io::Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match reader.read_exact(&mut len).await {
         Ok(_) => {}
@@ -249,18 +246,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
     // A small request arrives whole: its length and its body are then
     // one read from the socket, not two.
     let mut reader = BufReader::with_capacity(READ_BUFFER, reader);
-    let mut session = Session {
-        id,
-        state: state.clone(),
-        name: String::new(),
-        database: None,
-        gate: None,
-        admin: false,
-        txn: None,
-        request_bytes: 0,
-        held: Vec::new(),
-        restore: None,
-    };
+    let mut session = Session { id, state: state.clone(), name: String::new(), database: None, gate: None, admin: false, txn: None, request_bytes: 0, held: Vec::new(), restore: None };
 
     // The greeting, within ten seconds.
     let hello = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut reader, GREETING_FRAME)).await;
@@ -288,10 +274,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
         let patience = match session.txn {
             Some(Txn::Write(..)) => state.config.idle_transaction,
             // A fork holds a version as a reader does, and nobody up.
-            Some(Txn::Read(_) | Txn::Fork(_) | Txn::Dead(_)) => state
-                .config
-                .idle_transaction
-                .saturating_mul(IDLE_READ_FACTOR),
+            Some(Txn::Read(_) | Txn::Fork(_) | Txn::Dead(_)) => state.config.idle_transaction.saturating_mul(IDLE_READ_FACTOR),
             None => Duration::from_secs(u64::from(u32::MAX)),
         };
         let frame = tokio::select! {
@@ -432,8 +415,7 @@ fn is_lock_timeout(e: &database_engine::error::Error) -> bool {
 fn begin_write(db: &Arc<Database>, wait: Duration, interactive: bool) -> DbResult<WriteTxn> {
     match db.begin_write(Duration::ZERO, interactive) {
         Err(e) if is_lock_timeout(&e) => {
-            tokio::task::block_in_place(|| db.begin_write(wait, interactive))
-                .map_err(|e| e.into_db())
+            tokio::task::block_in_place(|| db.begin_write(wait, interactive)).map_err(|e| e.into_db())
         }
         other => other.map_err(|e| e.into_db()),
     }
@@ -720,10 +702,7 @@ impl Session {
                 Some(Txn::Fork(fork)) => self.commit_fork(*fork, deadline).await,
                 Some(Txn::Read(_)) => Ok(vec![Response::Ok]),
                 Some(Txn::Dead(e)) => Err(e),
-                None => Err(DbError::new(
-                    ErrorCode::TransactionAborted,
-                    "no transaction is open",
-                )),
+                None => Err(DbError::new(ErrorCode::TransactionAborted, "no transaction is open")),
             },
             Request::Rollback => {
                 if let Some(txn) = self.txn.take() {

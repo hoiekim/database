@@ -431,13 +431,7 @@ fn write_node<P: PagesMut>(p: &mut P, id: PageId, kind: u8, cells: &[&[u8]], app
 }
 
 /// Rewrites a branch after its child `i` became `pages`.
-fn replace_child<P: PagesMut>(
-    p: &mut P,
-    id: PageId,
-    page: Page,
-    i: usize,
-    pages: Vec<(Vec<u8>, PageId)>,
-) -> Result<Outcome> {
+fn replace_child<P: PagesMut>(p: &mut P, id: PageId, page: Page, i: usize, pages: Vec<(Vec<u8>, PageId)>) -> Result<Outcome> {
     let node = Node::new(&page, id)?;
     match pages.as_slice() {
         // The child moved: its cell names the new page.

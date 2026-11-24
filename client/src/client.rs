@@ -233,17 +233,9 @@ impl Client {
     async fn begin_with(&self, kind: TxnKind) -> DbResult<Transaction> {
         let mut conn = self.pool.acquire().await?;
         let lock_wait_ms = self.pool.config.lock_wait.as_millis() as u64;
-        ok(conn
-            .conn()
-            .call(Request::Begin { kind, lock_wait_ms })
-            .await?)?;
+        ok(conn.conn().call(Request::Begin { kind, lock_wait_ms }).await?)?;
         conn.held = true;
-        Ok(Transaction {
-            inner: Arc::new(TxInner {
-                conn: Mutex::new(Some(conn)),
-                conflicted: AtomicBool::new(false),
-            }),
-        })
+        Ok(Transaction { inner: Arc::new(TxInner { conn: Mutex::new(Some(conn)), conflicted: AtomicBool::new(false) }) })
     }
 
     /// Runs `work` in a writing transaction: commits if it returns `Ok`,

@@ -310,16 +310,9 @@ impl TableMeta {
         let parent: &TableMeta = if fk.ref_table == self.name {
             self
         } else {
-            catalog
-                .tables
-                .get(fk.ref_table.as_str())
-                .map(|t| &*t.meta)
-                .ok_or_else(|| {
-                    Error::Db(DbError::not_found(format!(
-                        "foreign key {:?} points at table {:?}, which does not exist",
-                        fk.name, fk.ref_table
-                    )))
-                })?
+            catalog.tables.get(fk.ref_table.as_str()).map(|t| &*t.meta).ok_or_else(|| {
+                Error::Db(DbError::not_found(format!("foreign key {:?} points at table {:?}, which does not exist", fk.name, fk.ref_table)))
+            })?
         };
         if fk.ref_columns.is_empty() {
             fk.ref_columns = parent.pk.iter().map(|i| parent.cols[*i].def.name.clone()).collect();
@@ -482,18 +475,7 @@ impl Catalog {
             if pk.iter().any(|i| *i >= cols.len()) {
                 return Err(Error::corrupt("the stored catalog names a key column that does not exist"));
             }
-            let mut meta = TableMeta {
-                id,
-                name,
-                cols,
-                by_name,
-                pk,
-                indexes: Vec::new(),
-                foreign_keys: Vec::new(),
-                checks: Vec::new(),
-                volatile: false,
-                pk_parts: Default::default(),
-            };
+            let mut meta = TableMeta { id, name, cols, by_name, pk, indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), volatile: false, pk_parts: Default::default() };
             let root = r.u32().map_err(bad)?;
             let blobs = r.u32().map_err(bad)?;
             let next_blob = r.varint().map_err(bad)?;
@@ -508,18 +490,8 @@ impl Catalog {
             meta.foreign_keys = rest.foreign_keys;
             meta.checks = rest.checks;
             meta.volatile = rest.volatile;
-            let table = Table {
-                meta: Arc::new(meta),
-                root,
-                blobs,
-                next_blob,
-                rows,
-                index_roots,
-                serials,
-            };
-            catalog
-                .tables
-                .insert(Arc::from(table.name.as_str()), Arc::new(table));
+            let table = Table { meta: Arc::new(meta), root, blobs, next_blob, rows, index_roots, serials };
+            catalog.tables.insert(Arc::from(table.name.as_str()), Arc::new(table));
         }
         Ok(catalog)
     }

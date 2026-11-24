@@ -53,11 +53,7 @@ fn key_type(ty: &Type) -> Type {
 
 pub fn pk_parts(table: &Table) -> &KeyParts {
     table.pk_parts.get_or_init(|| {
-        table
-            .pk
-            .iter()
-            .map(|i| (Some(key_type(&table.cols[*i].def.ty)), false))
-            .collect()
+        table.pk.iter().map(|i| (Some(key_type(&table.cols[*i].def.ty)), false)).collect()
     })
 }
 
@@ -409,18 +405,7 @@ fn table_of(ctx: &Ctx, name: &str) -> Result<Arc<Table>> {
     }
     Ok(NONE
         .get_or_init(|| {
-            let meta = TableMeta {
-                id: 0,
-                name: String::new(),
-                cols: Vec::new(),
-                by_name: Default::default(),
-                pk: Vec::new(),
-                indexes: Vec::new(),
-                foreign_keys: Vec::new(),
-                checks: Vec::new(),
-                volatile: true,
-                pk_parts: Default::default(),
-            };
+            let meta = TableMeta { id: 0, name: String::new(), cols: Vec::new(), by_name: Default::default(), pk: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), volatile: true, pk_parts: Default::default() };
             Arc::new(Table::empty(meta))
         })
         .clone())

@@ -889,11 +889,7 @@ fn print(reports: &[Report]) {
         let cells: Vec<String> = reports
             .iter()
             .flat_map(|r| match pick(r) {
-                Some(t) => [
-                    rate(t.ops as f64 / t.seconds),
-                    micros(t.p50),
-                    micros(t.p99),
-                ],
+                Some(t) => [rate(t.ops as f64 / t.seconds), micros(t.p50), micros(t.p99)],
                 None => ["-".to_string(), "-".to_string(), "-".to_string()],
             })
             .collect();
@@ -904,55 +900,13 @@ fn print(reports: &[Report]) {
         row(name, &|r| r.timings[index].as_ref());
     }
     println!();
-    println!(
-        "| | {} |",
-        reports
-            .iter()
-            .map(|r| r.name)
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
+    println!("| | {} |", reports.iter().map(|r| r.name).collect::<Vec<_>>().join(" | "));
     println!("|---|{}", "---:|".repeat(reports.len()));
-    println!(
-        "| Memory when idle, before any request | {} |",
-        reports
-            .iter()
-            .map(|r| mb(r.idle_memory))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
-    println!(
-        "| Memory after the run | {} |",
-        reports
-            .iter()
-            .map(|r| mb(r.memory))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
-    println!(
-        "| CPU time for the whole run | {} |",
-        reports
-            .iter()
-            .map(|r| format!("{:.1} s", r.cpu))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
-    println!(
-        "| Data files on disk after a checkpoint | {} |",
-        reports
-            .iter()
-            .map(|r| mb(r.disk.0))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
-    println!(
-        "| Log files on disk after a checkpoint | {} |",
-        reports
-            .iter()
-            .map(|r| mb(r.disk.1))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
+    println!("| Memory when idle, before any request | {} |", reports.iter().map(|r| mb(r.idle_memory)).collect::<Vec<_>>().join(" | "));
+    println!("| Memory after the run | {} |", reports.iter().map(|r| mb(r.memory)).collect::<Vec<_>>().join(" | "));
+    println!("| CPU time for the whole run | {} |", reports.iter().map(|r| format!("{:.1} s", r.cpu)).collect::<Vec<_>>().join(" | "));
+    println!("| Data files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk.0)).collect::<Vec<_>>().join(" | "));
+    println!("| Log files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk.1)).collect::<Vec<_>>().join(" | "));
 }
 
 #[tokio::main]

@@ -47,10 +47,7 @@ pub enum Request {
     /// Starts a transaction. An exclusive one waits for the database's
     /// write lock, for at most `lock_wait_ms`; an optimistic one waits
     /// that long at most when it commits.
-    Begin {
-        kind: TxnKind,
-        lock_wait_ms: u64,
-    },
+    Begin { kind: TxnKind, lock_wait_ms: u64 },
     Commit,
     Rollback,
     Savepoint(String),
@@ -226,10 +223,7 @@ pub fn decode_request(frame: &[u8]) -> DbResult<(Request, u64)> {
                     )))
                 }
             };
-            Request::Begin {
-                kind,
-                lock_wait_ms: r.varint()?,
-            }
+            Request::Begin { kind, lock_wait_ms: r.varint()? }
         }
         4 => Request::Commit,
         5 => Request::Rollback,
@@ -579,18 +573,9 @@ mod tests {
         let requests = vec![
             Request::Hello { version: PROTOCOL_VERSION, database: "shop".into(), password: "pw".into(), client: "test".into() },
             Request::Ping,
-            Request::Begin {
-                kind: TxnKind::Exclusive,
-                lock_wait_ms: 30_000,
-            },
-            Request::Begin {
-                kind: TxnKind::Optimistic,
-                lock_wait_ms: 0,
-            },
-            Request::Begin {
-                kind: TxnKind::Read,
-                lock_wait_ms: 0,
-            },
+            Request::Begin { kind: TxnKind::Exclusive, lock_wait_ms: 30_000 },
+            Request::Begin { kind: TxnKind::Optimistic, lock_wait_ms: 0 },
+            Request::Begin { kind: TxnKind::Read, lock_wait_ms: 0 },
             Request::Commit,
             Request::Rollback,
             Request::Savepoint("a".into()),

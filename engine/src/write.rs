@@ -194,25 +194,11 @@ fn unique_holder(ctx: &Ctx, table: &Table, i: usize, entry: &Entry, own_pk: &[u8
 
 impl Tx {
     pub fn new(writer: Writer, catalog: Catalog, now: i64) -> Tx {
-        Tx {
-            writer,
-            catalog,
-            log: Encoder::new(),
-            now,
-            deadline: None,
-            logging: true,
-            tape: Tape::default(),
-        }
+        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default() }
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx {
-            pages: &self.writer,
-            catalog: &self.catalog,
-            now: self.now,
-            deadline: self.deadline,
-            tape: Some(&self.tape),
-        }
+        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape) }
     }
 
     fn table(&self, name: &str) -> Result<Arc<Table>> {
@@ -239,9 +225,7 @@ impl Tx {
         let pk = pk_of(&table, values)?;
         let (entries, words) = {
             let ctx = self.ctx();
-            let entries: Vec<Vec<Entry>> = (0..table.indexes.len())
-                .map(|i| index_entries(&ctx, &table, i, stored, &pk))
-                .collect::<Result<_>>()?;
+            let entries: Vec<Vec<Entry>> = (0..table.indexes.len()).map(|i| index_entries(&ctx, &table, i, stored, &pk)).collect::<Result<_>>()?;
             let mut words = Vec::new();
             for i in (0..table.indexes.len()).filter(|i| is_full_text(&table, *i)) {
                 if let Some(w) = fts::words_of(&ctx, &table, i, stored)? {
@@ -251,19 +235,8 @@ impl Tx {
             (entries, words)
         };
         let (mut blobs, mut next_blob) = (table.blobs, table.next_blob);
-        let moved = row::fitted(
-            &mut self.writer,
-            stored,
-            btree::max_value(pk.len()),
-            &mut blobs,
-            &mut next_blob,
-        )?;
-        let (root, existed) = btree::put(
-            &mut self.writer,
-            table.root,
-            &pk,
-            moved.as_deref().unwrap_or(stored.raw()),
-        )?;
+        let moved = row::fitted(&mut self.writer, stored, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
+        let (root, existed) = btree::put(&mut self.writer, table.root, &pk, moved.as_deref().unwrap_or(stored.raw()))?;
         if existed {
             return Err(Error::corrupt(format!("a row of table {name:?} was inserted over another")));
         }
@@ -365,20 +338,8 @@ impl Tx {
                 blobs = blob::free(&mut self.writer, blobs, b.id, b.len)?;
             }
         }
-        let moved = row::fitted(
-            &mut self.writer,
-            new,
-            btree::max_value(pk.len()),
-            &mut blobs,
-            &mut next_blob,
-        )?;
-        let root = btree::put(
-            &mut self.writer,
-            table.root,
-            pk,
-            moved.as_deref().unwrap_or(new.raw()),
-        )?
-        .0;
+        let moved = row::fitted(&mut self.writer, new, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
+        let root = btree::put(&mut self.writer, table.root, pk, moved.as_deref().unwrap_or(new.raw()))?.0;
         let mut index_roots = table.index_roots.clone();
         for ((i, before), after) in touched.iter().zip(&before).zip(&after) {
             for entry in before {
@@ -595,13 +556,7 @@ impl Tx {
     /// Validates and applies a change to one row, and returns the row as
     /// it now is. `old` is the row as it was, if the caller has it at
     /// hand: it is read otherwise.
-    fn update_row(
-        &mut self,
-        name: &str,
-        pk: &[u8],
-        changes: Vec<(usize, Value)>,
-        old: Option<&Row>,
-    ) -> Result<Row> {
+    fn update_row(&mut self, name: &str, pk: &[u8], changes: Vec<(usize, Value)>, old: Option<&Row>) -> Result<Row> {
         let table = self.table(name)?;
         let read;
         let old = match old {
@@ -619,15 +574,7 @@ impl Tx {
         for (i, value) in changes {
             let value = Self::fit_column(&table, i, value)?;
             if table.pk.contains(&i) {
-                let current = frame_value(
-                    &self.ctx(),
-                    &Frame {
-                        alias: name,
-                        table: &table,
-                        row: Some(old),
-                    },
-                    i,
-                )?;
+                let current = frame_value(&self.ctx(), &Frame { alias: name, table: &table, row: Some(old) }, i)?;
                 if !current.same(&value) {
                     return Err(invalid(format!("column {:?} is part of the primary key of {name:?} and cannot be changed: delete the row and insert it again", table.cols[i].def.name)));
                 }
@@ -873,9 +820,7 @@ impl Tx {
                     (proposed, None)
                 }
                 Some(holder) => {
-                    let OnConflict::DoUpdate { set, filter, .. } = &ins.on_conflict else {
-                        unreachable!()
-                    };
+                    let OnConflict::DoUpdate { set, filter, .. } = &ins.on_conflict else { unreachable!() };
                     let current = match held.take() {
                         Some(row) if holder == pk => row,
                         _ => fetch(&self.ctx(), &table, &holder)?.ok_or_else(|| {
@@ -903,23 +848,9 @@ impl Tx {
                 // again. The table is read anew: its large values moved.
                 let table = self.table(&ins.table)?;
                 let ctx = self.ctx();
-                let frame = [Frame {
-                    alias: &table.name,
-                    table: &table,
-                    row: Some(&stored),
-                }];
-                let scope = Scope {
-                    frames: &frame,
-                    old: old.as_ref(),
-                    excluded: Some(&values),
-                    ..Scope::default()
-                };
-                out.push(
-                    returning
-                        .iter()
-                        .map(|s| eval(&ctx, &scope, &s.expr))
-                        .collect::<Result<Vec<_>>>()?,
-                );
+                let frame = [Frame { alias: &table.name, table: &table, row: Some(&stored) }];
+                let scope = Scope { frames: &frame, old: old.as_ref(), excluded: Some(&values), ..Scope::default() };
+                out.push(returning.iter().map(|s| eval(&ctx, &scope, &s.expr)).collect::<Result<Vec<_>>>()?);
             }
         }
         Ok(RowSet { columns, rows: out, affected, total: None })
@@ -1041,21 +972,12 @@ impl Tx {
 
     pub fn create_table(&mut self, def: &TableDef, if_not_exists: bool) -> Result<()> {
         if self.catalog.tables.contains_key(def.name.as_str()) {
-            return if if_not_exists {
-                Ok(())
-            } else {
-                Err(Error::db(
-                    ErrorCode::AlreadyExists,
-                    format!("table {:?} already exists", def.name),
-                ))
-            };
+            return if if_not_exists { Ok(()) } else { Err(Error::db(ErrorCode::AlreadyExists, format!("table {:?} already exists", def.name))) };
         }
         let id = self.catalog.next_table_id.max(1);
         let table = Table::create(def, id, &self.catalog)?;
         self.catalog.next_table_id = id + 1;
-        self.catalog
-            .tables
-            .insert(Arc::from(def.name.as_str()), Arc::new(table));
+        self.catalog.tables.insert(Arc::from(def.name.as_str()), Arc::new(table));
         self.log_op(OP_CREATE_TABLE, |w| codec::put_table(w, def));
         Ok(())
     }
