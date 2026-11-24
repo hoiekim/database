@@ -100,8 +100,9 @@ db.create_table_if_not_exists(
   when the column is created (`create_table` or `add_column`): a table
   that exists already keeps its columns as they are, and
   `create_table_if_not_exists` does not change them. A client from
-  before the setting existed cannot read the definition of a table that
-  uses it.
+  before the setting existed is described such a table without it, and
+  reads and writes the table as any other. A server from before it
+  refuses the database and a dump of it (`OPERATIONS.md`).
 - `describe()` returns every table as the server holds it. `add_column`
   adds a column to a table with rows; they read its default. Schema
   changes can run inside a transaction and roll back with it.
