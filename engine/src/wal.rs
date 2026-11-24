@@ -21,6 +21,15 @@
 //! acknowledged. That is said only of bytes that were read. A read that
 //! fails says nothing about what the file holds, and is an error.
 //!
+//! A file is synced whole before the next is begun, so only the newest
+//! can end short. To hold a disk to that, the first record written to a
+//! file that follows one with records is preceded by a record of the
+//! log's own, a **link**, that says where those records ended. A file
+//! that ends anywhere else has lost records since, to a sync that lied or
+//! to damage, and what the next file holds must not be applied over the
+//! gap. A file that never gets a record needs no link and has none: a
+//! server stopped in good order leaves a log that says nothing new.
+//!
 //! A file that grows with every record makes every sync slow: the file
 //! system must then commit the file's new length as well as its bytes,
 //! which here took four times as long as the bytes alone. So a busy log
@@ -43,6 +52,12 @@ const MAX_RECORD: u32 = 1 << 30;
 /// then from the least of these to the most, doubling.
 const GROW_LEAST: u64 = 16 * 1024;
 const GROW_MOST: u64 = 1024 * 1024;
+/// The first byte of a link. No transaction's record begins with it
+/// (`write.rs` numbers what a record holds from 1), and a build that
+/// knows nothing of links refuses the record rather than pass it over.
+const LINK: u8 = 0xF0;
+/// A link: that byte, and where the records of the file before ended.
+const LINK_LEN: usize = 9;
 
 pub fn wal_path(dir: &Path, name: &str, generation: u64) -> PathBuf {
     dir.join(format!("{name}.wal-{generation:010}"))
@@ -74,6 +89,10 @@ fn record_crc(generation: u64, offset: u64, bytes: &[u8]) -> u32 {
 struct Tail {
     file: Arc<dyn File>,
     generation: u64,
+    /// Where the records of the file before this one ended, to be said
+    /// with this file's first record: 0 once said, or with nothing to
+    /// say.
+    link: u64,
     offset: u64,
     /// How long the file is: records are written before this where they
     /// can be.
@@ -114,13 +133,21 @@ impl Wal {
     /// Starts a new log file of the given generation, replacing any file
     /// of that name. `version` is the newest committed version so far.
     pub fn create(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, uuid: [u8; 16], generation: u64, version: u64, sync: bool) -> Result<Wal> {
+        Self::create_after(vfs, dir, name, uuid, generation, version, sync, 0)
+    }
+
+    /// The same, for a file that follows another: `previous` is where
+    /// the records of the file before it ended, or 0 if it held none or
+    /// there is none. The file will say so with its first record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_after(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, uuid: [u8; 16], generation: u64, version: u64, sync: bool, previous: u64) -> Result<Wal> {
         let file = Self::start_file(&*vfs, dir, name, &uuid, generation)?;
         Ok(Wal {
             vfs,
             dir: dir.to_path_buf(),
             name: name.to_string(),
             uuid,
-            tail: Mutex::new(Tail { file, generation, offset: HEADER_LEN, allocated: HEADER_LEN, grow: 0, appended: version, last_record: version }),
+            tail: Mutex::new(Tail { file, generation, link: previous, offset: HEADER_LEN, allocated: HEADER_LEN, grow: 0, appended: version, last_record: version }),
             synced: Mutex::new(Synced { version, syncing: false, failed: false }),
             wake: Condvar::new(),
             sync,
@@ -164,9 +191,19 @@ impl Wal {
             return Err(failed());
         }
         let mut tail = self.tail.lock().unwrap();
-        let mut frame = Vec::with_capacity(bytes.len() + 8);
+        let mut frame = Vec::with_capacity(bytes.len() + 16 + LINK_LEN);
+        if tail.link > 0 {
+            // The file's first record: the link goes before it, in the
+            // same write.
+            let mut link = [LINK; LINK_LEN];
+            link[1..].copy_from_slice(&tail.link.to_le_bytes());
+            frame.extend_from_slice(&(LINK_LEN as u32).to_le_bytes());
+            frame.extend_from_slice(&record_crc(tail.generation, tail.offset, &link).to_le_bytes());
+            frame.extend_from_slice(&link);
+        }
+        let at = tail.offset + frame.len() as u64;
         frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&record_crc(tail.generation, tail.offset, bytes).to_le_bytes());
+        frame.extend_from_slice(&record_crc(tail.generation, at, bytes).to_le_bytes());
         frame.extend_from_slice(bytes);
         let end = tail.offset + frame.len() as u64;
         let mut written = tail.file.write_at(&frame, tail.offset);
@@ -183,6 +220,7 @@ impl Wal {
             return Err(e.into());
         }
         tail.offset = end;
+        tail.link = 0;
         tail.appended = version;
         tail.last_record = version;
         Ok(())
@@ -254,6 +292,8 @@ impl Wal {
             Ok((generation, file)) => {
                 synced.version = synced.version.max(tail.appended);
                 self.wake.notify_all();
+                // A file that holds a record holds a transaction's.
+                tail.link = if tail.offset > HEADER_LEN { tail.offset } else { 0 };
                 tail.file = file;
                 tail.generation = generation;
                 tail.offset = HEADER_LEN;
@@ -311,37 +351,54 @@ pub enum End {
     Torn,
 }
 
-/// Reads one log file, calling `on_record` with each record that checks,
-/// in order, and stops at the first that does not, saying how. A file
-/// whose header is missing or torn holds nothing and ends torn; a whole
-/// file of another data file holds nothing of this one's.
+/// What reading one log file found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replayed {
+    pub end: End,
+    /// Where its records ended: 0 for a file that holds none of this
+    /// data file's, for want of a header.
+    pub at: u64,
+    /// Where the file says the records of the file before it ended: 0
+    /// if it says nothing, for having no records of its own or because
+    /// that file had none.
+    pub after: u64,
+}
+
+/// Reads one log file, calling `on_record` with each transaction's record
+/// that checks, in order, and stops at the first that does not, saying
+/// how and where. A file whose header is missing or torn holds nothing
+/// and ends torn; a whole file of another data file holds nothing of this
+/// one's.
 ///
 /// A file ends where its length says it does, or at bytes that were read
 /// and do not check. A read that fails is neither: the records may all
 /// be there, so it is returned as the error it is, and the caller must
 /// not go on to delete the file.
-pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<End> {
+pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<Replayed> {
     let file = vfs.open(&wal_path(dir, name, generation), false)?;
     let len = file.len()?;
+    let nothing = |end| Replayed { end, at: 0, after: 0 };
     let mut head = vec![0u8; HEADER_LEN as usize];
     if len < HEADER_LEN {
-        return Ok(End::Torn);
+        return Ok(nothing(End::Torn));
     }
     read_exact_at(&*file, &mut head, 0)?;
     if head != header(generation, uuid) {
         // Whole, but another data file's: left from a database that had
         // this name before. Anything else in a header's place is damage.
         let whole = head[..8] == MAGIC[..] && crc32fast::hash(&head[..32]).to_le_bytes() == head[32..];
-        return Ok(if whole { End::Clean } else { End::Torn });
+        return Ok(nothing(if whole { End::Clean } else { End::Torn }));
     }
     let mut offset = HEADER_LEN;
+    let mut after = 0;
     loop {
+        let ended = |end| Replayed { end, at: offset, after };
         if offset == len {
-            return Ok(End::Clean);
+            return Ok(ended(End::Clean));
         }
         let mut prefix = [0u8; 8];
         if offset + 8 > len {
-            return Ok(End::Torn);
+            return Ok(ended(End::Torn));
         }
         read_exact_at(&*file, &mut prefix, offset)?;
         let size = u32::from_le_bytes(prefix[..4].try_into().unwrap());
@@ -349,17 +406,21 @@ pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation
         // No record is empty: a length of zero is the room a file was
         // grown by and not yet written over.
         if size == 0 {
-            return Ok(if crc == 0 { End::Clean } else { End::Torn });
+            return Ok(ended(if crc == 0 { End::Clean } else { End::Torn }));
         }
         if size > MAX_RECORD || offset + 8 + u64::from(size) > len {
-            return Ok(End::Torn);
+            return Ok(ended(End::Torn));
         }
         let mut bytes = vec![0u8; size as usize];
         read_exact_at(&*file, &mut bytes, offset + 8)?;
         if record_crc(generation, offset, &bytes) != crc {
-            return Ok(End::Torn);
+            return Ok(ended(End::Torn));
         }
-        on_record(&bytes)?;
+        if offset == HEADER_LEN && bytes.len() == LINK_LEN && bytes[0] == LINK {
+            after = u64::from_le_bytes(bytes[1..].try_into().unwrap());
+        } else {
+            on_record(&bytes)?;
+        }
         offset += 8 + u64::from(size);
     }
 }
@@ -439,16 +500,62 @@ mod tests {
         // before a crash and after one.
         assert_eq!(records(&vfs, 1).len(), 3000);
         assert_eq!(records(&vfs.crash_image(5), 1).len(), 3000);
-        // A new file starts small again.
+        // A new file starts small again: its header, the link to the
+        // file before it, and the one record.
         wal.rotate().unwrap();
         wal.append(3001, &[9; 10]).unwrap();
         let next = vfs.open(&wal_path(Path::new("/d"), "t", 2), false).unwrap();
-        assert_eq!(next.len().unwrap(), HEADER_LEN + 18);
+        assert_eq!(next.len().unwrap(), HEADER_LEN + 8 + LINK_LEN as u64 + 18);
+    }
+
+    #[test]
+    fn a_file_says_where_the_one_before_it_ended() {
+        let read = |vfs: &MemVfs, generation: u64| {
+            let mut records = 0;
+            let read = replay(vfs, Path::new("/d"), "t", &UUID, generation, &mut |_| {
+                records += 1;
+                Ok(())
+            })
+            .unwrap();
+            (read, records)
+        };
+        let vfs = MemVfs::new();
+        let wal = Wal::create(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 1, 0, true).unwrap();
+        // A file with no records leaves the next nothing to say.
+        wal.rotate().unwrap();
+        for v in 1..=3u64 {
+            wal.append(v, &[v as u8; 100]).unwrap();
+        }
+        let ended = HEADER_LEN + 3 * 108;
+        assert_eq!(wal.size(), ended);
+        assert_eq!(read(&vfs, 2), (Replayed { end: End::Clean, at: ended, after: 0 }, 3));
+        // A file that has no record yet says nothing either, and is as
+        // files were before there were links.
+        wal.rotate().unwrap();
+        assert_eq!(vfs.file_len(&wal_path(Path::new("/d"), "t", 3)), HEADER_LEN);
+        assert_eq!(read(&vfs, 3), (Replayed { end: End::Clean, at: HEADER_LEN, after: 0 }, 0));
+        // Its first record brings the link with it. The link is not a
+        // transaction's record, and later records bring none.
+        wal.append(4, &[4; 50]).unwrap();
+        wal.append(5, &[5; 50]).unwrap();
+        wal.sync_to(5).unwrap();
+        let linked = HEADER_LEN + 8 + LINK_LEN as u64;
+        assert_eq!(read(&vfs, 3), (Replayed { end: End::Clean, at: linked + 2 * 58, after: ended }, 2));
+        // The same for a file begun when a database is opened.
+        let wal = Wal::create_after(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 7, 5, true, 500).unwrap();
+        assert_eq!(wal.size(), HEADER_LEN);
+        wal.rotate().unwrap();
+        assert_eq!(read(&vfs, 7), (Replayed { end: End::Clean, at: HEADER_LEN, after: 0 }, 0));
+        wal.append(6, &[6; 10]).unwrap();
+        assert_eq!(read(&vfs, 8), (Replayed { end: End::Clean, at: HEADER_LEN + 18, after: 0 }, 1));
+        let wal = Wal::create_after(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 9, 6, true, 500).unwrap();
+        wal.append(7, &[7; 10]).unwrap();
+        assert_eq!(read(&vfs, 9), (Replayed { end: End::Clean, at: linked + 18, after: 500 }, 1));
     }
 
     #[test]
     fn a_reader_is_told_how_a_file_ended() {
-        let end = |vfs: &MemVfs| replay(vfs, Path::new("/d"), "t", &UUID, 1, &mut |_| Ok(())).unwrap();
+        let end = |vfs: &MemVfs| replay(vfs, Path::new("/d"), "t", &UUID, 1, &mut |_| Ok(())).unwrap().end;
         let path = wal_path(Path::new("/d"), "t", 1);
         let written = || {
             let vfs = MemVfs::new();
@@ -483,7 +590,7 @@ mod tests {
         // and is not damage: it is left from a database that had the
         // name before.
         let vfs = written();
-        assert_eq!(replay(&vfs, Path::new("/d"), "t", &[9; 16], 1, &mut |_| panic!("not its records")).unwrap(), End::Clean);
+        assert_eq!(replay(&vfs, Path::new("/d"), "t", &[9; 16], 1, &mut |_| panic!("not its records")).unwrap().end, End::Clean);
     }
 
     #[test]

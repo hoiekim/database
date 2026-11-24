@@ -6,6 +6,14 @@ and the server carries them out as written. This file is the contract:
 what each piece means, and how the things usually said in SQL are said
 here.
 
+The examples are Rust. The clients for TypeScript (`clients/typescript`)
+and Python (`clients/python`) have the same vocabulary under the same
+names, in each language's spelling, and everything this file says of
+what a request means holds for them: it is the server that gives a
+request its meaning. Each client's README lists where it differs (how a
+64-bit integer or a timestamp is held, which names the language had
+taken). The bytes all three send are `PROTOCOL.md`.
+
 ```rust
 use database_client::*;
 
@@ -140,6 +148,36 @@ grouping and `having`; `order_by`; `offset` and `limit`; `select`.
 - `Query::row()` is one row of no table, for what SQL writes as a
   `SELECT` without `FROM`:
   `Query::row().select("taken", exists(..)).select("at", now())`.
+
+### What a query costs
+
+There is no planner, so there is no plan to ask for. What can be wrong
+with a query is that the range it names takes in far more than it
+returns, and `explain` says how much it read:
+
+```rust
+let cost = db.explain(Query::table("mails").filter(col("user_id").eq(user)).limit(50)).await?;
+// Explained { index_entries: 0, rows_read: 98_112, rows_returned: 50, took: 71ms }
+let cost = db.explain(Query::table("mails").index("mails_user_date", KeyRange::eq([user])).limit(50)).await?;
+// Explained { index_entries: 50, rows_read: 50, rows_returned: 50, took: 240µs }
+```
+
+- `rows_read` counts every row read from a table: in key order, through
+  an index, and by joins and subqueries. `index_entries` counts the
+  entries read from indexes, and a search's hits.
+- A query is healthy when what it reads is close to what it returns (or,
+  for an aggregate, to what it has to count). `rows_read` near the size
+  of the table means a filter doing an index's work; `index_entries` far
+  above `rows_returned` means a range wider than the filter after it;
+  and `order_by` reads its whole range before `limit` cuts, where an
+  index in that order would stop early.
+- Explaining runs the query, in a transaction if called on one, and
+  returns no rows. Only a query can be explained: a write would take
+  effect. `explain_prepared(&prepared, [values])` explains a prepared
+  one.
+- The server can also say so unasked: with `DATABASE_SLOW_MS` set it
+  logs every statement that takes that long, writes included, with the
+  same figures (`OPERATIONS.md`).
 
 ### Expressions
 

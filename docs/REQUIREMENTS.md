@@ -132,3 +132,4 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-O4 | A way to verify the files | `database check` |
 | R-O5 | A fixed memory budget well under what a Postgres of the same job needs, and little CPU when idle | One page cache with a byte limit; no background work when nothing changes |
 | R-O6 | An application on the server's own host reaches it without the network stack | A Unix domain socket beside the TCP port: `DATABASE_SOCKET`, `?socket=` |
+| R-O7 | A slow statement can be seen and understood: how many index entries and rows a query read against how many it returned, on request and, for statements over a threshold, in the server's log (what `EXPLAIN ANALYZE` and `log_min_duration_statement` are used for) | `Db::explain`; `DATABASE_SLOW_MS` |

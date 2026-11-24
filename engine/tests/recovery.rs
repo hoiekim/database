@@ -5,132 +5,16 @@
 //! database is opened again and must hold exactly what was committed: all
 //! of every acknowledged transaction, none of any other, with every index
 //! and the free list consistent.
-//!
-//! And a disk that cannot be read is not a disk that holds nothing: when
-//! a read fails at recovery the engine does not start, and what it could
-//! not read is still there for the next start.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+mod common;
+
 use std::sync::Arc;
-use std::time::Duration;
 
-use database_engine::db::{Database, Options};
-use database_engine::engine::{Engine, EngineOptions};
-use database_engine::error::Error;
-use database_engine::page::PAGE_SIZE;
-use database_engine::store::Limits;
-use database_engine::vfs::{MemVfs, Rng, Vfs};
-use database_engine::wal::wal_generation;
-use database_protocol::expr::*;
-use database_protocol::message::Ddl;
+use common::*;
+use database_engine::db::Database;
+use database_engine::vfs::{MemVfs, Rng};
 use database_protocol::query::*;
-use database_protocol::schema::*;
-use database_protocol::value::{Type, Value};
-
-const DIR: &str = "/data";
-const WAIT: Duration = Duration::from_secs(5);
-
-fn options() -> EngineOptions {
-    // Small limits, so that pages are written early, evicted and read
-    // back, and checkpoints happen, within a short test; and full-text
-    // segments of a handful of rows, so that they are made, merged and
-    // cleaned of dead rows all the time.
-    database_engine::fts::set_pending_bytes(400);
-    EngineOptions { cache_bytes: 64 * 8192, db: Options { sync: true, limits: Limits { max_dirty: 24, max_private: 24 }, checkpoint_bytes: 64 * 1024 } }
-}
-
-fn open(vfs: &MemVfs) -> Engine {
-    Engine::open_with(Arc::new(vfs.clone()), Path::new(DIR), options(), None).expect("the engine opens")
-}
-
-fn items() -> TableDef {
-    TableDef::new("items")
-        .column(ColumnDef::new("id", Type::Int))
-        .column(ColumnDef::new("owner", Type::Int))
-        .column(ColumnDef::new("name", Type::Text))
-        .column(ColumnDef::new("body", Type::Text).default(""))
-        .column(ColumnDef::new("tags", Type::list(Type::Text)).default(Vec::<String>::new()))
-        .primary_key(["id"])
-        .unique("items_name", ["name"])
-        .index(IndexDef::new("items_owner").on(["owner", "id"]))
-        .index(IndexDef::new("items_tags").on(["owner"]).on_each(col("tags")))
-        .index(IndexDef::new("items_search").on(["owner"]).full_text(TextConfig::Simple, [(col("body"), 1.0)]))
-}
-
-/// What a row of `items` holds, as the model keeps it.
-#[derive(Clone, Debug, PartialEq)]
-struct Item {
-    owner: i64,
-    name: String,
-    body: String,
-    tags: Vec<String>,
-}
-
-type Model = BTreeMap<i64, Item>;
-
-fn insert_of(id: i64, item: &Item) -> Insert {
-    Insert::into("items").set("id", id).set("owner", item.owner).set("name", item.name.as_str()).set("body", item.body.as_str()).set("tags", item.tags.clone())
-}
-
-fn random_item(rng: &mut Rng, id: i64) -> Item {
-    let words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
-    let body = match rng.below(12) {
-        // Now and then a body far larger than a page.
-        0 => words[rng.below(6) as usize].repeat(2_000 + rng.below(6_000) as usize),
-        _ => (0..rng.below(12)).map(|_| words[rng.below(6) as usize]).collect::<Vec<_>>().join(" "),
-    };
-    let tags = (0..rng.below(4)).map(|_| format!("t{}", rng.below(5))).collect();
-    Item { owner: rng.below(4) as i64, name: format!("item-{id}-{}", rng.below(1000)), body, tags }
-}
-
-/// The table as it is, read by primary key.
-fn read_model(db: &Arc<Database>) -> Model {
-    let all = db.begin_read().query(&Query::table("items"), None).unwrap();
-    all.rows
-        .iter()
-        .map(|r| {
-            let (Value::Int(id), Value::Int(owner), Value::Text(name), Value::Text(body), Value::List(tags)) = (&r[0], &r[1], &r[2], &r[3], &r[4]) else { panic!("unexpected row {r:?}") };
-            let tags = tags.iter().map(|t| t.to_string()).collect();
-            (*id, Item { owner: *owner, name: name.clone(), body: body.clone(), tags })
-        })
-        .collect()
-}
-
-/// Reads the whole table and compares it with the model, by primary key
-/// and through each index.
-fn verify(db: &Arc<Database>, model: &Model) {
-    let got = read_model(db);
-    let txn = db.begin_read();
-    assert_eq!(got.len(), model.len(), "row count");
-    for (id, item) in model {
-        assert_eq!(got.get(id), Some(item), "row {id}");
-    }
-    for owner in 0..4i64 {
-        let by_owner = txn.query(&Query::table("items").index("items_owner", KeyRange::eq([owner])).columns(["id"]), None).unwrap();
-        let ids: Vec<i64> = by_owner.rows.iter().map(|r| if let Value::Int(n) = r[0] { n } else { panic!() }).collect();
-        let want: Vec<i64> = model.iter().filter(|(_, i)| i.owner == owner).map(|(id, _)| *id).collect();
-        assert_eq!(ids, want, "index by owner {owner}");
-
-        let tagged = txn.query(&Query::table("items").index("items_tags", KeyRange::eq([val(owner), val("t1")])).columns(["id"]), None).unwrap();
-        let mut ids: Vec<i64> = tagged.rows.iter().map(|r| if let Value::Int(n) = r[0] { n } else { panic!() }).collect();
-        ids.sort();
-        let want: Vec<i64> = model.iter().filter(|(_, i)| i.owner == owner && i.tags.iter().any(|t| t == "t1")).map(|(id, _)| *id).collect();
-        assert_eq!(ids, want, "index by tag for owner {owner}");
-
-        let found = txn.query(&Query::table("items").search("items_search", [owner], "gamma").columns(["id"]), None).unwrap();
-        let mut ids: Vec<i64> = found.rows.iter().map(|r| if let Value::Int(n) = r[0] { n } else { panic!() }).collect();
-        ids.sort();
-        let want: Vec<i64> = model.iter().filter(|(_, i)| i.owner == owner && i.body.split(' ').any(|w| w == "gamma")).map(|(id, _)| *id).collect();
-        assert_eq!(ids, want, "search for owner {owner}");
-    }
-    let by_name = txn.query(&Query::table("items").index("items_name", KeyRange::all()).columns(["name"]), None).unwrap();
-    let mut names: Vec<&String> = model.values().map(|i| &i.name).collect();
-    names.sort();
-    assert_eq!(by_name.rows.len(), names.len());
-    drop(txn);
-    db.check().expect("the files are consistent");
-}
+use database_protocol::value::Value;
 
 /// One random transaction of a few statements. Returns the model as it
 /// is if the transaction commits.
@@ -236,14 +120,6 @@ impl Bystander {
             _ => {}
         }
     }
-}
-
-fn create(engine: &Engine) -> Arc<Database> {
-    let db = engine.create_database("test").unwrap();
-    let mut txn = db.begin_write(WAIT, false).unwrap();
-    txn.ddl(&Ddl::CreateTable { def: items(), if_not_exists: false }, None).unwrap();
-    txn.commit().unwrap();
-    db
 }
 
 #[test]
@@ -406,73 +282,6 @@ fn model_of_transaction(rng: &mut Rng, model: &Model, next_id: &mut i64) -> Opti
         return None;
     }
     Some(after)
-}
-
-#[test]
-fn a_read_that_fails_at_recovery_stops_the_start_and_loses_no_commit() {
-    let vfs = MemVfs::new();
-    let engine = open(&vfs);
-    let db = create(&engine);
-    let item = |n: i64| Item { owner: n % 4, name: format!("n{n}"), body: "gamma ".repeat(n as usize % 5), tags: vec![format!("t{}", n % 5)] };
-    let mut model = Model::new();
-    let commit = |model: &mut Model, ids: std::ops::RangeInclusive<i64>| {
-        for n in ids {
-            let mut txn = db.begin_write(WAIT, false).unwrap();
-            txn.insert(&insert_of(n, &item(n)), None).unwrap();
-            txn.commit().unwrap();
-            model.insert(n, item(n));
-        }
-    };
-    // Rows the data file holds, then rows that only the log does, and
-    // the engine killed: nothing more is written.
-    commit(&mut model, 1..=20);
-    db.checkpoint().unwrap();
-    let checkpointed = model.clone();
-    commit(&mut model, 21..=40);
-    drop(db);
-    drop(engine);
-
-    let dir = Path::new(DIR);
-    let data = dir.join("test.db");
-    let logs: Vec<_> = vfs.list(dir).unwrap().into_iter().filter(|file| wal_generation("test", file).is_some()).collect();
-    assert_eq!(logs.len(), 1, "one log file continues from the checkpoint: {logs:?}");
-    let log = dir.join(&logs[0]);
-    // That the log alone holds those rows: the same disk without it has
-    // the checkpoint's and no more. This is what a start that took the
-    // unread log for an empty one would leave.
-    let without_log = vfs.crash_image(0);
-    without_log.remove(&log).unwrap();
-    assert_eq!(read_model(&open(&without_log).database("test").unwrap()), checkpointed);
-
-    let refused = |what: &str| {
-        match Engine::open_with(Arc::new(vfs.clone()), dir, options(), None) {
-            Err(Error::Io(_)) => {}
-            Err(other) => panic!("{what} cannot be read, and the engine says: {other}"),
-            Ok(_) => panic!("{what} cannot be read, and the engine starts"),
-        }
-        assert!(vfs.exists(&log), "{what} cannot be read, and the log is gone");
-        assert!(vfs.exists(&data), "{what} cannot be read, and the data file is gone");
-    };
-    // The log: all of it, and all but its first bytes, so that its
-    // header reads and what follows does not.
-    vfs.fail_reads(Some(&log));
-    refused("the log");
-    vfs.fail_reads_within(&log, 100..u64::MAX);
-    refused("the log past its header");
-    // The data file: all of it, and each copy of its header alone. The
-    // other copy then reads whole, which is no reason to start from it.
-    vfs.fail_reads(Some(&data));
-    refused("the data file");
-    let page = PAGE_SIZE as u64;
-    for copy in 0..2 {
-        vfs.fail_reads_within(&data, copy * page..(copy + 1) * page);
-        refused(["the first copy of the data file's header", "the second copy of the data file's header"][copy as usize]);
-    }
-
-    // The disk reads again, and every commit is there.
-    vfs.fail_reads(None);
-    let engine = open(&vfs);
-    verify(&engine.database("test").unwrap(), &model);
 }
 
 #[test]

@@ -3,12 +3,14 @@
 A map of the code for whoever changes it next: what each part does, the
 rule it keeps, and why it is built that way and not another. The
 requirements are in `REQUIREMENTS.md`; the client's contract is in
-`CLIENT.md`; running it is in `OPERATIONS.md`; how it compares with
-Postgres, and why, is in `PERFORMANCE.md`.
+`CLIENT.md`; the wire protocol is in `PROTOCOL.md`; running it is in
+`OPERATIONS.md`; how it compares with Postgres, and why, is in
+`PERFORMANCE.md`.
 
 ```text
 protocol/   values, expressions, queries, the wire format     (no I/O)
 client/     the typed async client applications use
+clients/    the same client for TypeScript and for Python     (from PROTOCOL.md, not from the Rust)
 engine/     storage, transactions, query execution            (no network, no async)
 server/     the network server and the `database` command
 bench/      the same workloads against this and against Postgres
@@ -165,6 +167,12 @@ record is grown ahead of its records with zeros, in steps that double up
 to a megabyte, and most records are written over room the file already
 has. A record is never empty, so the zeros end the log for a reader.
 
+A log file is synced whole before the next is begun. The first record
+written to a file that follows one with records says so: it is preceded
+by a **link**, a record of the log's own that names the place where
+those records ended. That is what holds a disk to the rule (see "When
+the disk fails"). A file that never gets a record has no link.
+
 Tables marked `volatile` (Postgres' `UNLOGGED`) are not logged; they are
 emptied on recovery. Their commits need no fsync.
 
@@ -177,13 +185,76 @@ other meta page, syncs, and deletes the old log. One runs when the log
 passes 8 MiB or dirty pages pass their limit, and at a clean stop.
 
 Opening a database: read both meta pages and take the newer valid one;
-empty the volatile tables; replay every log record after it, stopping at
-the first record that is incomplete or fails its CRC; checkpoint. In the
-newest log file such a record is the tail a crash tore, and it was never
-acknowledged. In an older file it is damage, since a file is synced
-whole before the next is begun: if commits follow it in a later file,
-the database refuses to open rather than apply them over the gap. Replay runs the same functions that executed
-the statements the first time, so there is one code path to trust.
+write it again and sync it; empty the volatile tables; replay every log
+record after it, stopping at the first record that is incomplete or
+fails its CRC; checkpoint. In the newest log file such a record is the
+tail a crash tore, and it was never acknowledged. In an older file it is
+damage, since a file is synced whole before the next is begun; and so is
+an older file that ends anywhere but where the next file's link says it
+ended. If commits follow the damage in a later file, the database
+refuses to open rather than apply them over the gap. Replay runs the
+same functions that executed the statements the first time, so there is
+one code path to trust.
+
+The meta page is written again because it may have been read from the
+operating system's cache without ever having reached the disk: a
+checkpoint whose last sync failed leaves it so. Opening then removes the
+log that this checkpoint replaced, which would be the only durable copy
+of what the page stands for. If the page was on disk, writing it again
+writes what is there, and no tear of that changes anything.
+
+### When the disk fails (`vfs.rs`)
+
+Every read, write, sync, creation, removal and renaming of a file goes
+through `Vfs`, and any of them may fail. The rule is that **after a
+failure the engine does not guess**:
+
+- A write or a sync that fails under a commit or a checkpoint marks the
+  database failed. It takes no more writes, and it declines to check its
+  files, since what it holds in memory may be half a commit. Readers go
+  on reading the last version that was made durable. A restart reads the
+  files and decides from them what was committed.
+- A sync that failed is never tried again in the hope that it now
+  covers what it did not. The system may have dropped the writes it was
+  to make durable, and a second sync would then report success without
+  them.
+- A data file is made under another name and given its own when it is
+  whole and synced, so a crash never leaves a database that cannot be
+  opened, which would be a server that cannot start. A drop removes the
+  data file before the log, so a crash never leaves a database without
+  its last commits.
+- A read that fails is not a read that found nothing. Recovery ends by
+  deleting: the log it has replayed, and whatever the data file holds
+  beyond the checkpoint it started from. So it takes something for
+  absent on two grounds only, both of them things it has seen: the
+  file's length says the bytes were never written, or the bytes were
+  read and do not check. A read that returns an error is neither, since
+  the bytes may all be there and the next read may give them. The start
+  stops with that error, the log and the checkpoint as they were. Taken
+  for the torn end of the log, it would end replay early, and the
+  checkpoint that follows replay would delete a log with acknowledged
+  commits in it. Taken for a meta page that is not valid, it would
+  leave the other copy to be chosen: if that is the older, a checkpoint
+  whose log was deleted when the newer was written, and to whose length
+  the file would then be cut. Only a file too short to hold a copy is
+  without it, and an error on either copy stops the start, since a copy
+  that was not read cannot be known to be the older.
+
+What no engine can do is keep its promise on a disk that reports a sync
+it has not done. The most that can be had is that the loss is seen. A
+log that lost records ends early, which gives the database as it stood
+at an earlier commit; or, where a later file was begun on the strength
+of the sync that lied, it ends short of the next file's link, and the
+database refuses to open if commits follow. A data file is weaker here:
+a page that was never written leaves the page that was there before,
+whose checksum is good. A read that comes to it is given the rows of
+another time. Page checksums catch a page that is torn or absent, and
+`check` catches most of the rest; catching all of it would take keeping
+each page's checksum in the page that points to it. Two things such a
+file can hold are reported as damage rather than followed: a log record
+that does not apply to it (a table created twice, say) refuses the
+start, and a tree whose pages lead back to one another fails the read
+that goes deeper than 64 levels, which no tree grows to.
 
 `engine/tests/recovery.rs` runs a random workload over a simulated file
 system that can cut power at any write, keep or drop or tear each
@@ -191,40 +262,40 @@ unsynced write independently, and checks after every reopening that the
 database holds exactly the acknowledged commits, with every index, the
 free list and every page accounted for.
 
-### When the disk fails
+`engine/tests/faults.rs` is exhaustive where that one is random. A
+scripted workload makes every kind of commit (alone, in a group that
+shares a sync, as a fork, beside a checkpoint at three moments of it,
+with large values, to tables that are not logged), changes its schema,
+restarts cleanly and not, and ends with a drop, a creation and a restore
+over a database. Every operation it made on the disk is kept, so the
+disk can be rebuilt as it stood before each one, which is where a
+process killed at that step leaves it. Then:
 
-**A read that fails is not a read that found nothing.** Recovery ends
-by deleting: the log files it has replayed, and whatever the data file
-holds beyond the checkpoint it started from. So it takes something for
-absent on two grounds only, both of them things it has seen: the file's
-length says the bytes were never written, or the bytes were read and do
-not check. The tail of the log that a crash tore is found that way, and
-a meta page that a crash cut short.
+- **The power is cut before every operation**, in each way that leaves
+  another disk: nothing lost, everything unsynced lost, the last write
+  torn at its sectors (the meta page at every one), only the last write
+  kept. A sample of those disks has its recovery cut the same way.
+- **The disk fills** at every operation that needs room, and stays full
+  through the rest of the workload and a restart.
+- **Every operation fails, once.** A sync fails as it does on a real
+  system: what it was to make durable is on the disk or is not, and no
+  later sync writes it.
+- **The disk lies** about every sync of the log, of the data file, or of
+  both, from one sync on, and the power is cut at points after that.
 
-A read that returns an error is neither. It says nothing of what the
-file holds: the bytes may all be there, and the next read may give
-them. So during recovery it is returned as the I/O error it is. The
-database is not opened and the server does not start; the log and the
-checkpoint are as they were, for a start when the disk reads again.
+After each of the first three the database must hold exactly what its
+clients were told, or that and the commits that were under way; while
+the disk fails, readers must still see every acknowledged commit, and
+nothing may be acknowledged that a restart then takes back. After a
+lie, a log must give the database as of some commit or be refused, and a
+data file must at least never be blamed on anything but itself, nor
+make the engine panic.
 
-- **In the log**, an error reading a file's header, the length and CRC
-  before a record, or the record itself is not the end of the log.
-  Taken for a torn tail it would end replay early, and the checkpoint
-  that follows replay would delete the file with acknowledged commits
-  still in it.
-- **In the data file**, an error reading a meta page is not an invalid
-  copy. Passed over, it would leave the other copy to be chosen: if
-  that is the older, a checkpoint whose log was deleted when the newer
-  was written, and to whose length the file would then be cut. Only a
-  file too short to hold a copy is without it. An error on either copy
-  stops the start, since a copy that was not read cannot be known to be
-  the older.
-
-`engine/tests/recovery.rs` commits rows that only the log holds, kills
-the engine and makes reads fail: of the log, of the data file, of each
-meta page alone. Each time the engine must refuse to start, with an I/O
-error and with the files still there, and once the disk reads again
-every commit is back.
+One test there stands apart from the workload. It commits rows that
+only the log holds, kills the engine and makes reads fail: of the log,
+of the data file, of each meta page alone. Each time the engine must
+refuse to start, with an I/O error and with the files still there, and
+once the disk reads again every commit is back.
 
 ## Transactions (`db.rs`, `write.rs`)
 
@@ -284,6 +355,15 @@ joins (each a lookup per row so far); `each` (one row per item of a
 list); the filter; grouping; ordering; offset and limit; the selected
 values. With no `order_by` the pipeline stops as soon as the limit is
 reached, which is what makes "the newest 50" cost 50 rows.
+
+**What a statement read is counted as it reads**: an entry for each
+index entry a range or a tree walk gives and each hit of a search, a
+row for each row read from a table, by any path. The two counts are
+all the explaining there is to do where nothing is planned: a
+statement's cost is what its own access path made the server read.
+They are what `Request::Explain` answers with in place of a query's
+rows, and what the server writes to its log beside a statement that
+took longer than `DATABASE_SLOW_MS`.
 
 Expressions are a tree (`Expr`) evaluated against a chain of scopes:
 the current row, the rows of enclosing joins and queries, the proposed

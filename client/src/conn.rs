@@ -103,7 +103,7 @@ const REMEMBERED_STATEMENTS: usize = 4 * KEPT_STATEMENTS;
 fn prepared_in(request: &mut Request, f: &mut dyn FnMut(u64, &mut Option<Arc<Request>>)) {
     match request {
         Request::Prepared { id, statement, .. } => f(*id, statement),
-        Request::BeginWith { statement, .. } => prepared_in(statement, f),
+        Request::BeginWith { statement, .. } | Request::Explain(statement) => prepared_in(statement, f),
         Request::Batch(items) => items.iter_mut().for_each(|item| prepared_in(&mut item.statement, f)),
         _ => {}
     }

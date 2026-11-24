@@ -197,7 +197,11 @@ pub fn entry_pk<'k>(key: &'k [u8], value: &[u8]) -> Result<&'k [u8]> {
 }
 
 pub fn fetch(ctx: &Ctx, table: &Table, pk: &[u8]) -> Result<Option<Row>> {
-    btree::get(ctx.pages, table.root, pk)?.map(Row::parse).transpose()
+    let found = btree::get(ctx.pages, table.root, pk)?;
+    if found.is_some() {
+        ctx.cost.row();
+    }
+    found.map(Row::parse).transpose()
 }
 
 fn fetch_indexed(ctx: &Ctx, table: &Table, pk: &[u8]) -> Result<Row> {
@@ -212,6 +216,7 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
             for range in ranges {
                 let Some((start, end)) = range_bytes(ctx, outer, range, parts)? else { continue };
                 let done = walk_range(ctx, table.root, start.as_deref(), end.as_deref(), *reverse, &mut |key, value| {
+                    ctx.cost.row();
                     on_hit(&Hit { pk: key.to_vec(), row: Row::parse(value.to_vec())?, depth: None, rank: None })
                 })?;
                 if !done {
@@ -232,6 +237,7 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
             for range in ranges {
                 let Some((start, end)) = range_bytes(ctx, outer, range, &parts)? else { continue };
                 let done = walk_range(ctx, table.index_roots[i], start.as_deref(), end.as_deref(), *reverse, &mut |key, value| {
+                    ctx.cost.entry();
                     let pk = entry_pk(key, value)?;
                     if let Some(seen) = &mut seen {
                         if !seen.insert(pk.to_vec()) {
@@ -341,6 +347,7 @@ fn walk_tree(
                     let prefix = encode_prefix(vec![value], &index_parts(table, i))?;
                     let end = keys::successor(&prefix);
                     let done = walk_range(ctx, table.index_roots[i], Some(&prefix), end.as_deref(), false, &mut |key, entry| {
+                        ctx.cost.entry();
                         let pk = entry_pk(key, entry)?;
                         reach(pk.to_vec(), fetch_indexed(ctx, table, pk)?, &mut next_level)
                     })?;
@@ -384,7 +391,9 @@ fn search(ctx: &Ctx, table: &Table, outer: &Scope, index: &str, prefix: &[Expr],
         return Ok(true);
     }
     let lead = encode_prefix(lead, &index_parts(table, i))?;
-    for (n, (pk, rank)) in crate::fts::search(ctx, table, i, &lead, &query, match_prefix)?.into_iter().enumerate() {
+    let hits = crate::fts::search(ctx, table, i, &lead, &query, match_prefix)?;
+    ctx.cost.entries(hits.len() as u64);
+    for (n, (pk, rank)) in hits.into_iter().enumerate() {
         if n % 256 == 255 {
             ctx.check_deadline()?;
         }

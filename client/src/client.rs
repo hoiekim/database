@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::expr::Expr;
-use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Request, Response, TxnKind};
+use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Request, Response, TxnKind, EXPLAIN_COLUMNS};
 use database_protocol::query::{Delete, Insert, Query, Update};
 use database_protocol::schema::{ColumnDef, IndexDef, TableDef};
 use database_protocol::value::{Timestamp, Value};
@@ -33,6 +33,33 @@ fn ok(response: Response) -> DbResult<()> {
         Response::Ok => Ok(()),
         _ => Err(unexpected("a command")),
     }
+}
+
+/// What a query made the server read: the answer of `Db::explain`.
+///
+/// There is no planner here, so there is no plan to look at: a query
+/// reads the range it names, in order, and filters what that gives. What
+/// can be wrong with it is that the range takes in far more than the
+/// query returns, and these figures say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Explained {
+    /// Entries read from indexes: those of an ordered index's range, the
+    /// children a tree walk found, a search's hits.
+    pub index_entries: u64,
+    /// Rows read from tables: in key order, through an index, and by
+    /// joins and subqueries.
+    pub rows_read: u64,
+    /// Rows the query returned.
+    pub rows_returned: u64,
+    /// How long the server took over it.
+    pub took: std::time::Duration,
+}
+
+fn explained(response: Response) -> DbResult<Explained> {
+    let rows = rows(response)?;
+    let row = rows.one()?;
+    let figure = |n: usize| row.get::<i64>(EXPLAIN_COLUMNS[n]).map(|v| v.max(0) as u64);
+    Ok(Explained { index_entries: figure(0)?, rows_read: figure(1)?, rows_returned: figure(2)?, took: std::time::Duration::from_micros(figure(3)?) })
 }
 
 /// A query, an insert, an update or a delete: what can be prepared, and
@@ -196,6 +223,19 @@ pub trait Db: Sync {
 
     fn delete(&self, delete: Delete) -> impl Future<Output = DbResult<Rows>> + Send {
         async move { rows(self.call(Request::Delete(delete)).await?) }
+    }
+
+    /// Runs a query and says what it made the server read, instead of
+    /// giving its rows: see `Explained`. For finding out why a query is
+    /// slow, or whether one will be when the table has grown.
+    fn explain(&self, query: Query) -> impl Future<Output = DbResult<Explained>> + Send {
+        async move { explained(self.call(Request::Explain(Box::new(Request::Query(query)))).await?) }
+    }
+
+    /// The same for a prepared query run with these values.
+    fn explain_prepared<V: Into<Value>>(&self, prepared: &Prepared, params: impl IntoIterator<Item = V>) -> impl Future<Output = DbResult<Explained>> + Send {
+        let request = Request::Explain(Box::new(prepared.run(params)));
+        async move { explained(self.call(request).await?) }
     }
 
     /// Runs a prepared statement with a value for each of its `param`s,
