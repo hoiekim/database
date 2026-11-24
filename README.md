@@ -142,6 +142,7 @@ docs/       REQUIREMENTS.md   what the database has to do
 cargo build --release          # target/release/database
 cargo test                     # everything: minutes to build, seconds to run
 CRASH_SEEDS=2000 cargo test -p database-engine --test recovery   # a longer hunt
+FAULT_SCRIPTS=20 cargo test -p database-engine --test faults     # and another
 ```
 
 The tests, by what they prove:
@@ -155,6 +156,7 @@ The tests, by what they prove:
 | `server/tests/explain.rs` | what a query read, by every way in, against what it returned; slow statements in the server's log |
 | `server/tests/durability.rs` | a server killed with `SIGKILL` under load, six times over, loses nothing acknowledged; memory stays bounded with data many times the cache |
 | `server/tests/operations.rs` | dump under load, restore, a damaged dump refused, passwords, restarts |
+| `engine/tests/faults.rs` | a scripted workload, killed before every operation it makes on the disk, with the power cut each way that differs, and again inside the recoveries; the disk full from each operation on; each operation failing once, a sync by losing what it covered; a disk that lies about its syncs. Nothing acknowledged is lost, and what a lying disk lost is seen as far as checksums can see |
 | `engine/tests/recovery.rs` | a random workload on a simulated disk that loses power at any write, keeping, dropping or tearing each unsynced write, with transactions open beside the writer; after every cut the database equals a model of what was committed and no page is lost |
 | `protocol/tests/vectors.rs` | the golden vectors are what the wire format is: 105 messages, each as the bytes this crate writes, and the limits `docs/PROTOCOL.md` states |
 | `clients/typescript/test`, `clients/python/tests` | each client writes those same bytes and reads them back, its builders mean what the Rust builders mean, and every kind of request works against a real server (`npm test`; `python -m unittest discover -s tests -t .`) |

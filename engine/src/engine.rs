@@ -11,7 +11,7 @@ use std::time::Duration;
 use database_protocol::error::{DbError, ErrorCode};
 
 use crate::cache::PageCache;
-use crate::db::{Database, Options};
+use crate::db::{Database, Options, CREATING};
 use crate::error::{Error, Result};
 use crate::vfs::{DiskVfs, Vfs};
 
@@ -128,10 +128,11 @@ impl Engine {
             due: Arc::new(Due { paused: AtomicBool::new(paused), ..Due::default() }),
             _lock: lock,
         });
-        // What a restore was building when the server stopped is no use.
+        // What a restore was building when the server stopped is no use,
+        // nor is a data file that was still being made.
         let mut swept = false;
         for file in vfs.list(dir)? {
-            if file.contains(RESTORING) {
+            if file.contains(RESTORING) || file.contains(CREATING) {
                 vfs.remove(&dir.join(&file))?;
                 swept = true;
             }
@@ -151,7 +152,12 @@ impl Engine {
         let background = inner.clone();
         let checkpointer = std::thread::Builder::new().name("checkpointer".into()).spawn(move || loop {
             {
+                // Told to stop before it first waited, it would otherwise
+                // sleep through the wake-up it was sent.
                 let stopping = background.stopping.lock().unwrap();
+                if *stopping {
+                    return;
+                }
                 let (stopping, _) = background.wake.wait_timeout(stopping, Duration::from_millis(250)).unwrap();
                 if *stopping {
                     return;
