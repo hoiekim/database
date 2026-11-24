@@ -861,6 +861,15 @@ fn mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_048_576.0)
 }
 
+/// Operations a second: to one decimal place where there are few.
+fn rate(per_second: f64) -> String {
+    if per_second < 100.0 {
+        format!("{per_second:.1}")
+    } else {
+        format!("{per_second:.0}")
+    }
+}
+
 fn micros(d: Duration) -> String {
     if d.as_micros() >= 10_000 {
         format!("{:.1} ms", d.as_secs_f64() * 1000.0)
@@ -881,7 +890,7 @@ fn print(reports: &[Report]) {
             .iter()
             .flat_map(|r| match pick(r) {
                 Some(t) => [
-                    format!("{:.0}", t.ops as f64 / t.seconds),
+                    rate(t.ops as f64 / t.seconds),
                     micros(t.p50),
                     micros(t.p99),
                 ],

@@ -217,6 +217,9 @@ pub struct Store {
     in_mem: AtomicUsize,
     /// And, when there is, which pages it may be.
     maybe: MaybeInMem,
+    /// The version the oldest reader must have reached before any freed
+    /// page that waits can be given back: `u64::MAX` when none can.
+    release_at: AtomicU64,
     pub disk_reads: AtomicU64,
     pub disk_writes: AtomicU64,
 }
@@ -331,6 +334,7 @@ impl Store {
             serials: Mutex::new(HashMap::new()),
             in_mem: AtomicUsize::new(0),
             maybe: MaybeInMem::new(),
+            release_at: AtomicU64::new(u64::MAX),
             disk_reads: AtomicU64::new(0),
             disk_writes: AtomicU64::new(0),
         }
@@ -449,7 +453,9 @@ impl Store {
     }
 
     pub fn unpin(&self, version: u64) {
-        let was_oldest = {
+        // The oldest version still needed, if this reader was the last
+        // to hold back anything older.
+        let moved_on = {
             let mut pins = self.pins.lock().unwrap();
             let oldest = pins.counts.keys().next().copied();
             if let Some(count) = pins.counts.get_mut(&version) {
@@ -458,20 +464,26 @@ impl Store {
                     pins.counts.remove(&version);
                 }
             }
-            oldest == Some(version) && !pins.counts.contains_key(&version)
+            (oldest == Some(version) && !pins.counts.contains_key(&version)).then(|| pins.counts.keys().next().copied().unwrap_or(pins.published).min(pins.published))
         };
-        if was_oldest {
+        // Every reader comes through here, and after a burst of writes
+        // pages wait that only a checkpoint will free: the allocator's
+        // lock is taken only when there is something to give back.
+        if moved_on.is_some_and(|oldest| oldest >= self.release_at.load(Ordering::Acquire)) {
             self.release();
         }
     }
 
     /// Makes `version` the one new readers see.
     pub fn publish(&self, version: u64) {
-        {
+        let oldest = {
             let mut pins = self.pins.lock().unwrap();
             pins.published = pins.published.max(version);
+            pins.counts.keys().next().copied().unwrap_or(pins.published).min(pins.published)
+        };
+        if oldest >= self.release_at.load(Ordering::Acquire) {
+            self.release();
         }
-        self.release();
     }
 
     pub fn published(&self) -> u64 {
@@ -489,6 +501,7 @@ impl Store {
     fn release(&self) {
         let mut alloc = self.alloc.lock().unwrap();
         if alloc.wait_readers.is_empty() && alloc.wait_checkpoint.is_empty() {
+            self.note_waiting(&alloc);
             return;
         }
         let oldest = self.oldest_needed();
@@ -506,6 +519,7 @@ impl Store {
             }
             released.extend(entry.remove());
         }
+        self.note_waiting(&alloc);
         if released.is_empty() {
             return;
         }
@@ -520,6 +534,15 @@ impl Store {
             self.cache.remove(self.id, *id);
         }
         alloc.free.extend(released);
+    }
+
+    /// Notes the oldest reader's version from which some waiting page
+    /// can be given back: called with the allocator's lock held, after
+    /// every change to what waits or to the checkpoint on disk.
+    fn note_waiting(&self, alloc: &Alloc) {
+        let readers = alloc.wait_readers.keys().next().copied().unwrap_or(u64::MAX);
+        let checkpoint = alloc.wait_checkpoint.keys().next().copied().filter(|freed_at| *freed_at <= alloc.durable).unwrap_or(u64::MAX);
+        self.release_at.store(readers.min(checkpoint), Ordering::Release);
     }
 
     // ------------------------------------------------------------ writers
@@ -582,6 +605,7 @@ impl Store {
                 }
             }
         }
+        self.note_waiting(&alloc);
 
         let take = |alloc: &mut Alloc| match alloc.free.pop() {
             Some(id) => id,
@@ -895,6 +919,7 @@ impl Writer {
             }
             self.store.count_mem(&mem, false);
             alloc.free.append(&mut self.recycled);
+            self.store.note_waiting(&alloc);
         }
         self.spilled.clear();
         self.store.flush_dirty_if_many()

@@ -453,9 +453,9 @@ fn stem_bytes(w: &mut Vec<u8>) {
     if tidy {
         if w.ends_with(b"at") || w.ends_with(b"bl") || w.ends_with(b"iz") {
             w.push(b'e');
-        } else if double_consonant(&w) && !matches!(w[w.len() - 1], b'l' | b's' | b'z') {
+        } else if double_consonant(w) && !matches!(w[w.len() - 1], b'l' | b's' | b'z') {
             w.pop();
-        } else if measure(&w) == 1 && cvc(&w) {
+        } else if measure(w) == 1 && cvc(w) {
             w.push(b'e');
         }
     }
