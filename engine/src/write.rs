@@ -25,7 +25,7 @@ use crate::blob;
 use crate::btree::{self, Cursor};
 use crate::catalog::{plain_columns, Catalog, Table, TableMeta};
 use crate::error::{Error, Result};
-use crate::eval::{eval, frame_value, holds, Ctx, Frame, Scope};
+use crate::eval::{eval, frame_value, holds, Ctx, Frame, Scope, Tape};
 use crate::exec::{self, encode_prefix, entry_pk, fetch, for_each_match, index_parts, pk_parts};
 use crate::fts;
 use crate::keys;
@@ -55,6 +55,10 @@ pub struct Tx {
     pub deadline: Option<Instant>,
     /// False while the log is being replayed: nothing is recorded twice.
     pub logging: bool,
+    /// What its statements draw: random ids and counters' numbers.
+    pub tape: Tape,
+    /// The tables it has made, which nobody else can see until it commits.
+    created: Vec<u32>,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -166,7 +170,7 @@ pub fn entry_keys(ctx: &Ctx, table: &Table, i: usize, row: &Row, pk: &[u8]) -> R
 }
 
 fn pk_of(table: &Table, values: &[Value]) -> Result<Vec<u8>> {
-    encode_prefix(table.pk.iter().map(|i| values[*i].clone()).collect(), &pk_parts(table))
+    encode_prefix(table.pk.iter().map(|i| values[*i].clone()).collect(), pk_parts(table))
 }
 
 /// The primary key of another row that already holds this unique entry.
@@ -192,11 +196,11 @@ fn unique_holder(ctx: &Ctx, table: &Table, i: usize, entry: &Entry, own_pk: &[u8
 
 impl Tx {
     pub fn new(writer: Writer, catalog: Catalog, now: i64) -> Tx {
-        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true }
+        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), created: Vec::new() }
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline }
+        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape) }
     }
 
     fn table(&self, name: &str) -> Result<Arc<Table>> {
@@ -213,24 +217,28 @@ impl Tx {
     /// Stores a new row. `values` holds one value per stored column, of
     /// the column's type, and breaks no constraint.
     pub fn apply_insert(&mut self, name: &str, values: &[Value]) -> Result<Vec<u8>> {
+        let stored = Row::from_values(values);
+        self.apply_insert_row(name, values, &stored)
+    }
+
+    /// `apply_insert` for a row already made of its values.
+    fn apply_insert_row(&mut self, name: &str, values: &[Value], stored: &Row) -> Result<Vec<u8>> {
         let table = self.table(name)?;
         let pk = pk_of(&table, values)?;
-        let stored = Row::from_values(values);
         let (entries, words) = {
             let ctx = self.ctx();
-            let entries: Vec<Vec<Entry>> = (0..table.indexes.len()).map(|i| index_entries(&ctx, &table, i, &stored, &pk)).collect::<Result<_>>()?;
+            let entries: Vec<Vec<Entry>> = (0..table.indexes.len()).map(|i| index_entries(&ctx, &table, i, stored, &pk)).collect::<Result<_>>()?;
             let mut words = Vec::new();
             for i in (0..table.indexes.len()).filter(|i| is_full_text(&table, *i)) {
-                if let Some(w) = fts::words_of(&ctx, &table, i, &stored)? {
+                if let Some(w) = fts::words_of(&ctx, &table, i, stored)? {
                     words.push((i, w));
                 }
             }
             (entries, words)
         };
-        let mut cols: Vec<Vec<u8>> = values.iter().map(row::encode_value).collect();
         let (mut blobs, mut next_blob) = (table.blobs, table.next_blob);
-        row::fit(&mut self.writer, &mut cols, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
-        let (root, existed) = btree::put(&mut self.writer, table.root, &pk, &row::assemble(&cols))?;
+        let moved = row::fitted(&mut self.writer, stored, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
+        let (root, existed) = btree::put(&mut self.writer, table.root, &pk, moved.as_deref().unwrap_or(stored.raw()))?;
         if existed {
             return Err(Error::corrupt(format!("a row of table {name:?} was inserted over another")));
         }
@@ -267,22 +275,43 @@ impl Tx {
         Ok(pk)
     }
 
+    /// The row `old` with `changes` made: the changed values, and the
+    /// stored bytes of the rest, large values still where they were.
+    fn changed_row(table: &Table, old: &Row, changes: &[(usize, Value)]) -> Row {
+        Row::build(table.cols.len(), |i, out| {
+            match changes.iter().rev().find(|(c, _)| *c == i) {
+                Some((_, value)) => codec::put_value(out, value),
+                None => match old.raw_col(i) {
+                    Some(raw) => out.buf.extend_from_slice(raw),
+                    None => codec::put_value(out, &table.cols[i].fill),
+                },
+            }
+        })
+    }
+
     /// Changes columns of the row with primary key `pk`.
     pub fn apply_update(&mut self, name: &str, pk: &[u8], changes: &[(usize, Value)]) -> Result<()> {
         let table = self.table(name)?;
-        let old = fetch(&self.ctx(), &table, pk)?.ok_or_else(|| Error::corrupt(format!("a row of table {name:?} vanished before its update")))?;
-        // The new row, column by column: the changed values, and the
-        // stored bytes of the rest, large values still where they were.
-        let mut cols: Vec<Vec<u8>> = (0..table.cols.len())
-            .map(|i| match changes.iter().rev().find(|(c, _)| *c == i) {
-                Some((_, value)) => row::encode_value(value),
-                None => match old.raw_col(i) {
-                    Some(raw) => raw.to_vec(),
-                    None => row::encode_value(&table.cols[i].fill),
-                },
-            })
-            .collect();
-        let new = Row::parse(row::assemble(&cols))?;
+        let old = fetch(&self.ctx(), &table, pk)?.ok_or_else(|| {
+            Error::corrupt(format!(
+                "a row of table {name:?} vanished before its update"
+            ))
+        })?;
+        let new = Self::changed_row(&table, &old, changes);
+        self.apply_update_rows(name, pk, changes, &old, &new)
+    }
+
+    /// `apply_update` for a row already read (`old`) and already made of
+    /// its changes (`new`).
+    fn apply_update_rows(
+        &mut self,
+        name: &str,
+        pk: &[u8],
+        changes: &[(usize, Value)],
+        old: &Row,
+        new: &Row,
+    ) -> Result<()> {
+        let table = self.table(name)?;
         // Only the indexes that read a changed column can change.
         let touched: Vec<usize> = (0..table.indexes.len()).filter(|i| table.indexes[*i].reads.iter().any(|c| changes.iter().any(|(ch, _)| ch == c))).collect();
         let (before, after, reworded) = {
@@ -291,13 +320,13 @@ impl Tx {
             let mut after = Vec::new();
             let mut reworded = Vec::new();
             for i in &touched {
-                before.push(index_entries(&ctx, &table, *i, &old, pk)?);
-                after.push(index_entries(&ctx, &table, *i, &new, pk)?);
+                before.push(index_entries(&ctx, &table, *i, old, pk)?);
+                after.push(index_entries(&ctx, &table, *i, new, pk)?);
                 if is_full_text(&table, *i) {
                     // Written again with the words it had, a row stays
                     // as it is in the index.
-                    let was = fts::words_of(&ctx, &table, *i, &old)?;
-                    let now = fts::words_of(&ctx, &table, *i, &new)?;
+                    let was = fts::words_of(&ctx, &table, *i, old)?;
+                    let now = fts::words_of(&ctx, &table, *i, new)?;
                     if was != now {
                         reworded.push((*i, now));
                     }
@@ -311,8 +340,8 @@ impl Tx {
                 blobs = blob::free(&mut self.writer, blobs, b.id, b.len)?;
             }
         }
-        row::fit(&mut self.writer, &mut cols, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
-        let root = btree::put(&mut self.writer, table.root, pk, &row::assemble(&cols))?.0;
+        let moved = row::fitted(&mut self.writer, new, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
+        let root = btree::put(&mut self.writer, table.root, pk, moved.as_deref().unwrap_or(new.raw()))?.0;
         let mut index_roots = table.index_roots.clone();
         for ((i, before), after) in touched.iter().zip(&before).zip(&after) {
             for entry in before {
@@ -448,7 +477,7 @@ impl Tx {
             }
             let parent = self.table(&fk.ref_table)?;
             let found = match parent.unique_key(&fk.ref_columns) {
-                Some(None) => fetch(&ctx, &parent, &encode_prefix(key.clone(), &pk_parts(&parent))?)?.is_some(),
+                Some(None) => fetch(&ctx, &parent, &encode_prefix(key.clone(), pk_parts(&parent))?)?.is_some(),
                 Some(Some(i)) => {
                     let prefix = encode_prefix(key.clone(), &index_parts(&parent, i))?;
                     let mut cursor = Cursor::new(ctx.pages, parent.index_roots[i]);
@@ -526,15 +555,28 @@ impl Tx {
         violation(ErrorCode::UniqueViolation, &table.name, index, format!("a row of {:?} with this key already exists", table.name))
     }
 
-    /// Validates and applies a change to one row.
-    fn update_row(&mut self, name: &str, pk: &[u8], changes: Vec<(usize, Value)>) -> Result<()> {
+    /// Validates and applies a change to one row, and returns the row as
+    /// it now is. `old` is the row as it was, if the caller has it at
+    /// hand: it is read otherwise.
+    fn update_row(&mut self, name: &str, pk: &[u8], changes: Vec<(usize, Value)>, old: Option<&Row>) -> Result<Row> {
         let table = self.table(name)?;
-        let old = fetch(&self.ctx(), &table, pk)?.ok_or_else(|| Error::corrupt(format!("a row of table {name:?} vanished before its update")))?;
+        let read;
+        let old = match old {
+            Some(old) => old,
+            None => {
+                read = fetch(&self.ctx(), &table, pk)?.ok_or_else(|| {
+                    Error::corrupt(format!(
+                        "a row of table {name:?} vanished before its update"
+                    ))
+                })?;
+                &read
+            }
+        };
         let mut fitted = Vec::with_capacity(changes.len());
         for (i, value) in changes {
             let value = Self::fit_column(&table, i, value)?;
             if table.pk.contains(&i) {
-                let current = frame_value(&self.ctx(), &Frame { alias: name, table: &table, row: Some(&old) }, i)?;
+                let current = frame_value(&self.ctx(), &Frame { alias: name, table: &table, row: Some(old) }, i)?;
                 if !current.same(&value) {
                     return Err(invalid(format!("column {:?} is part of the primary key of {name:?} and cannot be changed: delete the row and insert it again", table.cols[i].def.name)));
                 }
@@ -543,21 +585,16 @@ impl Tx {
             fitted.push((i, value));
         }
         let changed: Vec<usize> = fitted.iter().map(|(i, _)| *i).collect();
-        let cols: Vec<Vec<u8>> = (0..table.cols.len())
-            .map(|i| match fitted.iter().rev().find(|(c, _)| *c == i) {
-                Some((_, value)) => row::encode_value(value),
-                None => old.raw_col(i).map_or_else(|| row::encode_value(&table.cols[i].fill), <[u8]>::to_vec),
-            })
-            .collect();
-        let new = Row::parse(row::assemble(&cols))?;
+        let new = Self::changed_row(&table, old, &fitted);
         self.check_row(&table, &new, Some(&changed))?;
         let touched: Vec<usize> = (0..table.indexes.len()).filter(|i| table.indexes[*i].reads.iter().any(|c| changed.contains(c))).collect();
         if let Some((index, _)) = self.find_conflict(&table, &new, pk, Some(&touched))? {
             return Err(Self::unique_error(&table, &index));
         }
         self.check_parents(&table, &new, Some(&changed))?;
-        self.check_children_keep_their_parent(&table, &old, &new, &changed)?;
-        self.apply_update(name, pk, &fitted)
+        self.check_children_keep_their_parent(&table, old, &new, &changed)?;
+        self.apply_update_rows(name, pk, &fitted, old, &new)?;
+        Ok(new)
     }
 
     /// Deletes rows and then deals with the rows that pointed at them:
@@ -636,7 +673,7 @@ impl Tx {
         let pk_prefix = fk.columns.len() <= child.pk.len() && fk.columns.iter().zip(&child.pk).all(|(c, i)| child.cols[*i].def.name == *c);
         if pk_prefix {
             for key in keys {
-                let prefix = encode_prefix(key.clone(), &pk_parts(child))?;
+                let prefix = encode_prefix(key.clone(), pk_parts(child))?;
                 let mut cursor = Cursor::new(ctx.pages, child.root);
                 cursor.seek(&prefix)?;
                 while let Some(k) = cursor.key() {
@@ -738,7 +775,8 @@ impl Tx {
                     continue;
                 }
                 values[i] = if col.def.auto_increment {
-                    Value::Int(table.serials[i])
+                    let own = self.created.contains(&table.id);
+                    Value::Int(self.tape.serial(table.serials[i], |floor| self.writer.next_serial(table.id, i, floor, own)))
                 } else if let Some(default) = &col.def.default {
                     Self::fit_column(&table, i, eval(&self.ctx(), &Scope::default(), default)?)?
                 } else {
@@ -749,8 +787,10 @@ impl Tx {
             self.check_row(&table, &proposed, None)?;
             let pk = pk_of(&table, &values)?;
 
-            // Which unique key, if any, the row would break.
-            let conflict = if fetch(&self.ctx(), &table, &pk)?.is_some() {
+            // Which unique key, if any, the row would break. The row
+            // that holds its primary key is kept: an upsert reads it.
+            let mut held = fetch(&self.ctx(), &table, &pk)?;
+            let conflict = if held.is_some() {
                 Some((PRIMARY.to_string(), pk.clone()))
             } else {
                 self.find_conflict(&table, &proposed, &pk, None)?
@@ -773,14 +813,21 @@ impl Tx {
                 (OnConflict::DoUpdate { .. }, Some((_, holder))) => Some(holder),
             };
 
-            let (pk, old) = match existing {
+            // The row as written, and as it was before if it was there.
+            let (stored, old) = match existing {
                 None => {
                     self.check_parents(&table, &proposed, None)?;
-                    (self.apply_insert(&ins.table, &values)?, None)
+                    self.apply_insert_row(&ins.table, &values, &proposed)?;
+                    (proposed, None)
                 }
                 Some(holder) => {
                     let OnConflict::DoUpdate { set, filter, .. } = &ins.on_conflict else { unreachable!() };
-                    let current = fetch(&self.ctx(), &table, &holder)?.ok_or_else(|| Error::corrupt("a unique index points at a row that is not there"))?;
+                    let current = match held.take() {
+                        Some(row) if holder == pk => row,
+                        _ => fetch(&self.ctx(), &table, &holder)?.ok_or_else(|| {
+                            Error::corrupt("a unique index points at a row that is not there")
+                        })?,
+                    };
                     let changes = {
                         let ctx = self.ctx();
                         let frame = [Frame { alias: &table.name, table: &table, row: Some(&current) }];
@@ -792,15 +839,16 @@ impl Tx {
                         }
                         set.iter().map(|a| Ok((table.col(&a.column)?, eval(&ctx, &scope, &a.value)?))).collect::<Result<Vec<_>>>()?
                     };
-                    self.update_row(&ins.table, &holder, changes)?;
-                    (holder, Some(current))
+                    let new = self.update_row(&ins.table, &holder, changes, Some(&current))?;
+                    (new, Some(current))
                 }
             };
             affected += 1;
             if !returning.is_empty() {
+                // Read from the row as it was made, not from the tree
+                // again. The table is read anew: its large values moved.
                 let table = self.table(&ins.table)?;
                 let ctx = self.ctx();
-                let stored = fetch(&ctx, &table, &pk)?.ok_or_else(|| Error::corrupt("a row vanished after it was written"))?;
                 let frame = [Frame { alias: &table.name, table: &table, row: Some(&stored) }];
                 let scope = Scope { frames: &frame, old: old.as_ref(), excluded: Some(&values), ..Scope::default() };
                 out.push(returning.iter().map(|s| eval(&ctx, &scope, &s.expr)).collect::<Result<Vec<_>>>()?);
@@ -895,7 +943,7 @@ impl Tx {
             if n % 64 == 63 {
                 self.ctx().check_deadline()?;
             }
-            self.update_row(&name, &pk, changes)?;
+            self.update_row(&name, &pk, changes, None)?;
             affected += 1;
             if !returning.is_empty() {
                 out.push(returned);
@@ -924,13 +972,14 @@ impl Tx {
     }
 
     pub fn create_table(&mut self, def: &TableDef, if_not_exists: bool) -> Result<()> {
-        if self.catalog.tables.contains_key(&def.name) {
+        if self.catalog.tables.contains_key(def.name.as_str()) {
             return if if_not_exists { Ok(()) } else { Err(Error::db(ErrorCode::AlreadyExists, format!("table {:?} already exists", def.name))) };
         }
         let id = self.catalog.next_table_id.max(1);
         let table = Table::create(def, id, &self.catalog)?;
         self.catalog.next_table_id = id + 1;
-        self.catalog.tables.insert(def.name.clone(), Arc::new(table));
+        self.created.push(id);
+        self.catalog.tables.insert(Arc::from(def.name.as_str()), Arc::new(table));
         self.log_op(OP_CREATE_TABLE, |w| codec::put_table(w, def));
         Ok(())
     }

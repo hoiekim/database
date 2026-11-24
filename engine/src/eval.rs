@@ -2,7 +2,9 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use database_protocol::decimal::Decimal;
@@ -26,6 +28,100 @@ pub struct Ctx<'a> {
     pub now: i64,
     /// When the statement must give up.
     pub deadline: Option<Instant>,
+    /// Where a writing transaction's statements draw the values that the
+    /// rows do not decide. `None` for a reader, which draws them fresh.
+    pub tape: Option<&'a Tape>,
+}
+
+/// A value a statement drew that nothing in the database decides: a
+/// random id, or the next number of a counter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Drawn {
+    Uuid([u8; 16]),
+    Serial(i64),
+}
+
+/// The values a transaction's statements drew, and the values they are
+/// to draw.
+///
+/// A transaction that ran beside others is run again, alone, when it
+/// commits (see `db.rs`), and must then do what it did the first time.
+/// So what a statement draws is kept, and the second run is given it to
+/// draw again.
+#[derive(Default)]
+pub struct Tape {
+    /// Whether what is drawn is kept: only a fork's draws are ever asked
+    /// for, so only a fork keeps them.
+    recording: AtomicBool,
+    drawn: Mutex<Vec<Drawn>>,
+    /// Whether anything is left of what was given, so that a draw looks
+    /// for it only then.
+    giving: AtomicBool,
+    given: Mutex<VecDeque<Drawn>>,
+}
+
+impl Tape {
+    /// Keeps what is drawn from now on, or stops keeping it and forgets
+    /// what was kept.
+    pub fn record(&self, on: bool) {
+        self.recording.store(on, Relaxed);
+        if !on {
+            self.drawn.lock().unwrap().clear();
+        }
+    }
+
+    /// What has been drawn, and kept, since this was last asked.
+    pub fn take_drawn(&self) -> Vec<Drawn> {
+        std::mem::take(&mut self.drawn.lock().unwrap())
+    }
+
+    /// Sets what the next statement draws, in order. Where it draws
+    /// more, or something else, it draws fresh.
+    pub fn give(&self, values: &[Drawn]) {
+        let mut given = self.given.lock().unwrap();
+        given.clear();
+        given.extend(values);
+        self.giving.store(!given.is_empty(), Relaxed);
+    }
+
+    fn next_given(&self) -> Option<Drawn> {
+        if !self.giving.load(Relaxed) {
+            return None;
+        }
+        let mut given = self.given.lock().unwrap();
+        let next = given.pop_front();
+        self.giving.store(!given.is_empty(), Relaxed);
+        next
+    }
+
+    fn keep(&self, drawn: Drawn) {
+        if self.recording.load(Relaxed) {
+            self.drawn.lock().unwrap().push(drawn);
+        }
+    }
+
+    pub fn uuid(&self) -> [u8; 16] {
+        let uuid = match self.next_given() {
+            Some(Drawn::Uuid(uuid)) => uuid,
+            _ => random_uuid(),
+        };
+        self.keep(Drawn::Uuid(uuid));
+        uuid
+    }
+
+    /// A counter's next number: the one given, or else what `fresh`
+    /// makes of `floor`, where the counter stands. A number given is one
+    /// the counter kept for this transaction when it first ran (see
+    /// `Store::next_serial`), so it is used wherever the counter has got
+    /// to since.
+    pub fn serial(&self, floor: i64, fresh: impl FnOnce(i64) -> i64) -> i64 {
+        let number = match self.next_given() {
+            Some(Drawn::Serial(number)) => number,
+            _ => fresh(floor),
+        };
+        self.keep(Drawn::Serial(number));
+        number
+    }
 }
 
 impl Ctx<'_> {
@@ -644,7 +740,21 @@ fn first_chars(bytes: &[u8], n: usize) -> String {
         Ok(s) => s,
         Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or(""),
     };
-    valid.chars().take(n).collect()
+    chars(valid, 0, n).to_string()
+}
+
+/// The `n` characters of `text` after its first `skip`, or as many as
+/// there are: found by where they start and end, and taken in one piece.
+fn chars(text: &str, skip: usize, n: usize) -> &str {
+    // In plain ASCII a character is a byte.
+    if text.is_ascii() {
+        let from = skip.min(text.len());
+        return &text[from..from.saturating_add(n).min(text.len())];
+    }
+    let mut starts = text.char_indices().map(|(at, _)| at);
+    let Some(from) = starts.nth(skip) else { return "" };
+    let to = if n == 0 { from } else { starts.nth(n - 1).unwrap_or(text.len()) };
+    &text[from..to]
 }
 
 fn substr(text: &str, start: i64, len: i64) -> String {
@@ -654,7 +764,7 @@ fn substr(text: &str, start: i64, len: i64) -> String {
     if end <= from {
         return String::new();
     }
-    text.chars().skip((from - 1) as usize).take((end - from) as usize).collect()
+    chars(text, (from - 1) as usize, (end - from) as usize).to_string()
 }
 
 /// Functions that can answer from a large value's length or a part of
@@ -702,7 +812,7 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
     // These handle NULL themselves or take any number of arguments.
     match func {
         Func::Now => return Ok(Value::Timestamp(ctx.now)),
-        Func::RandomUuid => return Ok(Value::Uuid(random_uuid())),
+        Func::RandomUuid => return Ok(Value::Uuid(ctx.tape.map_or_else(random_uuid, Tape::uuid))),
         Func::Coalesce => {
             for arg in args {
                 let v = eval(ctx, scope, arg)?;
@@ -860,7 +970,7 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
             arity(a.len() == 2)?;
             let (s, n) = (text_arg(&a[0], &name)?, int_arg(&a[1], &name)?);
             let keep = if n >= 0 { n as usize } else { s.chars().count().saturating_sub(n.unsigned_abs() as usize) };
-            Value::Text(s.chars().take(keep).collect())
+            Value::Text(chars(s, 0, keep).to_string())
         }
         Func::Substr => {
             arity(a.len() == 3)?;
@@ -1114,4 +1224,29 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
         Func::Now | Func::RandomUuid | Func::Coalesce | Func::Least | Func::Greatest | Func::NullIf | Func::ListConcat | Func::JsonElems | Func::JsonTexts | Func::JsonPluck
         | Func::JsonArray | Func::JsonObject | Func::ToJson | Func::JsonGet | Func::JsonGetText => unreachable!("handled above"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn characters_are_cut_where_counting_them_one_by_one_would() {
+        for text in ["", "a", "plain ascii text", "héllo wörld", "日本語のテキスト", "mixed: é日x𝄞y", "𝄞𝄞𝄞"] {
+            let count = text.chars().count();
+            for skip in 0..count + 3 {
+                for n in 0..count + 3 {
+                    let want: String = text.chars().skip(skip).take(n).collect();
+                    assert_eq!(chars(text, skip, n), want, "{text:?} skip {skip} take {n}");
+                }
+            }
+        }
+        // Bytes cut in the middle of a character end at the last whole one.
+        let bytes = "aé日".as_bytes();
+        assert_eq!(first_chars(&bytes[..bytes.len() - 1], 10), "aé");
+        assert_eq!(first_chars(bytes, 2), "aé");
+        assert_eq!(substr("héllo", 2, 3), "éll");
+        assert_eq!(substr("héllo", 0, 3), "hé");
+        assert_eq!(substr("héllo", 9, 3), "");
+    }
 }

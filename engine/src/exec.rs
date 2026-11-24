@@ -51,8 +51,10 @@ fn key_type(ty: &Type) -> Type {
     }
 }
 
-pub fn pk_parts(table: &Table) -> KeyParts {
-    table.pk.iter().map(|i| (Some(key_type(&table.cols[*i].def.ty)), false)).collect()
+pub fn pk_parts(table: &Table) -> &KeyParts {
+    table.pk_parts.get_or_init(|| {
+        table.pk.iter().map(|i| (Some(key_type(&table.cols[*i].def.ty)), false)).collect()
+    })
 }
 
 /// An index's keys followed by the primary key, which every entry ends
@@ -77,7 +79,7 @@ pub fn index_parts(table: &Table, index: usize) -> KeyParts {
             (ty, key.desc)
         })
         .collect();
-    parts.extend(pk_parts(table));
+    parts.extend(pk_parts(table).iter().cloned());
     parts
 }
 
@@ -86,7 +88,7 @@ pub fn encode_prefix(values: Vec<Value>, parts: &KeyParts) -> Result<Vec<u8>> {
     if values.len() > parts.len() {
         return Err(invalid(format!("a bound of {} values for a key of {} parts", values.len(), parts.len())));
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(48);
     for (value, (ty, desc)) in values.into_iter().zip(parts) {
         let value = match ty {
             Some(ty) => value.coerce(ty)?,
@@ -208,7 +210,7 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
         Access::Primary { ranges, reverse } => {
             let parts = pk_parts(table);
             for range in ranges {
-                let Some((start, end)) = range_bytes(ctx, outer, range, &parts)? else { continue };
+                let Some((start, end)) = range_bytes(ctx, outer, range, parts)? else { continue };
                 let done = walk_range(ctx, table.root, start.as_deref(), end.as_deref(), *reverse, &mut |key, value| {
                     on_hit(&Hit { pk: key.to_vec(), row: Row::parse(value.to_vec())?, depth: None, rank: None })
                 })?;
@@ -296,7 +298,7 @@ fn walk_tree(
         eval::frame_value(ctx, &Frame { alias, table, row: Some(row) }, col)
     };
     for key in start {
-        let pk = bound_prefix(ctx, outer, key, &parts)?;
+        let pk = bound_prefix(ctx, outer, key, parts)?;
         if !seen.insert(pk.clone()) {
             continue;
         }
@@ -347,7 +349,7 @@ fn walk_tree(
                     }
                 }
                 None => {
-                    let pk = encode_prefix(vec![value], &parts)?;
+                    let pk = encode_prefix(vec![value], parts)?;
                     if let Some(row) = fetch(ctx, table, &pk)? {
                         if !reach(pk, row, &mut next_level)? {
                             return Ok(false);
@@ -403,7 +405,7 @@ fn table_of(ctx: &Ctx, name: &str) -> Result<Arc<Table>> {
     }
     Ok(NONE
         .get_or_init(|| {
-            let meta = TableMeta { id: 0, name: String::new(), cols: Vec::new(), by_name: HashMap::new(), pk: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), volatile: true };
+            let meta = TableMeta { id: 0, name: String::new(), cols: Vec::new(), by_name: Default::default(), pk: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), volatile: true, pk_parts: Default::default() };
             Arc::new(Table::empty(meta))
         })
         .clone())

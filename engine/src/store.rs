@@ -22,8 +22,8 @@
 //! read it: no reader pinned at an older version, and no checkpoint, on
 //! disk or under way, that still names it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::btree::{Pages, PagesMut};
@@ -93,8 +93,62 @@ impl Meta {
 
 #[derive(Default)]
 struct Mem {
-    dirty: HashMap<PageId, Page>,
-    flushing: HashMap<PageId, Page>,
+    dirty: PageMap<Page>,
+    flushing: PageMap<Page>,
+}
+
+/// Which page numbers may be in `Mem`, for a reader to ask without its
+/// lock: a bit for each number, many numbers to a bit. A reader takes
+/// the lock only for a number whose bit is set, which few of the pages
+/// it reads have: nearly all are in the cache or the file.
+struct MaybeInMem {
+    bits: Vec<AtomicU64>,
+    /// Numbers marked since the bits were last set afresh.
+    marked: AtomicUsize,
+}
+
+/// 65,536 bits: a few hundred pages wait in memory at a time.
+const MAYBE_WORDS: usize = 1024;
+
+impl MaybeInMem {
+    fn new() -> MaybeInMem {
+        MaybeInMem { bits: (0..MAYBE_WORDS).map(|_| AtomicU64::new(0)).collect(), marked: AtomicUsize::new(0) }
+    }
+
+    fn place(id: PageId) -> (usize, u64) {
+        let h = u64::from(id).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48;
+        ((h >> 6) as usize % MAYBE_WORDS, 1 << (h & 63))
+    }
+
+    fn may_hold(&self, id: PageId) -> bool {
+        let (word, bit) = Self::place(id);
+        self.bits[word].load(Ordering::Acquire) & bit != 0
+    }
+
+    /// Marks a page about to be put in `Mem`. Called with its lock held
+    /// for writing.
+    fn mark(&self, id: PageId) {
+        let (word, bit) = Self::place(id);
+        self.bits[word].fetch_or(bit, Ordering::Release);
+        self.marked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sets the bits afresh from what `mem` holds now, dropping the
+    /// marks of pages that have left it. Called with its lock held for
+    /// writing. Each word goes from one value that covers every page in
+    /// `mem` to another that does, so a reader that looks meanwhile is
+    /// never told that a page there is not.
+    fn renew(&self, mem: &Mem) {
+        let mut fresh = vec![0u64; MAYBE_WORDS];
+        for id in mem.dirty.keys().chain(mem.flushing.keys()) {
+            let (word, bit) = Self::place(*id);
+            fresh[word] |= bit;
+        }
+        for (word, bits) in fresh.into_iter().enumerate() {
+            self.bits[word].store(bits, Ordering::Release);
+        }
+        self.marked.store(0, Ordering::Relaxed);
+    }
 }
 
 struct Alloc {
@@ -102,7 +156,7 @@ struct Alloc {
     next_page: PageId,
     /// Pages handed out since the last checkpoint was captured. No
     /// checkpoint names them, so once freed they wait only for readers.
-    young: HashSet<PageId>,
+    young: PageSet,
     /// Freed pages that no checkpoint names, by the version that freed
     /// them: reusable once no reader is older than that version.
     wait_readers: BTreeMap<u64, Vec<PageId>>,
@@ -113,6 +167,11 @@ struct Alloc {
     durable: u64,
     /// The pages holding that checkpoint's catalog and free list.
     chain_pages: Vec<PageId>,
+    /// Pages held by forks: transactions that write beside the one
+    /// writer and have not committed (see `Writer::fork`). No version
+    /// uses them, so a checkpoint counts them free: after a crash they
+    /// are, the fork having died with the process.
+    lent: PageSet,
     meta: Meta,
 }
 
@@ -147,6 +206,20 @@ pub struct Store {
     limits: Limits,
     /// Set when a write to the file failed: nothing more is written.
     failed: AtomicBool,
+    /// Per table and column, one past the highest number an
+    /// `auto_increment` counter has given any transaction. A writer and
+    /// the forks beside it each count on their own copy of the counter:
+    /// this keeps them from giving out the same number twice.
+    serials: Mutex<HashMap<(u32, usize), i64>>,
+    /// How many pages `mem` holds. A reader looks there, behind its lock,
+    /// only when this says there is something to find: after a
+    /// checkpoint, until the next commit, there is not.
+    in_mem: AtomicUsize,
+    /// And, when there is, which pages it may be.
+    maybe: MaybeInMem,
+    /// The version the oldest reader must have reached before any freed
+    /// page that waits can be given back: `u64::MAX` when none can.
+    release_at: AtomicU64,
     pub disk_reads: AtomicU64,
     pub disk_writes: AtomicU64,
 }
@@ -247,16 +320,21 @@ impl Store {
             alloc: Mutex::new(Alloc {
                 free,
                 next_page: meta.next_page,
-                young: HashSet::new(),
+                young: PageSet::default(),
                 wait_readers: BTreeMap::new(),
                 wait_checkpoint: BTreeMap::new(),
                 durable: meta.version,
                 chain_pages,
+                lent: PageSet::default(),
                 meta: meta.clone(),
             }),
             pins: Mutex::new(Pins { published: meta.version, counts: BTreeMap::new() }),
             limits,
             failed: AtomicBool::new(false),
+            serials: Mutex::new(HashMap::new()),
+            in_mem: AtomicUsize::new(0),
+            maybe: MaybeInMem::new(),
+            release_at: AtomicU64::new(u64::MAX),
             disk_reads: AtomicU64::new(0),
             disk_writes: AtomicU64::new(0),
         }
@@ -271,6 +349,18 @@ impl Store {
             return Err(Error::Io(std::io::Error::other("an earlier write to the data file failed")));
         }
         Ok(())
+    }
+
+    /// Notes how many pages `mem` holds, for readers: called with its
+    /// lock held for writing, after every change to it. `left` says
+    /// that pages have gone from it, which is the time to forget their
+    /// marks; so is having marked many since that was last done, as
+    /// pages also leave one by one when they are freed.
+    fn count_mem(&self, mem: &Mem, left: bool) {
+        if left || self.maybe.marked.load(Ordering::Relaxed) > MAYBE_WORDS * 8 {
+            self.maybe.renew(mem);
+        }
+        self.in_mem.store(mem.dirty.len() + mem.flushing.len(), Ordering::Release);
     }
 
     fn write_page(&self, id: PageId, page: &[u8]) -> Result<()> {
@@ -302,7 +392,10 @@ impl Store {
 
     /// A committed page, from memory or from the file.
     pub fn read(&self, id: PageId) -> Result<Page> {
-        {
+        // A page a reader can reach was put in `mem`, and counted, before
+        // the version that holds it was shown to anyone; and it is in
+        // the cache or the file before it leaves and is counted out.
+        if self.in_mem.load(Ordering::Acquire) > 0 && self.maybe.may_hold(id) {
             let mem = self.mem.read().unwrap();
             if let Some(page) = mem.dirty.get(&id).or_else(|| mem.flushing.get(&id)) {
                 return Ok(page.clone());
@@ -316,7 +409,7 @@ impl Store {
         Ok(page)
     }
 
-    fn take_page(&self) -> PageId {
+    fn take_page(&self, lent: bool) -> PageId {
         let mut alloc = self.alloc.lock().unwrap();
         let id = match alloc.free.pop() {
             Some(id) => id,
@@ -327,7 +420,26 @@ impl Store {
             }
         };
         alloc.young.insert(id);
+        if lent {
+            alloc.lent.insert(id);
+        }
         id
+    }
+
+    /// The next number of a table's counter, which stands at `floor` in
+    /// the transaction that asks: `floor`, or more if a transaction that
+    /// has not committed, or has since been undone, was given that
+    /// already. `claim` keeps the number from everyone who asks later,
+    /// whether or not the asker commits: a writer and the forks beside it
+    /// each count on their own copy of the counter, and this is all that
+    /// keeps them from giving out the same number.
+    fn next_serial(&self, table: u32, column: usize, floor: i64, claim: bool) -> i64 {
+        let mut serials = self.serials.lock().unwrap();
+        let number = serials.get(&(table, column)).map_or(floor, |given| floor.max(*given));
+        if claim {
+            serials.insert((table, column), number.saturating_add(1));
+        }
+        number
     }
 
     // ------------------------------------------------------------ readers
@@ -342,7 +454,9 @@ impl Store {
     }
 
     pub fn unpin(&self, version: u64) {
-        let was_oldest = {
+        // The oldest version still needed, if this reader was the last
+        // to hold back anything older.
+        let moved_on = {
             let mut pins = self.pins.lock().unwrap();
             let oldest = pins.counts.keys().next().copied();
             if let Some(count) = pins.counts.get_mut(&version) {
@@ -351,20 +465,26 @@ impl Store {
                     pins.counts.remove(&version);
                 }
             }
-            oldest == Some(version) && !pins.counts.contains_key(&version)
+            (oldest == Some(version) && !pins.counts.contains_key(&version)).then(|| pins.counts.keys().next().copied().unwrap_or(pins.published).min(pins.published))
         };
-        if was_oldest {
+        // Every reader comes through here, and after a burst of writes
+        // pages wait that only a checkpoint will free: the allocator's
+        // lock is taken only when there is something to give back.
+        if moved_on.is_some_and(|oldest| oldest >= self.release_at.load(Ordering::Acquire)) {
             self.release();
         }
     }
 
     /// Makes `version` the one new readers see.
     pub fn publish(&self, version: u64) {
-        {
+        let oldest = {
             let mut pins = self.pins.lock().unwrap();
             pins.published = pins.published.max(version);
+            pins.counts.keys().next().copied().unwrap_or(pins.published).min(pins.published)
+        };
+        if oldest >= self.release_at.load(Ordering::Acquire) {
+            self.release();
         }
-        self.release();
     }
 
     pub fn published(&self) -> u64 {
@@ -382,6 +502,7 @@ impl Store {
     fn release(&self) {
         let mut alloc = self.alloc.lock().unwrap();
         if alloc.wait_readers.is_empty() && alloc.wait_checkpoint.is_empty() {
+            self.note_waiting(&alloc);
             return;
         }
         let oldest = self.oldest_needed();
@@ -399,6 +520,7 @@ impl Store {
             }
             released.extend(entry.remove());
         }
+        self.note_waiting(&alloc);
         if released.is_empty() {
             return;
         }
@@ -407,11 +529,21 @@ impl Store {
             for id in &released {
                 mem.dirty.remove(id);
             }
+            self.count_mem(&mem, false);
         }
         for id in &released {
             self.cache.remove(self.id, *id);
         }
         alloc.free.extend(released);
+    }
+
+    /// Notes the oldest reader's version from which some waiting page
+    /// can be given back: called with the allocator's lock held, after
+    /// every change to what waits or to the checkpoint on disk.
+    fn note_waiting(&self, alloc: &Alloc) {
+        let readers = alloc.wait_readers.keys().next().copied().unwrap_or(u64::MAX);
+        let checkpoint = alloc.wait_checkpoint.keys().next().copied().filter(|freed_at| *freed_at <= alloc.durable).unwrap_or(u64::MAX);
+        self.release_at.store(readers.min(checkpoint), Ordering::Release);
     }
 
     // ------------------------------------------------------------ writers
@@ -437,6 +569,7 @@ impl Store {
                 mem.dirty.remove(&id);
             }
         }
+        self.count_mem(&mem, true);
         Ok(())
     }
 
@@ -473,6 +606,7 @@ impl Store {
                 }
             }
         }
+        self.note_waiting(&alloc);
 
         let take = |alloc: &mut Alloc| match alloc.free.pop() {
             Some(id) => id,
@@ -490,6 +624,7 @@ impl Store {
         let mut free: Vec<PageId> = alloc.free.clone();
         free.extend(alloc.wait_readers.values().flatten());
         free.extend(alloc.wait_checkpoint.values().flatten());
+        free.extend(&alloc.lent);
         free.extend(&old_chain);
         // Its own pages come from the end of the file, so that taking
         // them does not change the list being written.
@@ -545,7 +680,11 @@ impl Store {
         for (id, page) in pages {
             self.cache.insert(self.id, id, page);
         }
-        self.mem.write().unwrap().flushing.clear();
+        {
+            let mut mem = self.mem.write().unwrap();
+            mem.flushing.clear();
+            self.count_mem(&mem, true);
+        }
         {
             let mut alloc = self.alloc.lock().unwrap();
             alloc.durable = capture.version;
@@ -573,6 +712,7 @@ impl Store {
         let mut free = alloc.free.clone();
         free.extend(alloc.wait_readers.values().flatten());
         free.extend(alloc.wait_checkpoint.values().flatten());
+        free.extend(&alloc.lent);
         (free, alloc.next_page, alloc.chain_pages.clone())
     }
 
@@ -605,12 +745,12 @@ impl Pages for Store {
 /// it has written itself, which nobody else can see until `commit`.
 pub struct Writer {
     store: Arc<Store>,
-    private: HashMap<PageId, Page>,
+    private: PageMap<Page>,
     /// Private pages written to the file to save memory.
-    spilled: HashSet<PageId>,
+    spilled: PageSet,
     /// Private pages a savepoint may have to bring back: they are no
     /// longer changed in place.
-    frozen: HashSet<PageId>,
+    frozen: PageSet,
     /// Numbers this transaction took and gave back, to take again.
     recycled: Vec<PageId>,
     /// Committed pages this transaction's trees no longer use.
@@ -619,6 +759,8 @@ pub struct Writer {
     frozen_freed: Vec<PageId>,
     /// Every number handed out, in order, for `rollback_to`.
     alloc_log: Vec<PageId>,
+    /// Whether this writes beside the database's one writer: see `fork`.
+    fork: bool,
 }
 
 /// A point in a transaction's page writes to return to.
@@ -633,14 +775,61 @@ impl Writer {
     pub fn new(store: Arc<Store>) -> Writer {
         Writer {
             store,
-            private: HashMap::new(),
-            spilled: HashSet::new(),
-            frozen: HashSet::new(),
+            private: PageMap::default(),
+            spilled: PageSet::default(),
+            frozen: PageSet::default(),
             recycled: Vec::new(),
             freed: Vec::new(),
             frozen_freed: Vec::new(),
             alloc_log: Vec::new(),
+            fork: false,
         }
+    }
+
+    /// A writer that may work while another does: on a version it does
+    /// not have to itself, which the caller keeps pinned as a reader
+    /// would. Its pages are its own until `commit`, and that may be
+    /// called only if no other writer has committed since the version it
+    /// began on, and with every other writer held off. Otherwise there
+    /// is only `rollback`.
+    pub fn fork(store: Arc<Store>) -> Writer {
+        let mut writer = Writer::new(store);
+        writer.fork = true;
+        writer
+    }
+
+    /// Makes a fork the database's writer. The caller holds every other
+    /// writer off, and none has committed since the fork began.
+    pub fn attach(&mut self) {
+        if !self.fork {
+            return;
+        }
+        self.fork = false;
+        // Its pages are a writer's now: the next checkpoint finds no
+        // transaction open, and so none of them lent.
+        let mut alloc = self.store.alloc.lock().unwrap();
+        for id in self
+            .private
+            .keys()
+            .chain(&self.spilled)
+            .chain(&self.recycled)
+        {
+            alloc.lent.remove(id);
+        }
+    }
+
+    /// Pages held in memory for the transaction.
+    pub fn private_pages(&self) -> usize {
+        self.private.len()
+    }
+
+    /// The next number of a table's `auto_increment` counter, which
+    /// stands at `floor` in this transaction. `own` says the transaction
+    /// made the table itself and has not committed: nobody else can see
+    /// the table, so the number need not be kept from anyone, and is
+    /// not, since an undone table's number is given to the next table.
+    pub fn next_serial(&self, table: u32, column: usize, floor: i64, own: bool) -> i64 {
+        self.store.next_serial(table, column, floor, !own)
     }
 
     pub fn store(&self) -> &Arc<Store> {
@@ -708,6 +897,17 @@ impl Writer {
         {
             let mut alloc = self.store.alloc.lock().unwrap();
             let mut mem = self.store.mem.write().unwrap();
+            if self.fork {
+                // Every page it took is now in one of these three.
+                for id in self
+                    .private
+                    .keys()
+                    .chain(&self.spilled)
+                    .chain(&self.recycled)
+                {
+                    alloc.lent.remove(id);
+                }
+            }
             for id in self.freed.drain(..) {
                 // A page handed out since the last checkpoint is named by
                 // none; any other may be.
@@ -718,9 +918,12 @@ impl Writer {
                 }
             }
             for (id, page) in self.private.drain() {
+                self.store.maybe.mark(id);
                 mem.dirty.insert(id, page);
             }
+            self.store.count_mem(&mem, false);
             alloc.free.append(&mut self.recycled);
+            self.store.note_waiting(&alloc);
         }
         self.spilled.clear();
         self.store.flush_dirty_if_many()
@@ -742,7 +945,13 @@ impl Writer {
         self.frozen_freed.clear();
         self.alloc_log.clear();
         if !ids.is_empty() {
-            self.store.alloc.lock().unwrap().free.extend(ids);
+            let mut alloc = self.store.alloc.lock().unwrap();
+            if self.fork {
+                for id in &ids {
+                    alloc.lent.remove(id);
+                }
+            }
+            alloc.free.extend(ids);
         }
     }
 }
@@ -767,12 +976,16 @@ impl Pages for Writer {
 
 impl PagesMut for Writer {
     fn alloc(&mut self, buf: Vec<u8>) -> Result<PageId> {
+        self.alloc_page(Arc::from(buf))
+    }
+
+    fn alloc_page(&mut self, page: Page) -> Result<PageId> {
         let id = match self.recycled.pop() {
             Some(id) => id,
-            None => self.store.take_page(),
+            None => self.store.take_page(self.fork),
         };
         self.alloc_log.push(id);
-        self.private.insert(id, Arc::from(buf));
+        self.private.insert(id, page);
         self.spill_if_many()?;
         Ok(id)
     }
@@ -785,6 +998,19 @@ impl PagesMut for Writer {
         debug_assert!(self.is_private(id));
         self.spilled.remove(&id);
         self.private.insert(id, Arc::from(buf));
+    }
+
+    fn edit(&mut self, id: PageId, change: &mut dyn FnMut(&mut [u8])) -> bool {
+        if self.frozen.contains(&id) {
+            return false;
+        }
+        match self.private.get_mut(&id).and_then(Arc::get_mut) {
+            Some(buf) => {
+                change(buf);
+                true
+            }
+            None => false,
+        }
     }
 
     fn free(&mut self, id: PageId) {

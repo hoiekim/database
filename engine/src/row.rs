@@ -123,6 +123,26 @@ pub fn assemble(cols: &[Vec<u8>]) -> Vec<u8> {
     w.buf
 }
 
+/// The bytes to store for `row` under a budget: the row's own if they
+/// fit, which is the usual case and copies nothing column by column;
+/// otherwise the row with its largest values moved to the blob tree.
+pub fn fitted<P: PagesMut>(
+    p: &mut P,
+    row: &Row,
+    budget: usize,
+    blobs: &mut PageId,
+    next_blob: &mut u64,
+) -> Result<Option<Vec<u8>>> {
+    if row.columns_len() + 3 <= budget {
+        return Ok(None);
+    }
+    let mut cols: Vec<Vec<u8>> = (0..row.stored())
+        .map(|i| row.raw_col(i).unwrap_or_default().to_vec())
+        .collect();
+    fit(p, &mut cols, budget, blobs, next_blob)?;
+    Ok(Some(assemble(&cols)))
+}
+
 /// Moves the largest values into the blob tree until the row fits in
 /// `budget` bytes. `blobs` is the tree's root and `next_blob` the next
 /// unused value number; both are updated.
@@ -174,12 +194,40 @@ impl Row {
 
     /// A row that was never stored, from its values.
     pub fn from_values(values: &[Value]) -> Row {
-        let cols: Vec<Vec<u8>> = values.iter().map(encode_value).collect();
-        let row = Row::parse(assemble(&cols)).expect("a freshly encoded row parses");
+        let row = Row::build(values.len(), |i, out| codec::put_value(out, &values[i]));
         for (cell, value) in row.values.iter().zip(values) {
             let _ = cell.set(value.clone());
         }
         row
+    }
+
+    /// A row of `n` columns, each written by `column` in the stored
+    /// encoding: a value's, or bytes copied from another stored row.
+    pub fn build(n: usize, mut column: impl FnMut(usize, &mut Writer)) -> Row {
+        // Room for a row of ordinary size at once, not by doubling.
+        let mut w = Writer::with_capacity(32 + 24 * n);
+        w.varint(n as u64);
+        let mut starts = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            starts.push(w.buf.len() as u32);
+            column(i, &mut w);
+        }
+        starts.push(w.buf.len() as u32);
+        Row {
+            raw: w.buf,
+            starts,
+            values: (0..n).map(|_| OnceCell::new()).collect(),
+        }
+    }
+
+    /// The row as it is stored.
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// The bytes its columns take, without the count before them.
+    pub fn columns_len(&self) -> usize {
+        self.raw.len() - self.starts.first().map_or(0, |s| *s as usize)
     }
 
     /// How many columns the row was stored with.

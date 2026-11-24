@@ -3830,7 +3830,7 @@ fn no_prefix() -> [Expr; 0] {
 /// after the last sibling there, and indexes what its document links to.
 /// `None` when the parent is not a live page of the space.
 async fn create_page(db: &Client, space: Uuid, parent: Option<Uuid>, title: &str, links: Vec<Uuid>, by: Uuid) -> DbResult<Option<Uuid>> {
-    db.transaction(|tx| async move {
+    db.exclusive(|tx| async move {
         if let Some(parent) = parent {
             // The parent must be a live page of the space.
             let live = Query::table("pages").key([parent]).filter(col("space_id").eq(space).and(col("deleted_at").is_null())).columns(["id"]);
@@ -5670,8 +5670,13 @@ fn apply_cell_patch(cells: Expr, patch: &Json) -> Expr {
 /// neighbours' keys are the first entries of the order index on either
 /// side: no aggregate, two reads of one entry each.
 async fn add_row(db: &Client, base: Uuid, after: Option<Uuid>, cells: Json, by: Uuid) -> DbResult<Option<Row>> {
-    db.transaction(|tx| async move {
-        let in_order = |range: KeyRange| Query::table("base_rows").index("base_rows_order_idx", range).limit(1).columns(["position"]);
+    db.exclusive(|tx| async move {
+        let in_order = |range: KeyRange| {
+            Query::table("base_rows")
+                .index("base_rows_order_idx", range)
+                .limit(1)
+                .columns(["position"])
+        };
         let position = match after {
             Some(after) => {
                 // That row's key, and the smallest key above it.
@@ -5711,7 +5716,7 @@ async fn add_row(db: &Client, base: Uuid, after: Option<Uuid>, cells: Json, by: 
 /// read-modify-write (`FOR UPDATE`); here the transaction is alone, so
 /// two editors patching different cells of one row both keep theirs.
 async fn patch_row(db: &Client, base: Uuid, row: Uuid, patch: Json, position: Option<&str>, by: Uuid) -> DbResult<Option<Row>> {
-    db.transaction(|tx| async move {
+    db.exclusive(|tx| async move {
         // The row as it is. A caller diffs the patch against these cells
         // and recomputes formulas before it writes.
         if tx

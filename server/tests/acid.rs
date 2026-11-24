@@ -5,7 +5,7 @@
 mod common;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 
@@ -397,9 +397,19 @@ async fn a_statement_past_its_deadline_is_stopped() -> DbResult<()> {
         }
         db.insert(insert).await?;
     }
-    let hurried = server.client_with("test", |c| c.statement_timeout = Duration::from_millis(20)).await;
     // Every row is read and matched against a pattern that never matches.
     let slow = Query::table("big").filter(col("text").ilike("%a%b%c%d%e%f%g%h%zzz%")).select("n", count());
+    // The deadline must fall while the statement runs, however fast the
+    // machine is: it is an eighth of the quickest the statement is seen
+    // to be here.
+    let mut quickest = Duration::MAX;
+    for _ in 0..3 {
+        let began = Instant::now();
+        assert_eq!(db.query_one(slow.clone()).await?.get::<i64>("n")?, 0);
+        quickest = quickest.min(began.elapsed());
+    }
+    let allowed = (quickest / 8).max(Duration::from_millis(1));
+    let hurried = server.client_with("test", |c| c.statement_timeout = allowed).await;
     assert_eq!(hurried.query(slow.clone()).await.unwrap_err().code, ErrorCode::Timeout);
     let err = hurried.update(Update::table("big").filter(col("text").ilike("%a%b%c%d%e%f%g%h%zzz%").not()).set("text", "x")).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Timeout);

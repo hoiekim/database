@@ -7,6 +7,7 @@
 //! is rolled back if the connection ends first.
 
 mod access;
+mod gate;
 pub mod memory;
 mod session;
 
@@ -74,8 +75,13 @@ pub(crate) struct State {
     pub connection_closed: Notify,
     /// Requests received, ever.
     pub requests: AtomicU64,
-    /// Each database's queue of writers (see `session::Turn`).
-    pub gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Each database's queue of writers.
+    pub gates: Mutex<HashMap<String, Arc<gate::Gate>>>,
+    /// Optimistic transactions that wrote, by how their commit went: the
+    /// copy they ran on became the next version as it stood; they were
+    /// run again on a newer version and answered the same; or they were
+    /// run again and did not, and so failed with a conflict.
+    pub forks: [AtomicU64; 3],
 }
 
 /// A running server.
@@ -112,6 +118,7 @@ impl Server {
             connection_closed: Notify::new(),
             requests: AtomicU64::new(0),
             gates: Mutex::new(HashMap::new()),
+            forks: Default::default(),
         });
         let (stop, stopping) = watch::channel(false);
         // While requests arrive, and once more after they stop, memory

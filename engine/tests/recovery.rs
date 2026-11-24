@@ -129,7 +129,14 @@ fn verify(db: &Arc<Database>, model: &Model) {
 /// is if the transaction commits.
 fn random_transaction(rng: &mut Rng, db: &Arc<Database>, model: &Model, next_id: &mut i64) -> Result<Option<Model>, database_engine::error::Error> {
     let mut after = model.clone();
-    let mut txn = db.begin_write(WAIT, false)?;
+    // One in three runs as a fork: without the write lock until it is
+    // done, then attached, which nothing here ever prevents.
+    let forked = rng.chance(3);
+    let mut txn = if forked {
+        db.begin_fork()?
+    } else {
+        db.begin_write(WAIT, false)?
+    };
     for _ in 0..1 + rng.below(4) {
         match rng.below(10) {
             0..=3 => {
@@ -173,8 +180,55 @@ fn random_transaction(rng: &mut Rng, db: &Arc<Database>, model: &Model, next_id:
         txn.rollback();
         return Ok(None);
     }
+    if forked {
+        assert!(txn.attach(WAIT)?, "nothing was committed beside the fork");
+    }
     txn.commit()?;
     Ok(Some(after))
+}
+
+/// A fork that stands open beside the workload, holding pages of its
+/// own, and is in the end dropped: through commits, checkpoints and
+/// power cuts it must leave no trace, and none of its pages lost.
+struct Bystander {
+    rng: Rng,
+    fork: Option<(database_engine::db::WriteTxn, u64)>,
+}
+
+impl Bystander {
+    fn new(seed: u64) -> Bystander {
+        Bystander {
+            rng: Rng::new(seed ^ 0x5EED_F0C5),
+            fork: None,
+        }
+    }
+
+    /// Now and then begins a fork, writes in it, or ends it.
+    fn step(&mut self, db: &Arc<Database>) {
+        match (&mut self.fork, self.rng.below(4)) {
+            (None, 0) => self.fork = db.begin_fork().ok().map(|fork| (fork, db.latest_version())),
+            (Some((fork, _)), 0 | 1) => {
+                // Rows no committed transaction ever holds. A failure
+                // (the disk gone, a name taken) is all the same to it.
+                let id = 2_000_000 + self.rng.below(1_000_000) as i64;
+                let item = random_item(&mut self.rng, id);
+                let _ = fork.insert(&insert_of(id, &item), None);
+            }
+            (Some((fork, began)), 2) => {
+                // It can become the writer only if nobody has committed
+                // since it began, and it is rolled back either way.
+                if let Ok(attached) = fork.attach(WAIT) {
+                    assert_eq!(
+                        attached,
+                        *began == db.latest_version(),
+                        "a fork attaches exactly when no commit was made beside it"
+                    );
+                }
+                self.fork = None;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn create(engine: &Engine) -> Arc<Database> {
@@ -193,7 +247,9 @@ fn a_workload_matches_its_model_and_survives_clean_restarts() {
     let mut next_id = 1;
     let mut engine = open(&vfs);
     let mut db = create(&engine);
+    let mut bystander = Bystander::new(11);
     for step in 0..600 {
+        bystander.step(&db);
         if let Some(after) = random_transaction(&mut rng, &db, &model, &mut next_id).unwrap() {
             model = after;
         }
@@ -204,6 +260,7 @@ fn a_workload_matches_its_model_and_survives_clean_restarts() {
             db.checkpoint().unwrap();
         }
         if step % 150 == 149 {
+            bystander.fork = None;
             drop(db);
             if rng.chance(2) {
                 engine.close().unwrap();
@@ -232,8 +289,10 @@ fn a_power_cut_at_any_moment_loses_no_commit_and_keeps_no_other() {
         let mut next_id = 1;
         let engine = open(&vfs);
         let db = create(&engine);
+        let mut bystander = Bystander::new(seed);
         // Some history first, then the cut somewhere in what follows.
         for _ in 0..rng.below(40) {
+            bystander.step(&db);
             if let Some(after) = random_transaction(&mut rng, &db, &model, &mut next_id).unwrap() {
                 model = after;
             }
@@ -246,6 +305,7 @@ fn a_power_cut_at_any_moment_loses_no_commit_and_keeps_no_other() {
         // not have been made durable before its client could be told.
         let mut in_flight: Option<Model> = None;
         loop {
+            bystander.step(&db);
             let mut attempt_rng = rng.clone();
             let mut attempt_id = next_id;
             match random_transaction(&mut attempt_rng, &db, &model, &mut attempt_id) {
@@ -273,6 +333,7 @@ fn a_power_cut_at_any_moment_loses_no_commit_and_keeps_no_other() {
         }
         let Some(image) = vfs.take_crash_image() else { continue };
         cuts += 1;
+        drop(bystander);
         drop(db);
         drop(engine);
 
@@ -304,6 +365,7 @@ fn a_power_cut_at_any_moment_loses_no_commit_and_keeps_no_other() {
 /// choices against the model alone.
 fn model_of_transaction(rng: &mut Rng, model: &Model, next_id: &mut i64) -> Option<Model> {
     let mut after = model.clone();
+    let _forked = rng.chance(3);
     for _ in 0..1 + rng.below(4) {
         match rng.below(10) {
             0..=3 => {

@@ -40,6 +40,12 @@ const LIST: u8 = 0x90;
 const NULL: u8 = 0xF0;
 
 fn escaped(out: &mut Vec<u8>, bytes: &[u8]) {
+    // Few strings hold a zero byte: the rest are copied as they are.
+    if !bytes.contains(&0) {
+        out.extend_from_slice(bytes);
+        return;
+    }
+    out.reserve(bytes.len() + 2);
     for &b in bytes {
         out.push(b);
         if b == 0 {
@@ -143,6 +149,13 @@ pub fn encode(out: &mut Vec<u8>, value: &Value, desc: bool) {
 
 /// The start of every text key that begins with `prefix`: the text's
 /// bytes without the end mark.
+/// A text as `encode` writes it rising, from its bytes.
+pub fn encode_text(out: &mut Vec<u8>, text: &[u8]) {
+    out.push(TEXT);
+    escaped(out, text);
+    out.extend_from_slice(&[0, 0]);
+}
+
 pub fn encode_text_prefix(out: &mut Vec<u8>, prefix: &str) {
     out.push(TEXT);
     escaped(out, prefix.as_bytes());

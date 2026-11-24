@@ -51,7 +51,9 @@ db.create_table_if_not_exists(
 - A default is evaluated per inserted row: a constant, `default_now()`,
   `default_random_uuid()`, or any expression of constants.
 - `auto_increment()` numbers rows from 1. An insert may give the number
-  itself; later rows continue above the highest number ever stored.
+  itself; later rows continue above the highest number ever stored. A
+  number given to an insert that fails or is rolled back may be left
+  unused.
 - An index key is a column or an expression (`on_expr(col("email").lower())`).
   `on_desc` stores that key descending. `on_each(list_expr)` indexes the
   row once under each distinct item of the list. `.unique()` forbids two
@@ -317,6 +319,7 @@ Errors are `DbError { code, message, constraint, table }`:
 | `NotFound`, `AlreadyExists`, `InvalidRequest` | No such table, column or index; one already there; a request that makes no sense |
 | `LockTimeout`, `Timeout` | Waited too long for the write lock; the statement ran too long |
 | `TransactionAborted` | The transaction already failed or ended |
+| `Conflict` | An optimistic transaction was told something that a commit made beside it has since changed. Nothing of it took effect; `db.transaction(..)` runs it again by itself |
 | `Connection` | The connection broke; whether the statement took effect is unknown |
 
 ## Transactions
@@ -331,18 +334,50 @@ let balance: Decimal = db.transaction(|tx| async move {
 }).await?;
 ```
 
-or `let tx = db.begin().await?; ..; tx.commit().await?;`. Dropping a
-transaction rolls it back.
+Dropping a transaction rolls it back.
 
-- **A writing transaction has the database to itself.** `begin()` waits
-  for any other writer (transaction or lone statement) to finish, then
-  holds the write lock until it ends. What it reads is the latest
-  committed state and cannot change under it. So there is no `FOR
-  UPDATE`, no `FOR SHARE`, no `SKIP LOCKED`, no advisory transaction
-  lock, no deadlock and no serialization failure to retry: read, decide,
-  write. The price: keep it short, and never wait on the network inside
+- **`db.transaction(work)` runs beside other writers, and may run `work`
+  again.** The work runs on a copy of the database that only it sees, so
+  nothing waits for it while it waits for its own answers. When it
+  commits, the server checks that no commit made meanwhile changed
+  anything the work was told: a row it read, a count, a "no such row",
+  an insert that succeeded. If none did, it commits; the result is as
+  if it had run alone at that moment. If one did, nothing of that run
+  takes effect and `work` is called again: once more the same way, and
+  after that as the database's only writer, where nothing can get in
+  its way. So there is still no `FOR UPDATE`, no `FOR SHARE`, no `SKIP
+  LOCKED`, no deadlock and no error to retry by hand: read, decide,
+  write. What `work` must not do is anything but talk to the database
+  through `tx`: whatever else it does (a message sent, a counter kept in
+  memory) is done once per run.
+- **`db.exclusive(work)`, or `db.begin()`, has the database to itself.**
+  It waits for any other writer to finish, then holds the write lock
+  until it ends; what it reads is the latest committed state and cannot
+  change under it. `work` runs exactly once. The price: every other
+  writer waits for it, the time it spends waiting for its own answers
+  included, so keep it short and never wait on anything else inside
   one. A writer that waits longer than `lock_wait` (30 s) gets
   `LockTimeout`.
+- **`db.begin_optimistic()`** is what `transaction` begins: `commit()`
+  can then fail with `Conflict` (and `tx.conflicted()` says so after a
+  statement did), for a caller that would rather decide for itself what
+  to do then.
+- **Only what a transaction was told can conflict.** `set("n", col("n")
+  + 1)` without `returning` was told nothing of `n`, and is applied to
+  the row as it stands at the commit. Reading `n` and then setting it to
+  what was read plus one conflicts if another commit changed `n` in
+  between, as it must.
+- **Numbers and random ids are kept.** An `auto_increment` number or a
+  `default_random_uuid()` value a statement returned is the one stored,
+  however the transaction commits, and `now()` reads the same
+  throughout.
+- **Large work takes the write lock when it comes.** A statement that
+  inserts more than eight rows, updates or deletes other than by key, or
+  changes the schema, and a transaction grown past about a megabyte,
+  are not worth doing twice: before one runs, an optimistic transaction
+  becomes the database's writer (its earlier answers are checked then,
+  and a conflict fails that statement) and carries on as an exclusive
+  one.
 - **Readers never wait and never block.** A lone query, or `begin_read()`
   / `db.read(..)` for several queries that must see one moment, reads a
   snapshot.
@@ -353,7 +388,6 @@ transaction rolls it back.
   `TransactionAborted`), unless a savepoint was taken first:
   `tx.savepoint("s")`, then on failure `tx.rollback_to("s")` and carry
   on. `tx.release("s")` forgets it.
-- `now()` reads the same throughout a transaction.
 
 ## Named locks
 
@@ -384,11 +418,11 @@ dropped or the process dies. It occupies one pooled connection.
 | `a OR b` over two different indexes | two queries (in `db.read(..)` for one moment), merged by the caller |
 | `UNION` | two queries, merged by the caller |
 | `SELECT count(*) FILTER (WHERE ..)` | `count().filter(..)` |
-| `SELECT ... FOR UPDATE` then `UPDATE` | the same two statements in `db.transaction(..)` |
+| `SELECT ... FOR UPDATE` then `UPDATE` | the same two statements in `db.transaction(..)`: a row read and since changed by another commit is caught at the commit, and the work is run again |
 | `UPDATE .. WHERE id IN (SELECT .. ORDER BY .. LIMIT n FOR UPDATE SKIP LOCKED) RETURNING` | `Update::rows(Query::table(..).index(..).filter(..).limit(n)).set(..).returning(..)` |
 | `INSERT .. ON CONFLICT (k) DO UPDATE SET n = t.n + 1 RETURNING n` | `.on_conflict_update(index).update("n", col("n") + 1).returning(["n"])` |
 | `pg_advisory_lock(k)` (session) | `db.lock(name)` |
-| `pg_advisory_xact_lock(k)` | nothing: a writing transaction is already alone |
+| `pg_advisory_xact_lock(k)` | nothing: a transaction's result is as if it had run alone; `db.exclusive(..)` to hold the database while it runs |
 | `a @> '[{"address": "x"}]'` | an `on_each(col("a").json_pluck("address"))` index, read with `KeyRange::eq([.., "x"])`; or `col("a").json_contains(json)` as a filter |
 | `WITH RECURSIVE` over `parent_id` | `ancestors` / `descendants` |
 | `to_tsvector` / `@@` / `ts_rank` / `ts_headline` | a full-text index, `search`, `Expr::Rank`, `Func::Headline` |

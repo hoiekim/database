@@ -217,27 +217,65 @@ fn truncate(text: &str, max: usize) -> &str {
 }
 
 fn normalize(word: &str, config: TextConfig) -> String {
-    let lower = word.to_lowercase();
-    match config {
-        TextConfig::Simple => lower,
-        TextConfig::English => {
-            if STOP_WORDS.binary_search(&lower.as_str()).is_ok() {
-                String::new()
-            } else {
-                stem(&lower)
+    let mut term = String::new();
+    normalize_into(word, config, &mut term);
+    term
+}
+
+/// Leaves in `term` the form `word` is indexed under, or nothing for a
+/// word the configuration drops. `term` is written over, so one buffer
+/// serves a whole text.
+fn normalize_into(word: &str, config: TextConfig, term: &mut String) {
+    term.clear();
+    if word.is_ascii() {
+        term.push_str(word);
+        term.make_ascii_lowercase();
+    } else {
+        term.push_str(&word.to_lowercase());
+    }
+    if config == TextConfig::English {
+        if STOP_WORDS.binary_search(&term.as_str()).is_ok() {
+            term.clear();
+        } else if stems(term) {
+            // Only words of plain letters are stemmed, and they stay so.
+            let mut bytes = std::mem::take(term).into_bytes();
+            stem_bytes(&mut bytes);
+            *term = String::from_utf8(bytes).unwrap_or_default();
+        }
+    }
+}
+
+/// Calls `on_term` with the indexed form of each word of a text, in the
+/// text's order, the words its configuration drops left out.
+pub fn each_term(text: &str, config: TextConfig, on_term: &mut dyn FnMut(&str)) {
+    let text = truncate(text, MAX_INDEXED_BYTES);
+    let mut term = String::new();
+    let mut start = None;
+    for (i, c) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+        match (c.is_alphanumeric(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                normalize_into(&text[s..i], config, &mut term);
+                if !term.is_empty() {
+                    on_term(&term);
+                }
+                start = None;
             }
+            _ => {}
         }
     }
 }
 
 /// The distinct terms of a text, each with how often it occurs.
 pub fn terms(text: &str, config: TextConfig) -> HashMap<String, u32> {
-    let mut out = HashMap::new();
-    for word in words(text, config) {
-        if !word.term.is_empty() {
-            *out.entry(word.term).or_insert(0) += 1;
+    let mut out: HashMap<String, u32> = HashMap::new();
+    // A term is copied only the first time the text has it.
+    each_term(text, config, &mut |term| match out.get_mut(term) {
+        Some(count) => *count += 1,
+        None => {
+            out.insert(term.to_string(), 1);
         }
-    }
+    });
     out
 }
 
@@ -376,10 +414,21 @@ fn replace(w: &mut Vec<u8>, suffix: &str, with: &str, min: usize) -> bool {
 /// The Porter stemmer: `invoices` and `invoiced` both become `invoic`.
 /// Words with anything but ASCII letters are left as they are.
 pub fn stem(word: &str) -> String {
-    if word.len() <= 2 || !word.bytes().all(|b| b.is_ascii_lowercase()) {
+    if !stems(word) {
         return word.to_string();
     }
     let mut w = word.as_bytes().to_vec();
+    stem_bytes(&mut w);
+    String::from_utf8(w).unwrap_or_else(|_| word.to_string())
+}
+
+/// Whether the stemmer changes words like this one at all.
+fn stems(word: &str) -> bool {
+    word.len() > 2 && word.bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// The stemmer itself, on a word of lower-case ASCII letters.
+fn stem_bytes(w: &mut Vec<u8>) {
 
     // 1a: plurals.
     if w.ends_with(b"sses") || w.ends_with(b"ies") {
@@ -404,9 +453,9 @@ pub fn stem(word: &str) -> String {
     if tidy {
         if w.ends_with(b"at") || w.ends_with(b"bl") || w.ends_with(b"iz") {
             w.push(b'e');
-        } else if double_consonant(&w) && !matches!(w[w.len() - 1], b'l' | b's' | b'z') {
+        } else if double_consonant(w) && !matches!(w[w.len() - 1], b'l' | b's' | b'z') {
             w.pop();
-        } else if measure(&w) == 1 && cvc(&w) {
+        } else if measure(w) == 1 && cvc(w) {
             w.push(b'e');
         }
     }
@@ -426,7 +475,7 @@ pub fn stem(word: &str) -> String {
     const STEP3: &[(&str, &str)] = &[("icate", "ic"), ("ative", ""), ("alize", "al"), ("iciti", "ic"), ("ical", "ic"), ("ful", ""), ("ness", "")];
     for rules in [STEP2, STEP3] {
         for (suffix, with) in rules {
-            if replace(&mut w, suffix, with, 0) {
+            if replace(w, suffix, with, 0) {
                 break;
             }
         }
@@ -454,10 +503,9 @@ pub fn stem(word: &str) -> String {
             w.pop();
         }
     }
-    if measure(&w) > 1 && double_consonant(&w) && w.ends_with(b"l") {
+    if measure(w) > 1 && double_consonant(w) && w.ends_with(b"l") {
         w.pop();
     }
-    String::from_utf8(w).unwrap_or_else(|_| word.to_string())
 }
 
 // ------------------------------------------------------------ similarity
@@ -502,6 +550,47 @@ mod tests {
         assert_eq!(normalize("The", TextConfig::English), "");
         assert_eq!(normalize("Yourselves", TextConfig::English), "");
         assert_eq!(normalize("theory", TextConfig::English), "theori");
+    }
+
+    /// The terms of a text, word by word, as they were once made: each
+    /// word lowered by the language's rules and stemmed from a copy.
+    fn terms_the_long_way(text: &str, config: TextConfig) -> Vec<String> {
+        let mut out = Vec::new();
+        for word in text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+            let lower = word.to_lowercase();
+            let term = match config {
+                TextConfig::Simple => lower,
+                TextConfig::English if STOP_WORDS.binary_search(&lower.as_str()).is_ok() => String::new(),
+                TextConfig::English => stem(&lower),
+            };
+            if !term.is_empty() {
+                out.push(term);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_text_gives_the_same_terms_however_it_is_cut() {
+        let texts = [
+            "",
+            "The Invoices were RELATIONAL, and the meetings went on: running, hopping, agreed!",
+            "Ünïcödé WÖRDS stay; ÉCOLE İstanbul straße ΑΒΓ, 日本語 text123 and x",
+            "a-b_c d'e f.g  h\ti\n\nj",
+            "caresses ponies ties caress cats feed agreed plastered motoring sing conflated troubled sized hopping falling hissing fizzed",
+        ];
+        for text in texts {
+            for config in [TextConfig::Simple, TextConfig::English] {
+                let mut seen = Vec::new();
+                each_term(text, config, &mut |term| seen.push(term.to_string()));
+                assert_eq!(seen, terms_the_long_way(text, config), "{text:?}");
+                let from_words: Vec<String> = words(text, config).into_iter().map(|w| w.term).filter(|t| !t.is_empty()).collect();
+                assert_eq!(seen, from_words, "{text:?}");
+                let counted = terms(text, config);
+                assert_eq!(counted.values().sum::<u32>() as usize, seen.len());
+                assert!(seen.iter().all(|term| counted.contains_key(term)));
+            }
+        }
     }
 
     #[test]
