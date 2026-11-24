@@ -1,8 +1,10 @@
 //! Large statements: their texts cut into words before their turn to
-//! write.
+//! write, and the memory they may hold while in flight.
 
 mod common;
 use common::*;
+
+use std::time::Duration;
 
 fn notes() -> TableDef {
     TableDef::new("notes")
@@ -71,5 +73,44 @@ async fn words_cut_ahead_are_those_of_the_row_as_written() -> DbResult<()> {
 
     let report = server.admin().await.admin().check().await?;
     assert!(!report.is_empty());
+    Ok(())
+}
+
+// The memory for large requests in flight is a budget that a request
+// waits for. A connection that holds the turn to write never waits for
+// it: whoever holds the budget may be waiting for that turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_holder_of_the_turn_does_not_wait_for_memory_held_by_one_waiting_for_the_turn() -> DbResult<()> {
+    let server = TestServer::start().await;
+    let db = server.client("test").await;
+    db.create_table(TableDef::new("blobs").column(ColumnDef::new("id", Type::Int)).column(ColumnDef::new("data", Type::Text)).primary_key(["id"])).await?;
+    let big = |from: i64, rows: i64| {
+        let mut insert = Insert::into("blobs").columns(["id", "data"]);
+        for id in from..from + rows {
+            insert = insert.values([val(id), val("x".repeat(100_000))]);
+        }
+        insert
+    };
+
+    // An exclusive transaction holds the turn.
+    let tx = db.begin().await?;
+    tx.insert(Insert::into("blobs").set("id", 0i64).set("data", "first")).await?;
+
+    // Another connection sends more than the whole budget, and waits for
+    // the turn with all of it.
+    let other = server.client("test").await;
+    let waiting = tokio::spawn(async move { other.insert(big(1000, 60)).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished(), "it waits for the turn");
+
+    // A request of ordinary size does not wait for the budget.
+    let third = server.client("test").await;
+    tokio::time::timeout(Duration::from_secs(5), third.query(Query::table("blobs"))).await.expect("a small request goes at once")?;
+
+    // The holder of the turn sends a large request too, and is answered.
+    tokio::time::timeout(Duration::from_secs(20), tx.insert(big(1, 20))).await.expect("the holder of the turn does not wait for the budget")?;
+    tx.commit().await?;
+    tokio::time::timeout(Duration::from_secs(30), waiting).await.expect("the large request goes once the turn is free").unwrap()?;
+    assert_eq!(db.query(Query::table("blobs")).await?.len(), 81);
     Ok(())
 }

@@ -277,14 +277,24 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
             Some(Txn::Read(_) | Txn::Fork(_) | Txn::Dead(_)) => state.config.idle_transaction.saturating_mul(IDLE_READ_FACTOR),
             None => Duration::from_secs(u64::from(u32::MAX)),
         };
-        let frame = tokio::select! {
-            frame = tokio::time::timeout(patience, read_frame(&mut reader, MAX_FRAME)) => frame,
+        let len = tokio::select! {
+            len = tokio::time::timeout(patience, budget::read_len(&mut reader)) => len,
             _ = stopping.changed() => break,
         };
-        let frame = match frame {
-            Ok(Ok(Some(frame))) => frame,
-            _ => break,
+        let Ok(Ok(Some(len))) = len else { break };
+        // A large request's share of memory, taken before its bytes are
+        // read (see `budget`). Whoever holds the turn between requests
+        // does not wait for it.
+        let holds_turn = matches!(session.txn, Some(Txn::Write(..)));
+        let share = tokio::select! {
+            share = budget::budget().take(len, !holds_turn) => share,
+            _ = stopping.changed() => break,
         };
+        let frame = tokio::select! {
+            frame = tokio::time::timeout(patience, budget::read_body(&mut reader, len, MAX_FRAME)) => frame,
+            _ = stopping.changed() => break,
+        };
+        let Ok(Ok(frame)) = frame else { break };
         state.requests.fetch_add(1, Ordering::Relaxed);
         let outcome = match decode_request(&frame) {
             Ok((request, timeout_ms)) => {
@@ -299,6 +309,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
             }
             Err(e) => Ok(vec![Response::Error(e)]),
         };
+        share.give_back();
         let Ok(responses) = outcome else { break };
         let mut failed = false;
         for response in &responses {
@@ -310,6 +321,7 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<State>, id: u64, mut sto
     }
 }
 
+mod budget;
 mod load;
 
 fn rows(set: RowSet) -> Vec<Response> {
