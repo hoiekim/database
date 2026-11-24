@@ -523,9 +523,12 @@ async fn load(target: &Target) {
     }
 }
 
-/// Loads the mails: the bulk-load workload.
+/// Loads the mails: the bulk-load workload. `BENCH_LOAD_PART=10` loads a
+/// tenth of them, to study the load itself: the workloads that read the
+/// mails expect them all.
 async fn load_mails(target: &Target) -> Timing {
-    let total = (USERS * MAILS_PER_USER / 250) as u64;
+    let part = std::env::var("BENCH_LOAD_PART").ok().and_then(|n| n.parse::<u64>().ok()).filter(|n| *n > 0).unwrap_or(1);
+    let total = (USERS * MAILS_PER_USER / 250) as u64 / part;
     let target = target.clone();
     measure(4, total, move |worker, chunk| {
         let target = target.clone();
