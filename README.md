@@ -3,10 +3,13 @@
 A small database server in Rust, for applications that would otherwise
 run a Postgres far larger than they need.
 
-It has no SQL. An application talks to it through a typed Rust client: a
-table, a query and a write are Rust values, and a query names the index
-it reads. That is what keeps it small: there is no parser, no planner
-and no optimizer, and the server does exactly what it is asked.
+It has no SQL. An application talks to it through a typed client: a
+table, a query and a write are values the application builds, and a
+query names the index it reads. That is what keeps it small: there is no
+parser, no planner and no optimizer, and the server does exactly what it
+is asked. The client below is the Rust one; `clients/` has the same
+vocabulary for TypeScript and for Python, and `docs/PROTOCOL.md` is the
+wire protocol, for writing one in any other language.
 
 ```rust
 use database_client::*;
@@ -118,12 +121,16 @@ options for what is left with what each would cost.
 
 ```text
 protocol/   values, expressions, queries, the wire format
-client/     the client applications depend on (`database-client`)
+            fixtures/vectors.json   golden vectors: messages and their bytes
+client/     the client Rust applications depend on (`database-client`)
+clients/    typescript/       the same client for Node, on node:net alone
+            python/           and for Python, on the standard library alone
 engine/     pages, trees, the log, transactions, query execution
 server/     the server and the `database` command
 bench/      the benchmark above
 docs/       REQUIREMENTS.md   what the database has to do
             CLIENT.md         the client's contract, and SQL-to-API
+            PROTOCOL.md       the wire protocol, byte for byte
             DESIGN.md         how it works and why
             OPERATIONS.md     running it: settings, backup, restore
             PERFORMANCE.md    measurements, their causes, and options
@@ -145,10 +152,14 @@ The tests, by what they prove:
 | `server/tests/scenario_*.rs` | the requirements as four kinds of application use them (an identity service, a mail store, a document workspace, a personal-finance ledger), against a real server over TCP (236 tests) |
 | `server/tests/acid.rs` | atomicity, isolation, once-only races, savepoints, lock and statement timeouts |
 | `server/tests/optimistic.rs` | transactions that run beside other writers: committed as they stand, run again, or in conflict; what they were told is what is stored |
+| `server/tests/requests.rs` | statements the server keeps and runs with new values; a transaction sent whole as a batch, with conditions; a transaction that begins with its first statement; the Unix socket |
+| `server/tests/explain.rs` | what a query read, by every way in, against what it returned; slow statements in the server's log |
 | `server/tests/durability.rs` | a server killed with `SIGKILL` under load, six times over, loses nothing acknowledged; memory stays bounded with data many times the cache |
 | `server/tests/operations.rs` | dump under load, restore, a damaged dump refused, passwords, restarts |
 | `engine/tests/faults.rs` | a scripted workload, killed before every operation it makes on the disk, with the power cut each way that differs, and again inside the recoveries; the disk full from each operation on; each operation failing once, a sync by losing what it covered; a disk that lies about its syncs. Nothing acknowledged is lost, and what a lying disk lost is seen as far as checksums can see |
 | `engine/tests/recovery.rs` | a random workload on a simulated disk that loses power at any write, keeping, dropping or tearing each unsynced write, with transactions open beside the writer; after every cut the database equals a model of what was committed and no page is lost |
+| `protocol/tests/vectors.rs` | the golden vectors are what the wire format is: 105 messages, each as the bytes this crate writes, and the limits `docs/PROTOCOL.md` states |
+| `clients/typescript/test`, `clients/python/tests` | each client writes those same bytes and reads them back, its builders mean what the Rust builders mean, and every kind of request works against a real server (`npm test`; `python -m unittest discover -s tests -t .`) |
 
 ## Running
 

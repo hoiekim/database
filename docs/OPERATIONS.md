@@ -25,7 +25,9 @@ database stats
 | `DATABASE_ADMIN_PASSWORD` | (required) | the password that may do anything: create and drop databases, dump, restore |
 | `DATABASE_DATA` | `./data` | where the files live |
 | `DATABASE_LISTEN` | `0.0.0.0:5454` | address to listen on |
+| `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well (see "On the same host") |
 | `DATABASE_CACHE_MB` | `32` | memory for cached pages (see "Memory") |
+| `DATABASE_SLOW_MS` | (none) | log every statement that takes this many milliseconds or more (see "Checking") |
 
 It recovers every database in the data directory, then listens. On
 `SIGTERM` or `SIGINT` it stops taking connections, lets requests in
@@ -38,9 +40,33 @@ Only one server can open a data directory: a second one fails at once
 rather than share the files.
 
 Every other command connects to the server on `DATABASE_HOST` (default
-`127.0.0.1`), the port of `DATABASE_LISTEN`, with
-`DATABASE_ADMIN_PASSWORD`. Run inside the server's container they need
-nothing else.
+`127.0.0.1`), the port of `DATABASE_LISTEN`, or through
+`DATABASE_SOCKET` if that is set, with `DATABASE_ADMIN_PASSWORD`. Run
+inside the server's container they need nothing else.
+
+## On the same host
+
+A client on the server's own host can skip the network stack. Give the
+server a path in `DATABASE_SOCKET` and it listens on a Unix domain
+socket there as well as on TCP; the client names the same path:
+
+```text
+database://shop:<password>@localhost?socket=/run/database/database.sock
+```
+
+What that saves each request depends on the system's loopback: about
+15 µs of a round trip where it was measured on macOS, about 2 µs on
+Linux (`PERFORMANCE.md`). Between containers, mount one volume at the
+socket's directory in both.
+
+- The socket file is created with the server's umask, and a client
+  needs write permission on it to connect: that decides which users of
+  the host can reach the server at all. Whoever connects still gives a
+  database's password, as on TCP.
+- A file left at the path by a server that is gone is replaced. A path
+  that another server is listening on, or that holds something other
+  than a socket, stops the server from starting.
+- The file is removed when the server stops.
 
 ## In a container
 
@@ -79,7 +105,8 @@ database://shop:<password>@database:5454
 ```
 
 `shop` is the database's name; the password is that database's. Options
-go in the query string: `?pool=8&statement_timeout=60&lock_wait=30&connect_timeout=10&name=shop`.
+go in the query string: `?pool=8&statement_timeout=60&lock_wait=30&connect_timeout=10&name=shop`,
+and `socket=` and `optimistic_runs=`, which `CLIENT.md` describes.
 
 Each application gets its own database and password, created once:
 
@@ -148,11 +175,37 @@ docker rm -f drill
   size, and counts of commits and disk reads and writes; then how the
   commits of optimistic transactions went: as they stood, run again
   beside another's commit, or in conflict (and so run again by their
-  client). Many conflicts mean transactions that read and write the
-  same rows: see `PERFORMANCE.md`.
+  client); then the requests received since the server started. Many
+  conflicts mean transactions that read and write the same rows: see
+  `PERFORMANCE.md`.
 - `database checkpoint`: writes everything committed into the data
   files now and empties the logs. Never needed; useful before copying
   the files of a stopped server.
+- **Slow statements.** With `DATABASE_SLOW_MS=100` the server writes a
+  line to its log (standard error) for every statement that takes 100
+  milliseconds or more:
+
+  ```text
+  database: slow: 153 ms, database "shop", client "shop-web": query "mails" by the whole table, filtered, limit 50: read 0 index entries and 98112 rows
+  ```
+
+  How long it took, on which database, for which client (the `name` of
+  its URL), what the statement was, and how much it read to answer. The
+  statement is described by its table, its way in and its clauses,
+  never by its values. Names are written quoted and escaped, as the
+  client sent them, so each line of the log is one line. For a statement on its own and for a batch the
+  time includes the wait for the write lock and for the disk. In a
+  transaction those waits are the `begin`'s and the `commit`'s, which
+  are timed and logged as statements are: a `begin` line is a wait for
+  the write lock, and a `commit` line a wait for the disk, or for an
+  optimistic transaction's turn and its statements run again (it then
+  counts what that second run read). A transaction's first statement,
+  when it brings the begin with it, includes the begin's wait. There is no planner whose choice could be at
+  fault: a statement is slow because of what its own access path made
+  the server read, and the two counts say which it was. This one read
+  the whole table to return 50 rows, and wants an index range. The
+  same counts for any query, slow or not, are `db.explain(query)`
+  (`CLIENT.md`).
 
 ## When the disk fails
 

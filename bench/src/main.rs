@@ -1,9 +1,11 @@
-//! The same workloads against this database and against Postgres.
+//! The same workloads against this database and against Postgres, and
+//! some of them against the SQLite family.
 //!
 //! ```text
 //! cargo build --release
-//! cargo run --release -p database-bench            # both, side by side
+//! cargo run --release -p database-bench            # this and Postgres, side by side
 //! cargo run --release -p database-bench -- --only ours
+//! cargo run --release -p database-bench --features sqlite -- --only ours,sqlite,rqlite,libsql
 //! ```
 //!
 //! Each server runs as its own process on its own empty directory under
@@ -14,8 +16,25 @@
 //! a session lookup, a durable insert, a rate-limit upsert, a mailbox
 //! page, a flag update, a small transaction, a filtered count, a search.
 //!
+//! `--only` takes the targets to run, by name and separated by commas:
+//! `ours`, `postgres`, `sqlite` (embedded, see `sqlite.rs`), `rqlite`
+//! and `libsql` (servers, see `family.rs`), or `all`. The SQLite family
+//! runs the session lookup, the durable insert and the transfers.
+//! `limits.rs` runs each server on a few CPUs and under a memory limit.
+//!
 //! What is printed: operations per second and latency for each workload,
 //! then what each server cost: memory, CPU time, and disk.
+//!
+//! Both clients prepare each statement once per connection and send its
+//! values after that. `BENCH_SOCKET=1` has both servers listen on a Unix
+//! domain socket and both clients connect through it, as an application
+//! on the server's own host could.
+
+mod family;
+mod http;
+mod limits;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,6 +44,8 @@ use std::time::{Duration, Instant};
 
 use database_client::*;
 use tokio_postgres::types::ToSql;
+
+use limits::limits;
 
 const USERS: i64 = 20;
 const MAILS_PER_USER: i64 = 5_000;
@@ -97,7 +118,8 @@ fn disk_bytes(dir: &Path) -> (u64, u64) {
                     data += d;
                     log += l;
                 }
-            } else if name.contains(".wal-") {
+            } else if name.contains(".wal-") || name.ends_with("-wal") || name == "raft.db" {
+                // This server's log, SQLite's, and rqlite's Raft log.
                 log += meta.len();
             } else {
                 data += meta.len();
@@ -108,26 +130,42 @@ fn disk_bytes(dir: &Path) -> (u64, u64) {
 }
 
 struct Server {
-    child: Child,
+    /// `None` for embedded SQLite, which runs in this process.
+    child: Option<Child>,
     dir: PathBuf,
     as_postgres: bool,
+    /// The memory cgroup the server runs in, if it runs under a limit.
+    /// Removed after the server has stopped.
+    cage: Option<limits::Cage>,
+    name: &'static str,
+}
+
+impl Server {
+    fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        // Asked to stop first, so that a server run under a profiler
-        // can write what it gathered; killed if it does not.
-        let _ = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
-            .status();
-        for _ in 0..600 {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                break;
+        if let Some(child) = &mut self.child {
+            // Asked to stop first, so that a server run under a profiler
+            // can write what it gathered; killed if it does not.
+            let _ = Command::new("kill").args(["-TERM", &child.id().to_string()]).status();
+            for _ in 0..600 {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Said here too, because a run whose server was killed ends in
+        // a panic about a lost connection and never reaches its report.
+        if let Some(kills) = self.cage.as_ref().map(limits::Cage::kills).filter(|k| *k > 0) {
+            eprintln!("{}: killed {kills} time(s) for going over its memory limit", self.name);
+        }
         if self.as_postgres {
             let _ = Command::new("runuser").args(["-u", "postgres", "--", "rm", "-rf"]).arg(&self.dir).status();
         } else if !keep() {
@@ -147,6 +185,12 @@ fn keep() -> bool {
     std::env::var_os("BENCH_KEEP").is_some()
 }
 
+/// `BENCH_SOCKET=1`: both servers are reached through a Unix domain
+/// socket instead of TCP on the loopback address.
+fn through_socket() -> bool {
+    std::env::var_os("BENCH_SOCKET").is_some()
+}
+
 fn bench_dir(name: &str) -> PathBuf {
     let base = std::env::var("BENCH_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     if keep() && name == "ours" {
@@ -160,13 +204,17 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
     if !keep() {
         let _ = std::fs::remove_dir_all(&dir);
     }
+    let socket = through_socket().then(|| dir.with_extension("sock"));
     let port = free_port();
-    let child = Command::new(binary)
+    let cage = limits().cage("ours");
+    let child = limits()
+        .command(cage.as_ref(), binary)
         .arg("serve")
         .env("DATABASE_DATA", &dir)
         .env("DATABASE_LISTEN", format!("127.0.0.1:{port}"))
         .env("DATABASE_ADMIN_PASSWORD", "bench-admin")
         .env("DATABASE_CACHE_MB", cache_mb.to_string())
+        .envs(socket.iter().map(|socket| ("DATABASE_SOCKET", socket)))
         // BENCH_SERVER_LOG=file keeps what the server says.
         .stderr(match std::env::var_os("BENCH_SERVER_LOG") {
             Some(path) => Stdio::from(std::fs::File::create(path).expect("the server's log file")),
@@ -174,11 +222,14 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
         })
         .spawn()
         .unwrap_or_else(|e| panic!("cannot run {}: {e}. Build it first: cargo build --release", binary.display()));
-    let server = Server { child, dir, as_postgres: false };
+    let server = Server { child: Some(child), dir, as_postgres: false, cage, name: "database" };
     for _ in 0..200 {
-        if let Ok(admin) = Client::connect(Config::new("127.0.0.1", port, "", "bench-admin")).await {
+        let mut admin = Config::new("127.0.0.1", port, "", "bench-admin");
+        admin.socket = socket.clone();
+        if let Ok(admin) = Client::connect(admin).await {
             admin.admin().create_database_if_not_exists("bench", "bench").await.unwrap();
             let mut config = Config::new("127.0.0.1", port, "bench", "bench");
+            config.socket = socket.clone();
             config.pool_size = CONNECTIONS;
             return (server, Client::connect(config).await.unwrap());
         }
@@ -230,39 +281,49 @@ async fn start_postgres() -> Option<(Server, Pg)> {
     let bin = ["/usr/lib/postgresql/16/bin", "/usr/lib/postgresql/17/bin", "/usr/local/bin", "/usr/bin"].iter().map(Path::new).find(|d| d.join("initdb").exists())?;
     let root = std::fs::read_to_string("/proc/self/status").ok()?.lines().any(|l| l.starts_with("Uid:") && l.split_whitespace().nth(1) == Some("0"));
     let dir = bench_dir("postgres");
-    let run = |program: &Path, args: &[&str]| -> Command {
+    // `limited` is the memory cgroup to run in, for the server itself:
+    // what prepares its directory runs under no limit.
+    let run = |program: &Path, args: &[&str], limited: Option<Option<&limits::Cage>>| -> Command {
         // Postgres refuses to run as root.
+        let first = if root { Path::new("runuser") } else { program };
+        let mut c = match limited {
+            Some(cage) => limits().command(cage, first),
+            None => Command::new(first),
+        };
         if root {
-            let mut c = Command::new("runuser");
-            c.args(["-u", "postgres", "--"]).arg(program).args(args);
-            c
-        } else {
-            let mut c = Command::new(program);
-            c.args(args);
-            c
+            c.args(["-u", "postgres", "--"]).arg(program);
         }
+        c.args(args);
+        c
     };
-    let _ = run(Path::new("rm"), &["-rf", dir.to_str()?]).status();
+    let _ = run(Path::new("rm"), &["-rf", dir.to_str()?], None).status();
     std::fs::create_dir_all(&dir).ok()?;
     if root {
         Command::new("chown").arg("postgres").arg(&dir).status().ok()?;
     }
     let data = dir.join("data");
-    let init = run(&bin.join("initdb"), &["-D", data.to_str()?, "--auth=trust", "--no-sync", "-E", "UTF8", "--locale=C.UTF-8"]).stdout(Stdio::null()).stderr(Stdio::null()).status().ok()?;
+    let init = run(&bin.join("initdb"), &["-D", data.to_str()?, "--auth=trust", "--no-sync", "-E", "UTF8", "--locale=C.UTF-8"], None).stdout(Stdio::null()).stderr(Stdio::null()).status().ok()?;
     if !init.success() {
         return None;
     }
     let port = free_port();
+    let cage = limits().cage("postgres");
     let child = run(
         &bin.join("postgres"),
         &["-D", data.to_str()?, "-p", &port.to_string(), "-c", "listen_addresses=127.0.0.1", "-c", "shared_buffers=64MB", "-c", "unix_socket_directories=", "-c", "max_connections=100"],
+        Some(cage.as_ref()),
     )
+    // Its socket, when it is to be reached through one, goes in its own
+    // directory, which the user it runs as owns. (Of a setting given
+    // twice, the last holds.)
+    .args(through_socket().then(|| ["-c".to_string(), format!("unix_socket_directories={}", dir.display())]).into_iter().flatten())
     .stderr(Stdio::null())
     .spawn()
     .ok()?;
-    let server = Server { child, dir, as_postgres: root };
+    let server = Server { child: Some(child), dir, as_postgres: root, cage, name: "Postgres 16" };
     let user = if root { "postgres".to_string() } else { std::env::var("USER").unwrap_or_else(|_| "postgres".to_string()) };
-    let target = format!("host=127.0.0.1 port={port} user={user} dbname=postgres");
+    let host = if through_socket() { server.dir.to_str()?.to_string() } else { "127.0.0.1".to_string() };
+    let target = format!("host={host} port={port} user={user} dbname=postgres");
     for _ in 0..200 {
         if tokio_postgres::connect(&target, tokio_postgres::NoTls).await.is_ok() {
             let mut clients = Vec::new();
@@ -361,6 +422,32 @@ fn token(n: i64) -> Vec<u8> {
 
 fn user_id(n: i64) -> Uuid {
     Uuid((0x1000_0000_0000_0000_0000_0000_0000_0000u128 + n as u128).to_be_bytes())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// What a workload's operation is about, from its well-mixed number `r`:
+// here once, so that every target is asked for the same rows.
+
+/// The session a lookup asks for.
+fn session_of(r: u64) -> i64 {
+    (r % SESSIONS as u64) as i64
+}
+
+/// The event a durable insert writes: its actor, its action, its detail.
+fn event(r: u64) -> (String, &'static str, String) {
+    (format!("usr_{}", r % 1000), "login.ok", format!(r#"{{"device":"d{}","ip":"10.0.0.{}"}}"#, r % 50, r % 250))
+}
+
+/// The accounts a transfer moves money between: two picked at random
+/// (workload 8), or, to see transactions that are in each other's way,
+/// always into the same one (workload 11). `None` when it picked the
+/// same account twice, and so has nothing to do.
+fn transfer_between(index: usize, r: u64) -> Option<(i64, i64)> {
+    let (from, to) = if index == 8 { ((r % 1000) as i64, ((r >> 10) % 1000) as i64) } else { ((1 + r % 999) as i64, 0) };
+    (from != to).then_some((from, to))
 }
 
 fn mail_id(user: i64, n: i64) -> Uuid {
@@ -561,6 +648,76 @@ async fn load_mails(target: &Target) -> Timing {
     .await
 }
 
+/// This server's statements, each prepared once: a connection is sent
+/// one the first time it runs it and its values after that, as the
+/// Postgres client above does with its statements.
+struct Statements {
+    session: Prepared,
+    event: Prepared,
+    /// On the durable table and on the volatile one.
+    upsert: [Prepared; 2],
+    mailbox: Prepared,
+    flag: Prepared,
+    account: Prepared,
+    debit: Prepared,
+    /// The debit of a transfer sent whole: only from an account that is
+    /// not overdrawn, which the transaction tests after reading it.
+    debit_if_funded: Prepared,
+    credit: Prepared,
+    ledger: Prepared,
+    count: Prepared,
+    search: Prepared,
+}
+
+fn statements() -> &'static Statements {
+    static STATEMENTS: std::sync::OnceLock<Statements> = std::sync::OnceLock::new();
+    STATEMENTS.get_or_init(|| {
+        let upsert = |table: &str| {
+            let expired = col("window_start").le(now() - seconds(60));
+            Prepared::new(
+                Insert::into(table)
+                    .columns(["key", "window_start", "hits"])
+                    .values([param(0), now(), val(1)])
+                    .on_conflict_update(PRIMARY)
+                    .update("window_start", when(expired.clone(), now(), col("window_start")))
+                    .update("hits", when(expired, 1, col("hits") + 1))
+                    .returning(["hits"]),
+            )
+        };
+        Statements {
+            session: Prepared::new(
+                Query::table("sessions")
+                    .alias("s")
+                    .index("sessions_token", KeyRange::eq([param(0)]))
+                    .join(Query::table("users").alias("u").key([col("s.user_id")]).filter(col("u.disabled").eq(false)))
+                    .filter(col("s.expires_at").gt(now()))
+                    .select("id", col("s.id"))
+                    .select("username", col("u.username")),
+            ),
+            event: Prepared::new(Insert::into("events").columns(["actor", "action", "detail"]).values([param(0), param(1), param(2)])),
+            upsert: [upsert("throttle"), upsert("throttle_volatile")],
+            mailbox: Prepared::new(Query::table("mails").index("mails_user_date", KeyRange::eq([param(0)])).limit(50).columns(["mail_id", "subject", "date", "from_text", "read", "saved"]).select("preview", col("text").left(200))),
+            flag: Prepared::new(Update::table("mails").key([param(0)]).set("read", true).set("updated", now())),
+            account: Prepared::new(Query::table("accounts").key([param(0)])),
+            debit: Prepared::new(Update::table("accounts").key([param(0)]).set("balance", col("balance") - 1)),
+            debit_if_funded: Prepared::new(Update::table("accounts").key([param(0)]).filter(col("balance").ge(0)).set("balance", col("balance") - 1)),
+            credit: Prepared::new(Update::table("accounts").key([param(0)]).set("balance", col("balance") + 1)),
+            ledger: Prepared::new(Insert::into("ledger").columns(["from_id", "to_id", "amount"]).values([param(0), param(1), val(1)])),
+            count: Prepared::new(Query::table("mails").index("mails_user_date", KeyRange::eq([param(0)])).select("total", count()).select("unread", count().filter(col("read").eq(false)))),
+            search: Prepared::new(Query::table("mails").search("mails_search", [param(0)], param(1)).select("mail_id", col("mail_id")).select("subject", col("subject")).select("rank", Expr::Rank).order_by(Expr::Rank.desc()).limit(20)),
+        }
+    })
+}
+
+/// A transfer in one statement, for Postgres: what the batch is to this
+/// server. The rows are locked in id order first, so that two transfers
+/// never wait on each other; the debit happens only to an account that
+/// is not overdrawn, and the rest only if the debit did.
+const PG_TRANSFER: &str = "WITH held AS (SELECT id FROM accounts WHERE id IN ($1, $2) ORDER BY id FOR UPDATE), \
+     debit AS (UPDATE accounts SET balance = balance - 1 WHERE id = $1 AND balance >= 0 AND (SELECT count(*) FROM held) = 2 RETURNING id), \
+     credit AS (UPDATE accounts SET balance = balance + 1 WHERE id = $2 AND EXISTS (SELECT 1 FROM debit) RETURNING id) \
+     INSERT INTO ledger (from_id, to_id, amount) SELECT $1, $2, 1 WHERE EXISTS (SELECT 1 FROM credit)";
+
 type Workload = (&'static str, usize, u64);
 
 /// The workloads: name, connections, operations.
@@ -581,9 +738,12 @@ const WORKLOADS: &[Workload] = &[
         8,
         6_000,
     ),
+    ("transfer sent whole, as one request (8 connections)", 8, 6_000),
+    ("transfer sent whole, all into one account (8 connections)", 8, 6_000),
 ];
 
-async fn run_workload(target: &Target, index: usize) -> Timing {
+/// The connections and operations of a workload in this run.
+fn sized(index: usize) -> (usize, u64) {
     let (name, mut workers, mut total) = WORKLOADS[index];
     // BENCH_CONNECTIONS=1 runs every workload on that many connections.
     if let Some(n) = std::env::var("BENCH_CONNECTIONS")
@@ -599,24 +759,23 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
             total *= times.parse::<u64>().unwrap_or(1);
         }
     }
+    (workers, total)
+}
+
+async fn run_workload(target: &Target, index: usize) -> Timing {
+    let (workers, total) = sized(index);
     let target = target.clone();
     measure(workers, total, move |worker, n| {
         let target = target.clone();
         async move {
             let r = mix(n + 7 * index as u64);
+            let st = statements();
             match index {
                 0 | 1 => {
-                    let hash = token((r % SESSIONS as u64) as i64);
+                    let hash = token(session_of(r));
                     match &target {
                         Target::Ours(db) => {
-                            let q = Query::table("sessions")
-                                .alias("s")
-                                .index("sessions_token", KeyRange::eq([hash]))
-                                .join(Query::table("users").alias("u").key([col("s.user_id")]).filter(col("u.disabled").eq(false)))
-                                .filter(col("s.expires_at").gt(now()))
-                                .select("id", col("s.id"))
-                                .select("username", col("u.username"));
-                            assert_eq!(db.query(q).await.unwrap().len(), 1);
+                            assert_eq!(db.execute(&st.session, [hash]).await.unwrap().len(), 1);
                         }
                         Target::Pg(_) => {
                             let rows = target
@@ -629,11 +788,11 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     }
                 }
                 2 | 3 => {
-                    let (actor, action, detail) = (format!("usr_{}", r % 1000), "login.ok", format!(r#"{{"device":"d{}","ip":"10.0.0.{}"}}"#, r % 50, r % 250));
+                    let (actor, action, detail) = event(r);
                     match &target {
                         Target::Ours(db) => {
                             let json: Json = detail.parse().unwrap();
-                            db.insert(Insert::into("events").set("actor", actor).set("action", action).set("detail", json)).await.unwrap();
+                            db.execute(&st.event, [Value::from(actor), Value::from(action), Value::from(json)]).await.unwrap();
                         }
                         Target::Pg(_) => {
                             target.pg(worker).execute("INSERT INTO events (actor, action, detail) VALUES ($1, $2, $3::text::jsonb)", &[&actor, &action, &detail]).await.unwrap();
@@ -645,16 +804,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let key = format!("ip:10.0.{}.{}:login", r % 20, r % 250);
                     match &target {
                         Target::Ours(db) => {
-                            let expired = col("window_start").le(now() - seconds(60));
-                            let upsert = Insert::into(table)
-                                .set("key", key)
-                                .set("window_start", now())
-                                .set("hits", 1)
-                                .on_conflict_update(PRIMARY)
-                                .update("window_start", when(expired.clone(), now(), col("window_start")))
-                                .update("hits", when(expired, 1, col("hits") + 1))
-                                .returning(["hits"]);
-                            db.insert(upsert).await.unwrap();
+                            db.execute(&st.upsert[index - 4], [key]).await.unwrap();
                         }
                         Target::Pg(_) => {
                             let sql = format!(
@@ -670,8 +820,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let user = user_id((r % USERS as u64) as i64);
                     match &target {
                         Target::Ours(db) => {
-                            let q = Query::table("mails").index("mails_user_date", KeyRange::eq([user])).limit(50).columns(["mail_id", "subject", "date", "from_text", "read", "saved"]).select("preview", col("text").left(200));
-                            assert_eq!(db.query(q).await.unwrap().len(), 50);
+                            assert_eq!(db.execute(&st.mailbox, [user]).await.unwrap().len(), 50);
                         }
                         Target::Pg(_) => {
                             let rows = target
@@ -687,8 +836,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let id = mail_id((r % USERS as u64) as i64, ((r >> 8) % MAILS_PER_USER as u64) as i64);
                     match &target {
                         Target::Ours(db) => {
-                            let updated = db.update(Update::table("mails").key([id]).set("read", true).set("updated", now())).await.unwrap();
-                            assert_eq!(updated.affected(), 1);
+                            assert_eq!(db.execute(&st.flag, [id]).await.unwrap().affected(), 1);
                         }
                         Target::Pg(_) => {
                             assert_eq!(target.pg(worker).execute("UPDATE mails SET read = true, updated = now() WHERE mail_id = $1::text::uuid", &[&pg_uuid(id)]).await.unwrap(), 1);
@@ -696,24 +844,18 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     }
                 }
                 8 | 11 => {
-                    // Between two accounts picked at random, or, to see
-                    // transactions that are in each other's way, always
-                    // into the same one.
-                    let (from, to) = if index == 8 { ((r % 1000) as i64, ((r >> 10) % 1000) as i64) } else { ((1 + r % 999) as i64, 0) };
-                    if from == to {
-                        return;
-                    }
+                    let Some((from, to)) = transfer_between(index, r) else { return };
                     match &target {
                         Target::Ours(db) => {
                             db.transaction(|tx| async move {
-                                let a: Decimal = tx.get("accounts", [from]).await?.unwrap().get("balance")?;
-                                let _b: Decimal = tx.get("accounts", [to]).await?.unwrap().get("balance")?;
+                                let a: Decimal = tx.execute(&st.account, [from]).await?.one()?.get("balance")?;
+                                let _b: Decimal = tx.execute(&st.account, [to]).await?.one()?.get("balance")?;
                                 if a.is_negative() {
                                     return Ok(());
                                 }
-                                tx.update(Update::table("accounts").key([from]).set("balance", col("balance") - 1)).await?;
-                                tx.update(Update::table("accounts").key([to]).set("balance", col("balance") + 1)).await?;
-                                tx.insert(Insert::into("ledger").set("from_id", from).set("to_id", to).set("amount", 1)).await?;
+                                tx.execute(&st.debit, [from]).await?;
+                                tx.execute(&st.credit, [to]).await?;
+                                tx.execute(&st.ledger, [from, to]).await?;
                                 Ok::<_, DbError>(())
                             })
                             .await
@@ -738,12 +880,29 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let user = user_id((r % USERS as u64) as i64);
                     match &target {
                         Target::Ours(db) => {
-                            let q = Query::table("mails").index("mails_user_date", KeyRange::eq([user])).select("total", count()).select("unread", count().filter(col("read").eq(false)));
-                            assert_eq!(db.query_one(q).await.unwrap().get::<i64>("total").unwrap(), MAILS_PER_USER);
+                            assert_eq!(db.execute(&st.count, [user]).await.unwrap().one().unwrap().get::<i64>("total").unwrap(), MAILS_PER_USER);
                         }
                         Target::Pg(_) => {
                             let row = target.pg(worker).query_one("SELECT count(*), count(*) FILTER (WHERE NOT read) FROM mails WHERE user_id = $1::text::uuid", &[&pg_uuid(user)]).await.unwrap();
                             assert_eq!(row.get::<_, i64>(0), MAILS_PER_USER);
+                        }
+                    }
+                }
+                12 | 13 => {
+                    // The same transfers, between the same accounts, as
+                    // one request: see `Client::batch`.
+                    let s = mix(n + 7 * if index == 12 { 8 } else { 11 });
+                    let (from, to) = if index == 12 { ((s % 1000) as i64, ((s >> 10) % 1000) as i64) } else { ((1 + s % 999) as i64, 0) };
+                    if from == to {
+                        return;
+                    }
+                    match &target {
+                        Target::Ours(db) => {
+                            let transfer = Batch::new().add_prepared(&st.debit_if_funded, [from]).expect(1).add_prepared(&st.credit, [to]).expect(1).add_prepared(&st.ledger, [from, to]);
+                            db.batch(transfer).await.unwrap();
+                        }
+                        Target::Pg(_) => {
+                            assert_eq!(target.pg(worker).execute(PG_TRANSFER, &[&from, &to]).await.unwrap(), 1);
                         }
                     }
                 }
@@ -752,8 +911,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let words = format!("term{} term{}", r % 5000, (r >> 16) % 5000);
                     match &target {
                         Target::Ours(db) => {
-                            let q = Query::table("mails").search("mails_search", [user], words).select("mail_id", col("mail_id")).select("subject", col("subject")).select("rank", Expr::Rank).order_by(Expr::Rank.desc()).limit(20);
-                            assert!(db.query(q).await.unwrap().len() <= 20);
+                            assert!(db.execute(&st.search, [Value::from(user), Value::from(words)]).await.unwrap().len() <= 20);
                         }
                         Target::Pg(_) => {
                             let rows = target
@@ -775,21 +933,51 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
 }
 
 struct Report {
-    name: &'static str,
-    idle_memory: u64,
-    memory: u64,
-    cpu: f64,
+    name: String,
+    /// The memory and CPU figures are `None` for what has no process of
+    /// its own to measure: embedded SQLite runs inside the benchmark.
+    idle_memory: Option<u64>,
+    memory: Option<u64>,
+    /// The most memory held at any moment of the run.
+    peak: Option<u64>,
+    cpu: Option<f64>,
     disk: (u64, u64),
     /// `None` for what was not run.
     load: Option<Timing>,
     timings: Vec<Option<Timing>>,
+    /// What the figures do not say: operations that gave up, a workload
+    /// that did not complete, a server killed for its memory.
+    notes: Vec<String>,
+}
+
+/// What a server's process cost, measured while it still runs.
+struct Cost {
+    memory: u64,
+    peak: u64,
+    cpu: f64,
+    notes: Vec<String>,
+}
+
+fn cost(server: &Server, pid: u32, peak: limits::Peak) -> Cost {
+    let (memory, peak, cpu) = (memory(pid), peak.most(), cpu_seconds(pid));
+    let mut notes = Vec::new();
+    if let Some(cage) = &server.cage {
+        let kills = cage.kills();
+        if kills > 0 {
+            notes.push(format!("{}: killed {kills} time(s) for going over its memory limit", server.name));
+        }
+    } else if let Some(limit) = limits().memory().filter(|limit| peak > *limit) {
+        notes.push(format!("{}: held {} at most, over the limit of {} that was asked for and could not be enforced", server.name, mb(peak), mb(limit)));
+    }
+    Cost { memory, peak, cpu, notes }
 }
 
 async fn run(name: &'static str, server: Server, target: Target, loaded: bool) -> Report {
-    let pid = server.child.id();
+    let pid = server.pid().expect("a server of its own");
     // What the server holds before it has done anything.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let idle_memory = memory(pid);
+    let peak = limits::Peak::watch(pid);
     let mails = selected(BULK_LOAD) || ON_MAILS.iter().any(|index| selected(WORKLOADS[*index].0));
     let load = if loaded {
         None
@@ -811,8 +999,7 @@ async fn run(name: &'static str, server: Server, target: Target, loaded: bool) -
         eprintln!("{name}: {workload}");
         timings.push(Some(run_workload(&target, index).await));
     }
-    let memory = memory(pid);
-    let cpu = cpu_seconds(pid);
+    let cost = cost(&server, pid, peak);
     // Let each write what it buffers before the files are measured.
     match &target {
         Target::Ours(db) => {
@@ -854,7 +1041,137 @@ async fn run(name: &'static str, server: Server, target: Target, loaded: bool) -
     let disk = disk_bytes(&server.dir);
     drop(target);
     drop(server);
-    Report { name, idle_memory, memory, cpu, disk, load, timings }
+    Report { name: name.to_string(), idle_memory: Some(idle_memory), memory: Some(cost.memory), peak: Some(cost.peak), cpu: Some(cost.cpu), disk, load, timings, notes: cost.notes }
+}
+
+// ------------------------------------------------------ the SQLite family
+
+/// The workloads the SQLite family runs: the ones it was first compared
+/// on. The others need what was not written for it (full-text search
+/// set up three ways, the mails loaded three ways).
+const FAMILY: [usize; 6] = [0, 1, 2, 3, 8, 11];
+
+#[derive(Clone)]
+enum Family {
+    /// rqlite or libSQL's server.
+    Remote(Arc<family::Remote>),
+    /// SQLite in this process, and how its writers reach it.
+    #[cfg(feature = "sqlite")]
+    Embedded(Arc<sqlite::Embedded>, sqlite::Writers),
+}
+
+impl Family {
+    /// Whether a workload is run against this member of the family.
+    #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
+    fn runs(&self, index: usize) -> bool {
+        match self {
+            // Not after a request has failed or gone unanswered.
+            Family::Remote(remote) => remote.failure().is_none(),
+            #[cfg(feature = "sqlite")]
+            Family::Embedded(_, sqlite::Writers::Shared) => true,
+            // A connection each differs from one shared connection only
+            // where several workers write.
+            #[cfg(feature = "sqlite")]
+            Family::Embedded(_, sqlite::Writers::Each) => sized(index).0 > 1 && !matches!(index, 0 | 1),
+        }
+    }
+}
+
+/// Runs one workload. Returns its timing, if it completed, and what
+/// there is to say beside the timing.
+async fn run_family_workload(family: &Family, index: usize) -> (Option<Timing>, Option<String>) {
+    let (workers, total) = sized(index);
+    let name = WORKLOADS[index].0;
+    match family {
+        Family::Remote(remote) => {
+            remote.fresh().await;
+            let asked = remote.clone();
+            let timing = measure(workers, total, move |worker, n| {
+                let remote = asked.clone();
+                async move {
+                    if remote.failure().is_some() {
+                        return;
+                    }
+                    let r = mix(n + 7 * index as u64);
+                    let done = match index {
+                        0 | 1 => remote.session(worker, &hex(&token(session_of(r)))).await,
+                        2 | 3 => {
+                            let (actor, _, detail) = event(r);
+                            remote.insert(worker, &actor, &detail).await
+                        }
+                        _ => match transfer_between(index, r) {
+                            Some((from, to)) => remote.transfer(worker, from, to).await,
+                            None => Ok(()),
+                        },
+                    };
+                    if let Err(why) = done {
+                        remote.fail(why);
+                    }
+                }
+            })
+            .await;
+            match remote.failure() {
+                Some(why) => (None, Some(format!("{}: \"{name}\" did not complete, and nothing after it was run: {why}", remote.kind().name()))),
+                None => (Some(timing), None),
+            }
+        }
+        #[cfg(feature = "sqlite")]
+        Family::Embedded(db, writers) => {
+            let each = *writers == sqlite::Writers::Each;
+            // A quarter of the operations: where a sync is slow, writers
+            // that wait on each other's locks take minutes over these.
+            let total = if each { (total / 4).max(1) } else { total };
+            let (db, writers) = (db.clone(), *writers);
+            let (timing, gave_up) = tokio::task::spawn_blocking(move || db.run(index, workers, total, writers)).await.unwrap();
+            let note = each.then(|| format!("SQLite (a connection each): \"{name}\" ran {total} operations, of which {gave_up} gave up after waiting {} s for another connection's write lock", sqlite::BUSY.as_secs()));
+            (Some(timing), note)
+        }
+    }
+}
+
+/// Runs the family's workloads against one member of it. `server` is
+/// its process, or for embedded SQLite only its directory.
+async fn run_family(name: &str, server: &Server, family: &Family) -> Report {
+    let pid = server.pid();
+    if pid.is_some() {
+        // What the server holds before it has done anything.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let idle_memory = pid.map(memory);
+    let peak = pid.map(limits::Peak::watch);
+    let mut notes = Vec::new();
+    match family {
+        Family::Remote(remote) => {
+            eprintln!("{name}: loading");
+            if let Err(why) = remote.load().await {
+                remote.fail(why.clone());
+                notes.push(format!("{name}: the load did not complete, and nothing after it was run: {why}"));
+            }
+        }
+        // Loaded when it was created.
+        #[cfg(feature = "sqlite")]
+        Family::Embedded(..) => {}
+    }
+    let mut timings: Vec<Option<Timing>> = WORKLOADS.iter().map(|_| None).collect();
+    for index in FAMILY {
+        let workload = WORKLOADS[index].0;
+        if !selected(workload) || !family.runs(index) {
+            continue;
+        }
+        eprintln!("{name}: {workload}");
+        let (timing, note) = run_family_workload(family, index).await;
+        timings[index] = timing;
+        notes.extend(note);
+    }
+    let cost = pid.zip(peak).map(|(pid, peak)| cost(server, pid, peak));
+    #[cfg(feature = "sqlite")]
+    if let Family::Embedded(db, _) = family {
+        db.checkpoint().expect("SQLite: a checkpoint");
+    }
+    let disk = disk_bytes(&server.dir);
+    let (memory, peak, cpu) = (cost.as_ref().map(|c| c.memory), cost.as_ref().map(|c| c.peak), cost.as_ref().map(|c| c.cpu));
+    notes.extend(cost.into_iter().flat_map(|c| c.notes));
+    Report { name: name.to_string(), idle_memory, memory, peak, cpu, disk, load: None, timings, notes }
 }
 
 fn mb(bytes: u64) -> String {
@@ -879,6 +1196,10 @@ fn micros(d: Duration) -> String {
 }
 
 fn print(reports: &[Report]) {
+    for line in limits().describe() {
+        println!("{line}");
+        println!();
+    }
     let header: Vec<String> = reports.iter().flat_map(|r| [format!("{} ops/s", r.name), "p50".to_string(), "p99".to_string()]).collect();
     println!("| Workload | {} |", header.join(" | "));
     println!("|---|{}", "---:|".repeat(header.len()));
@@ -900,22 +1221,53 @@ fn print(reports: &[Report]) {
         row(name, &|r| r.timings[index].as_ref());
     }
     println!();
-    println!("| | {} |", reports.iter().map(|r| r.name).collect::<Vec<_>>().join(" | "));
+    // A dash where there is no process of the target's own to measure.
+    let cells = |pick: &dyn Fn(&Report) -> Option<String>| reports.iter().map(|r| pick(r).unwrap_or_else(|| "-".to_string())).collect::<Vec<_>>().join(" | ");
+    println!("| | {} |", reports.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(" | "));
     println!("|---|{}", "---:|".repeat(reports.len()));
-    println!("| Memory when idle, before any request | {} |", reports.iter().map(|r| mb(r.idle_memory)).collect::<Vec<_>>().join(" | "));
-    println!("| Memory after the run | {} |", reports.iter().map(|r| mb(r.memory)).collect::<Vec<_>>().join(" | "));
-    println!("| CPU time for the whole run | {} |", reports.iter().map(|r| format!("{:.1} s", r.cpu)).collect::<Vec<_>>().join(" | "));
-    println!("| Data files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk.0)).collect::<Vec<_>>().join(" | "));
-    println!("| Log files on disk after a checkpoint | {} |", reports.iter().map(|r| mb(r.disk.1)).collect::<Vec<_>>().join(" | "));
+    println!("| Memory when idle, before any request | {} |", cells(&|r| r.idle_memory.map(mb)));
+    println!("| Memory after the run | {} |", cells(&|r| r.memory.map(mb)));
+    println!("| Most memory held during the run | {} |", cells(&|r| r.peak.map(mb)));
+    println!("| CPU time for the whole run | {} |", cells(&|r| r.cpu.map(|cpu| format!("{cpu:.1} s"))));
+    println!("| Data files on disk after a checkpoint | {} |", cells(&|r| Some(mb(r.disk.0))));
+    println!("| Log files on disk after a checkpoint | {} |", cells(&|r| Some(mb(r.disk.1))));
+    let notes: Vec<&String> = reports.iter().flat_map(|r| &r.notes).collect();
+    if !notes.is_empty() {
+        println!();
+        for note in notes {
+            println!("- {note}");
+        }
+    }
 }
 
-#[tokio::main]
-async fn main() {
+/// What `--only` may name.
+const TARGETS: [&str; 5] = ["ours", "postgres", "sqlite", "rqlite", "libsql"];
+
+fn main() {
+    // Before any thread is started: the limits may move this process to
+    // other CPUs than the servers', and its threads go where it is.
+    if let Err(why) = limits::Limits::init() {
+        eprintln!("{why}");
+        std::process::exit(2);
+    }
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("the runtime").block_on(bench());
+}
+
+async fn bench() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).cloned();
+    let only: Option<Vec<String>> = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|list| list.split(',').map(|name| name.trim().to_string()).collect());
+    if let Some(unknown) = only.iter().flatten().find(|name| *name != "all" && !TARGETS.contains(&name.as_str())) {
+        eprintln!("--only {unknown}: not a target. The targets are {}, or all; several are separated by commas", TARGETS.join(", "));
+        std::process::exit(2);
+    }
+    // With no --only: this server and Postgres, on every workload.
+    let wanted = |name: &str| match &only {
+        Some(list) => list.iter().any(|o| o == name || o == "all"),
+        None => matches!(name, "ours" | "postgres"),
+    };
     let binary = args.iter().position(|a| a == "--binary").and_then(|i| args.get(i + 1)).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("target/release/database"));
     let mut reports = Vec::new();
-    if only.as_deref() != Some("postgres") {
+    if wanted("ours") {
         let (server, client) = start_ours(&binary, 32).await;
         // Data kept from an earlier run is used as it is.
         let loaded = !client.describe().await.unwrap().is_empty();
@@ -924,11 +1276,41 @@ async fn main() {
         }
         reports.push(run("database", server, Target::Ours(client), loaded).await);
     }
-    if only.as_deref() != Some("ours") {
+    if wanted("postgres") {
         match start_postgres().await {
             Some((server, pg)) => reports.push(run("Postgres 16", server, Target::Pg(Arc::new(pg)), false).await),
             None => eprintln!("Postgres is not installed here, or would not start: skipping it"),
         }
+    }
+    if wanted("sqlite") {
+        #[cfg(feature = "sqlite")]
+        {
+            let dir = bench_dir("sqlite");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("SQLite: its directory");
+            let server = Server { child: None, dir: dir.clone(), as_postgres: false, cage: None, name: "SQLite" };
+            if limits().memory().is_some() {
+                eprintln!("SQLite: embedded, so it runs inside the benchmark, on its CPUs and under no memory limit");
+            }
+            eprintln!("SQLite: loading");
+            let db = Arc::new(tokio::task::spawn_blocking(move || sqlite::Embedded::create(&dir)).await.unwrap().expect("SQLite: the load"));
+            for (name, writers) in [("SQLite (one write connection)", sqlite::Writers::Shared), ("SQLite (a connection each)", sqlite::Writers::Each)] {
+                reports.push(run_family(name, &server, &Family::Embedded(db.clone(), writers)).await);
+            }
+        }
+        #[cfg(not(feature = "sqlite"))]
+        eprintln!("SQLite: not in this build: cargo build --release -p database-bench --features sqlite");
+    }
+    for (name, kind) in [("rqlite", family::Kind::Rqlite), ("libsql", family::Kind::Libsql)] {
+        if wanted(name) {
+            if let Some((server, remote)) = family::start(kind).await {
+                reports.push(run_family(kind.name(), &server, &Family::Remote(Arc::new(remote))).await);
+            }
+        }
+    }
+    if reports.is_empty() {
+        eprintln!("nothing was run");
+        std::process::exit(1);
     }
     print(&reports);
 }
