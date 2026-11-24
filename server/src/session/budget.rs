@@ -10,7 +10,9 @@
 //! finds the budget spent waits, with its bytes still in the socket.
 //! As a large request is answered, the memory it held is handed back to
 //! the system (at most five times a second), rather than left in the
-//! allocator's pool of whichever thread decoded it.
+//! allocator's pool of whichever thread decoded it: where the allocator
+//! is the GNU C library's, which keeps such pools. Elsewhere only the
+//! budget bounds the memory.
 //!
 //! - A request of ordinary size (`BRIEF_BYTES` or less) takes nothing
 //!   and never waits.
@@ -23,8 +25,10 @@
 //! - The budget is taken in arrival order, so a large request is not
 //!   passed over for ever by smaller large ones.
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
@@ -43,6 +47,7 @@ pub(super) const BUDGET_BYTES: usize = 4 * 1024 * 1024;
 /// back to the system as they are answered. A trim takes the allocator's
 /// locks for a moment; the server also trims every few seconds while
 /// requests arrive, which is too seldom for a load of megabyte requests.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 const TRIM_EVERY: Duration = Duration::from_millis(200);
 
 /// What the budget is counted in.
@@ -64,18 +69,29 @@ impl Share {
     pub(super) fn give_back(self) {
         let Some(permit) = self.0 else { return };
         drop(permit);
-        // Milliseconds since the first trim, plus one interval, at the
-        // last trim: zero means none yet.
-        static START: OnceLock<Instant> = OnceLock::new();
-        static LAST: AtomicU64 = AtomicU64::new(0);
-        let every = TRIM_EVERY.as_millis() as u64;
-        let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64 + every;
-        let last = LAST.load(Ordering::Relaxed);
-        if now >= last + every && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-            tokio::task::spawn_blocking(crate::memory::trim);
-        }
+        trim_soon();
     }
 }
+
+/// Has the allocator give free memory back to the system, unless it did
+/// a moment ago. Only the GNU C library keeps a pool per thread and is
+/// asked to (`memory::trim`); with any other, the budget is all there is.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_soon() {
+    // Milliseconds since the first trim, plus one interval, at the last
+    // trim: zero means none yet.
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let every = TRIM_EVERY.as_millis() as u64;
+    let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64 + every;
+    let last = LAST.load(Ordering::Relaxed);
+    if now >= last + every && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tokio::task::spawn_blocking(crate::memory::trim);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_soon() {}
 
 impl Budget {
     pub(super) const fn new(bytes: usize) -> Budget {
