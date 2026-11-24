@@ -354,29 +354,33 @@ where
             Some(Txn::Read(_) | Txn::Fork(_) | Txn::Dead(_)) => state.config.idle_transaction.saturating_mul(IDLE_READ_FACTOR),
             None => Duration::from_secs(u64::from(u32::MAX)),
         };
-        let len = tokio::select! {
-            len = tokio::time::timeout(patience, budget::read_len(&mut reader)) => len,
-            _ = stopping.changed() => break,
-        };
-        let Ok(Ok(Some(len))) = len else { break };
-        // A large request's share of memory, taken before its bytes are
-        // read (see `budget`). Whoever holds the turn between requests
-        // does not wait for it.
-        let holds_turn = matches!(session.txn, Some(Txn::Write(..)));
-        let share = tokio::select! {
-            share = budget::budget().take(len, !holds_turn) => share,
-            _ = stopping.changed() => break,
-        };
+        // The frame is read whole before anything shared is taken for
+        // it: a client slow to send its bytes keeps only itself waiting.
         let frame = tokio::select! {
-            frame = tokio::time::timeout(patience, budget::read_body(&mut reader, len, MAX_FRAME)) => frame,
+            frame = tokio::time::timeout(patience, read_frame(&mut reader, MAX_FRAME)) => frame,
             _ = stopping.changed() => break,
         };
-        let Ok(Ok(frame)) = frame else { break };
+        let Ok(Ok(Some(frame))) = frame else { break };
+        // A large request's share of memory, taken before it is decoded
+        // (see `budget`). Whoever holds the turn between requests does
+        // not wait for it.
+        let holds_turn = matches!(session.txn, Some(Txn::Write(..)));
+        let mut share = tokio::select! {
+            share = budget::budget().take(frame.len(), !holds_turn) => Some(share),
+            _ = stopping.changed() => break,
+        };
         state.requests.fetch_add(1, Ordering::Relaxed);
         let outcome = match decode_request(&frame) {
             Ok((request, timeout_ms)) => {
                 session.request_bytes = frame.len();
                 drop(frame);
+                // A dump writes to the client as it goes, and may wait on
+                // it: nothing shared is held meanwhile.
+                if matches!(request, Request::Admin(Admin::Dump { .. })) {
+                    if let Some(share) = share.take() {
+                        share.give_back();
+                    }
+                }
                 let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
                 // The statement of a bulk load goes a way of its own.
                 match session.load(request, deadline).await {
@@ -386,7 +390,9 @@ where
             }
             Err(e) => Ok(vec![Response::Error(e)]),
         };
-        share.give_back();
+        if let Some(share) = share {
+            share.give_back();
+        }
         let Ok(responses) = outcome else { break };
         let mut failed = false;
         for response in &responses {

@@ -297,8 +297,9 @@ Since then, three things were done:
   engine's, and put in place under the write lock only if the segments
   read are as they were. A writer still merges a mostly dead segment,
   and the cheapest run once 40 segments have gathered.
-- **Large requests share 4 MB of memory**, and what each held is given
-  back to the system as it is answered (`session/budget.rs`).
+- **Large requests share 4 MB of memory** to be decoded and answered
+  in, taken once a request's bytes have all come, and what each held is
+  given back to the system as it is answered (`session/budget.rs`).
 
 Counted by `valgrind --tool=callgrind` over a tenth of the load
 (`BENCH_LOAD_PART=10`: 40 statements of 250 mails), in instructions of
@@ -325,9 +326,20 @@ The most memory the server held during the whole bulk load (`VmHWM`,
 with the default 32 MB cache): 150 to 171 MB before (six runs), 177 to
 218 MB with words cut before the turn (three runs: four connections cut
 at once, and hold what they cut), 153 to 190 MB with segments merged
-beside as well (six runs), and 112 to 125 MB with the budget (six
-runs). With the budget and a trim once a second instead of five times,
-it was 144 to 159 MB (three runs).
+beside as well (six runs), and 112 to 125 MB with the budget (six runs).
+With the budget and a trim once a second instead of five times, it was
+144 to 159 MB (three runs). The share was first taken before a request's
+bytes were read, so that a fourth connection waited with its statement
+still in its socket; but then a client that announced a large frame and
+sent it slowly, or not at all, held the budget meanwhile, and every
+other connection's large request waited for it. The share is now taken
+once the bytes have come, before they are decoded: the bytes of a
+request waiting for the budget are in memory, as they were before there
+was one, and what the budget bounds is the decoding, the cutting into
+words and the wait for the turn. Measured again, alternating the two
+builds on the same machine (six runs each), the peak was 113 to 124 MB
+with the share taken first and 117 to 130 MB with it taken after the
+bytes; the 130 MB run is the only one over 125.
 
 On this machine, shared with other work, the load ran at a median of
 7.3 statements a second before and 9.1 after, in runs that moved

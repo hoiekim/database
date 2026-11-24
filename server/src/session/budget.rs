@@ -5,9 +5,19 @@
 //! values they decode to. Four connections that each load megabyte
 //! statements held that much four times over, and the allocator, which
 //! keeps a pool of memory per thread, kept most of it after it was
-//! freed. So a large request takes a share of a fixed budget before its
-//! bytes are read, and gives it back once it has been answered; one that
-//! finds the budget spent waits, with its bytes still in the socket.
+//! freed. So a large request, once its bytes have all come, takes a share
+//! of a fixed budget before it is decoded, and gives it back once it has
+//! been answered; one that finds the budget spent waits with its bytes
+//! in hand, as they would be on a server without the budget. What the
+//! budget bounds is the decoding, the cutting of texts into words and
+//! the wait for the turn, not the bytes of requests waiting for it.
+//!
+//! Nothing shared is held while the server waits on a client: the share
+//! is taken only after the whole frame has come, and a dump, which
+//! writes to the client as it goes, gives its share back first. A client
+//! that sends a large statement slowly, or announces one and goes quiet,
+//! keeps only its own connection waiting.
+//!
 //! As a large request is answered, the memory it held is handed back to
 //! the system (at most five times a second), rather than left in the
 //! allocator's pool of whichever thread decoded it: where the allocator
@@ -31,16 +41,15 @@ use std::sync::OnceLock;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::BRIEF_BYTES;
 
-/// The memory the large requests in flight may take together, counted
-/// as their bytes on the wire. Of four connections that load megabyte
-/// statements, three have one in hand at a time: one writing, two
-/// cutting their texts into words or waiting for the turn. The fourth
-/// waits with its statement still in its socket.
+/// The memory the large requests being decoded or answered may take
+/// together, counted as their bytes on the wire. Of four connections
+/// that load megabyte statements, three have one decoded at a time: one
+/// writing, two cutting their texts into words or waiting for the turn.
+/// The fourth waits with its statement's bytes in hand, not decoded.
 pub(super) const BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 /// How often, at most, the memory that large requests held is given
@@ -134,32 +143,6 @@ impl Budget {
 pub(super) fn budget() -> &'static Budget {
     static BUDGET: OnceLock<Budget> = OnceLock::new();
     BUDGET.get_or_init(|| Budget::new(BUDGET_BYTES))
-}
-
-/// Reads the length of the next frame, as `read_frame` does: `None` at
-/// the end of the stream.
-pub(super) async fn read_len<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> std::io::Result<Option<usize>> {
-    let mut len = [0u8; 4];
-    match reader.read_exact(&mut len).await {
-        Ok(_) => Ok(Some(u32::from_le_bytes(len) as usize)),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// Reads the body of a frame of `len` bytes, as `read_frame` does.
-pub(super) async fn read_body<R: AsyncRead + Unpin>(reader: &mut BufReader<R>, len: usize, largest: usize) -> std::io::Result<Vec<u8>> {
-    if len > largest {
-        return Err(std::io::Error::other("frame larger than allowed"));
-    }
-    // Room for an ordinary request at once; beyond that, grown as the
-    // bytes arrive, so that a length alone reserves little.
-    let mut frame = Vec::with_capacity(len.min(64 * 1024));
-    let read = reader.take(len as u64).read_to_end(&mut frame).await?;
-    if read != len {
-        return Err(std::io::ErrorKind::UnexpectedEof.into());
-    }
-    Ok(frame)
 }
 
 #[cfg(test)]

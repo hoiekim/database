@@ -114,3 +114,41 @@ async fn the_holder_of_the_turn_does_not_wait_for_memory_held_by_one_waiting_for
     assert_eq!(db.query(Query::table("blobs")).await?.len(), 81);
     Ok(())
 }
+
+// Nothing shared between connections is held while the server waits on a
+// client's bytes. A connection that announces a frame larger than the
+// whole budget and then sends nothing (a client gone quiet, or a large
+// statement on a slow link) keeps no other connection's large request
+// from being answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_that_never_comes_holds_up_no_other_connection() -> DbResult<()> {
+    use database_protocol::message::{encode_request, Request, PROTOCOL_VERSION};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = TestServer::start().await;
+    let db = server.client("test").await;
+    db.create_table(TableDef::new("blobs").column(ColumnDef::new("id", Type::Int)).column(ColumnDef::new("data", Type::Text)).primary_key(["id"])).await?;
+
+    // Signed in, then the length of 16 MB, and no more.
+    let mut quiet = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    let hello = encode_request(&Request::Hello { version: PROTOCOL_VERSION, database: "test".into(), password: PASSWORD.into(), client: "quiet".into() }, 0);
+    quiet.write_all(&(hello.len() as u32).to_le_bytes()).await.unwrap();
+    quiet.write_all(&hello).await.unwrap();
+    let mut len = [0u8; 4];
+    quiet.read_exact(&mut len).await.unwrap();
+    let mut greeting = vec![0u8; u32::from_le_bytes(len) as usize];
+    quiet.read_exact(&mut greeting).await.unwrap();
+    quiet.write_all(&(16u32 * 1024 * 1024).to_le_bytes()).await.unwrap();
+    quiet.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Another connection's large insert is answered all the same.
+    let mut insert = Insert::into("blobs").columns(["id", "data"]);
+    for id in 0..20i64 {
+        insert = insert.values([val(id), val("x".repeat(100_000))]);
+    }
+    tokio::time::timeout(Duration::from_secs(10), db.insert(insert)).await.expect("a quiet connection holds up no other")?;
+    assert_eq!(db.query(Query::table("blobs")).await?.len(), 20);
+    drop(quiet);
+    Ok(())
+}

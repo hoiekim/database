@@ -512,19 +512,27 @@ Named locks live in the server, per database and name, owned by a
 connection and released when it closes.
 
 **Large requests share a memory budget** (`session/budget.rs`). A
-request larger than 64 KiB takes a share of 4 MiB, counted in its bytes
-on the wire, before its body is read, and gives it back once it is
-answered; one that finds the budget spent waits, its bytes still in its
-socket, in the order of arrival. A request of ordinary size takes
-nothing and never waits; one larger than the budget takes all of it and
-runs alone. A connection that holds the turn between requests (an
-exclusive transaction) never waits for the budget, since whoever holds
-the budget may be waiting for that turn: it takes what is free and
-runs. As a large request is answered, the memory it held is handed back
-to the system, at most five times a second; left in the allocator's
-pool of the thread that decoded it, it was most of what the server held
-during a bulk load. Only the GNU C library keeps such pools and is asked
-to (`memory.rs`); built for any other, the server has the budget alone.
+request larger than 64 KiB, once its bytes have all come, takes a share
+of 4 MiB, counted in its bytes on the wire, before it is decoded, and
+gives it back once it is answered; one that finds the budget spent
+waits, in the order of arrival, with its bytes in memory as they would
+be without the budget. What the budget bounds is the decoding, the
+cutting of texts into words and the wait for the turn, where a request
+is held twice. Nothing shared is held while the server waits on a
+client: the share is taken only after the frame has come, so a client
+that sends a large statement slowly, or announces one and goes quiet,
+keeps only its own connection waiting; and a dump, which writes to the
+client as it goes, gives its share back before it starts. A request of
+ordinary size takes nothing and never waits; one larger than the budget
+takes all of it and runs alone. A connection that holds the turn between
+requests (an exclusive transaction) never waits for the budget, since
+whoever holds the budget may be waiting for that turn: it takes what is
+free and runs. As a large request is answered, the memory it held is
+handed back to the system, at most five times a second; left in the
+allocator's pool of the thread that decoded it, it was most of what the
+server held during a bulk load. Only the GNU C library keeps such pools
+and is asked to (`memory.rs`); built for any other, the server has the
+budget alone.
 
 ## Dump and restore (`dump.rs`)
 
