@@ -262,15 +262,25 @@ impl Store {
 
     /// Opens a data file as of its last checkpoint. Returns the store, its
     /// header and the catalog the checkpoint stored.
+    ///
+    /// Of the two header copies the newer valid one is taken, and a copy
+    /// is passed over only for what was read of it: bytes that do not
+    /// check, or a file too short to hold it. A copy that cannot be read
+    /// may be the newer one. The older would then be a checkpoint whose
+    /// log is gone, and the file would be cut back to its length below:
+    /// so a read that fails is returned as the error it is.
     pub fn open(file: Arc<dyn File>, cache: Arc<PageCache>, id: u32, limits: Limits) -> Result<(Store, Meta, Vec<u8>)> {
         let mut best: Option<Meta> = None;
         for slot in 0..2u64 {
             let mut page = vec![0u8; PAGE_SIZE];
-            if read_exact_at(&*file, &mut page, slot * PAGE_SIZE as u64).is_ok() {
-                if let Some(meta) = Meta::decode(&page) {
-                    if best.as_ref().is_none_or(|b| meta.counter > b.counter) {
-                        best = Some(meta);
-                    }
+            match read_exact_at(&*file, &mut page, slot * PAGE_SIZE as u64) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+                Err(e) => return Err(Error::Io(e)),
+            }
+            if let Some(meta) = Meta::decode(&page) {
+                if best.as_ref().is_none_or(|b| meta.counter > b.counter) {
+                    best = Some(meta);
                 }
             }
         }

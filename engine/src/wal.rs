@@ -18,7 +18,8 @@
 //! its bytes, so nothing left over from another file or another place can
 //! pass for a record. Reading stops at the first record that does not
 //! check: that is the torn tail of a crash, and nothing after it was ever
-//! acknowledged.
+//! acknowledged. That is said only of bytes that were read. A read that
+//! fails says nothing about what the file holds, and is an error.
 //!
 //! A file that grows with every record makes every sync slow: the file
 //! system must then commit the file's new length as well as its bytes,
@@ -314,13 +315,19 @@ pub enum End {
 /// in order, and stops at the first that does not, saying how. A file
 /// whose header is missing or torn holds nothing and ends torn; a whole
 /// file of another data file holds nothing of this one's.
+///
+/// A file ends where its length says it does, or at bytes that were read
+/// and do not check. A read that fails is neither: the records may all
+/// be there, so it is returned as the error it is, and the caller must
+/// not go on to delete the file.
 pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<End> {
     let file = vfs.open(&wal_path(dir, name, generation), false)?;
     let len = file.len()?;
     let mut head = vec![0u8; HEADER_LEN as usize];
-    if len < HEADER_LEN || read_exact_at(&*file, &mut head, 0).is_err() {
+    if len < HEADER_LEN {
         return Ok(End::Torn);
     }
+    read_exact_at(&*file, &mut head, 0)?;
     if head != header(generation, uuid) {
         // Whole, but another data file's: left from a database that had
         // this name before. Anything else in a header's place is damage.
@@ -333,9 +340,10 @@ pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation
             return Ok(End::Clean);
         }
         let mut prefix = [0u8; 8];
-        if offset + 8 > len || read_exact_at(&*file, &mut prefix, offset).is_err() {
+        if offset + 8 > len {
             return Ok(End::Torn);
         }
+        read_exact_at(&*file, &mut prefix, offset)?;
         let size = u32::from_le_bytes(prefix[..4].try_into().unwrap());
         let crc = u32::from_le_bytes(prefix[4..].try_into().unwrap());
         // No record is empty: a length of zero is the room a file was
@@ -347,7 +355,8 @@ pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation
             return Ok(End::Torn);
         }
         let mut bytes = vec![0u8; size as usize];
-        if read_exact_at(&*file, &mut bytes, offset + 8).is_err() || record_crc(generation, offset, &bytes) != crc {
+        read_exact_at(&*file, &mut bytes, offset + 8)?;
+        if record_crc(generation, offset, &bytes) != crc {
             return Ok(End::Torn);
         }
         on_record(&bytes)?;
@@ -501,6 +510,34 @@ mod tests {
         wal.sync_to(5).unwrap();
         vfs.corrupt(&wal_path(Path::new("/d"), "t", 1), HEADER_LEN + 2 * 108 + 50);
         assert_eq!(records(&vfs, 1).len(), 2);
+    }
+
+    #[test]
+    fn a_read_that_fails_is_an_error_and_not_the_end_of_the_log() {
+        let vfs = MemVfs::new();
+        let wal = Wal::create(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 1, 0, true).unwrap();
+        for v in 1..=5u64 {
+            wal.append(v, &[v as u8; 300]).unwrap();
+        }
+        wal.sync_to(5).unwrap();
+        let path = wal_path(Path::new("/d"), "t", 1);
+        // The header, the eight bytes before the third record, and the
+        // third record itself: wherever the disk gives no answer, the
+        // reader has none either, having passed on what it read before.
+        let third = HEADER_LEN + 2 * 308;
+        for (unreadable, read_before) in [(0, 0), (third + 4, 2), (third + 8 + 150, 2)] {
+            vfs.fail_reads_within(&path, unreadable..unreadable + 1);
+            let mut read = 0;
+            let end = replay(&vfs, Path::new("/d"), "t", &UUID, 1, &mut |_| {
+                read += 1;
+                Ok(())
+            });
+            assert!(matches!(end, Err(Error::Io(_))), "byte {unreadable} cannot be read: {end:?}");
+            assert_eq!(read, read_before, "byte {unreadable} cannot be read");
+        }
+        // The same file, once it can be read, holds every record.
+        vfs.fail_reads(None);
+        assert_eq!(records(&vfs, 1).len(), 5);
     }
 
     #[test]

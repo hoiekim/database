@@ -191,6 +191,41 @@ unsynced write independently, and checks after every reopening that the
 database holds exactly the acknowledged commits, with every index, the
 free list and every page accounted for.
 
+### When the disk fails
+
+**A read that fails is not a read that found nothing.** Recovery ends
+by deleting: the log files it has replayed, and whatever the data file
+holds beyond the checkpoint it started from. So it takes something for
+absent on two grounds only, both of them things it has seen: the file's
+length says the bytes were never written, or the bytes were read and do
+not check. The tail of the log that a crash tore is found that way, and
+a meta page that a crash cut short.
+
+A read that returns an error is neither. It says nothing of what the
+file holds: the bytes may all be there, and the next read may give
+them. So during recovery it is returned as the I/O error it is. The
+database is not opened and the server does not start; the log and the
+checkpoint are as they were, for a start when the disk reads again.
+
+- **In the log**, an error reading a file's header, the length and CRC
+  before a record, or the record itself is not the end of the log.
+  Taken for a torn tail it would end replay early, and the checkpoint
+  that follows replay would delete the file with acknowledged commits
+  still in it.
+- **In the data file**, an error reading a meta page is not an invalid
+  copy. Passed over, it would leave the other copy to be chosen: if
+  that is the older, a checkpoint whose log was deleted when the newer
+  was written, and to whose length the file would then be cut. Only a
+  file too short to hold a copy is without it. An error on either copy
+  stops the start, since a copy that was not read cannot be known to be
+  the older.
+
+`engine/tests/recovery.rs` commits rows that only the log holds, kills
+the engine and makes reads fail: of the log, of the data file, of each
+meta page alone. Each time the engine must refuse to start, with an I/O
+error and with the files still there, and once the disk reads again
+every commit is back.
+
 ## Transactions (`db.rs`, `write.rs`)
 
 A **version** is an immutable catalog: every table's definition, its
