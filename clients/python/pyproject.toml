@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "database-client"
+version = "0.1.0"
+description = "The Python client for the database server"
+readme = "README.md"
+requires-python = ">=3.9"
+# The standard library only: sockets, struct, json, decimal, uuid.
+dependencies = []
+
+[tool.setuptools]
+packages = ["database_client"]
+
+[tool.setuptools.package-data]
+database_client = ["py.typed"]
+
+[tool.mypy]
+strict = true
+files = ["database_client"]
