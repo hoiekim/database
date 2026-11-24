@@ -143,6 +143,31 @@ the length; `left` and `substr_bytes` read only the chunks they need. A
 column added to a table with rows is not written to them: a row shorter
 than the table's column list reads the new column's fill value.
 
+Reading the start of a large value is still a second descent, of the
+tree of large values, for every row: a page of mails with a preview of
+each body made fifty. A column can ask to **keep the start in the row**
+(`keep_start`): the reference to the value then carries the value's
+first bytes, cut after a whole character for a text, and `left`,
+`substr` and `substr_bytes` are answered from them when they hold all
+that is asked. Three rules keep this from changing anything else:
+
+- The start is a copy. The value is stored whole where it was, a
+  reference without a start reads the same, and `check` compares every
+  start with the value it belongs to.
+- A start takes only the room a row has left. Which values leave a row
+  is decided as before, with no start counted; what room the row then
+  has goes to the starts, in column order, shortened or left out where
+  it is not enough. So a start never pushes another value out of its
+  row, and a row with a long key keeps a short one or none.
+- A row written again around a value that stays where it is (an update
+  of another column) carries the reference over with its start, without
+  reading the value.
+
+The setting travels in the byte that ended a column's stored
+definition, once the flag for `auto_increment` alone: a definition that
+does not use it is stored, logged, dumped and sent byte for byte as it
+was, so files from before read as they did.
+
 ### The log (`wal.rs`)
 
 Every commit appends one record to the log: the **logical** changes of

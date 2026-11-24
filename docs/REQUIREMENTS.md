@@ -43,6 +43,7 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-T7 | Ordered lists of text or uuids | `Value::List`, `Type::list(..)` |
 | R-T8 | Large text: bodies of many megabytes, whose length, first few hundred characters, and byte or character ranges are read without loading the rest | Large values live outside the row; `octet_length`, `left`, `substr`, `substr_bytes` read only the pages they need |
 | R-T9 | SQL's NULL: three-valued logic under `NOT`, `IS DISTINCT FROM`, unique indexes that allow many NULLs | Expressions evaluate as SQL does; NULL is not a key in a unique index |
+| R-T10 | The first few hundred bytes of a large text beside its row, for a list that previews each (a page of mails with the start of each body), without a lookup per row and without changing what any read answers | `ColumnDef::keep_start`: a copy of the start in the row, used by `left`, `substr` and `substr_bytes` when it holds what they ask |
 
 ## B. Schema
 

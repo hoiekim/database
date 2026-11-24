@@ -237,7 +237,7 @@ impl Tx {
             (entries, words)
         };
         let (mut blobs, mut next_blob) = (table.blobs, table.next_blob);
-        let moved = row::fitted(&mut self.writer, stored, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
+        let moved = row::fitted(&mut self.writer, stored, btree::max_value(pk.len()), &mut blobs, &mut next_blob, &|i| table.keep_start(i))?;
         let (root, existed) = btree::put(&mut self.writer, table.root, &pk, moved.as_deref().unwrap_or(stored.raw()))?;
         if existed {
             return Err(Error::corrupt(format!("a row of table {name:?} was inserted over another")));
@@ -340,7 +340,7 @@ impl Tx {
                 blobs = blob::free(&mut self.writer, blobs, b.id, b.len)?;
             }
         }
-        let moved = row::fitted(&mut self.writer, new, btree::max_value(pk.len()), &mut blobs, &mut next_blob)?;
+        let moved = row::fitted(&mut self.writer, new, btree::max_value(pk.len()), &mut blobs, &mut next_blob, &|i| table.keep_start(i))?;
         let root = btree::put(&mut self.writer, table.root, pk, moved.as_deref().unwrap_or(new.raw()))?.0;
         let mut index_roots = table.index_roots.clone();
         for ((i, before), after) in touched.iter().zip(&before).zip(&after) {

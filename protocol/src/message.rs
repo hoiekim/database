@@ -562,6 +562,7 @@ mod tests {
             .column(ColumnDef::new("amount", Type::decimal(15, 2)).default(0))
             .column(ColumnDef::new("tags", Type::list(Type::Text)).default(Vec::<String>::new()))
             .column(ColumnDef::new("at", Type::Timestamp).default_now())
+            .column(ColumnDef::new("about", Type::Text).nullable().keep_start(256))
             .primary_key(["id"])
             .unique("users_n", ["n"])
             .index(IndexDef::new("users_email").on_expr(col("email").lower()).unique().filter(col("email").is_not_null()))
