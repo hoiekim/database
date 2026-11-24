@@ -879,16 +879,50 @@ pub fn get_delete(r: &mut Reader) -> DbResult<Delete> {
 
 // ----------------------------------------------------------------- schema
 
+/// In a column's last byte: it numbers rows.
+const COLUMN_AUTO_INCREMENT: u8 = 1;
+/// In a column's last byte: a `keep_start` follows.
+const COLUMN_KEEP_START: u8 = 2;
+
+/// A column ends in a byte of flags. It was once the flag for
+/// `auto_increment` alone, 0 or 1, and for a column that uses nothing
+/// newer it still is exactly that: what was stored and sent before reads
+/// as it did, and what is written now for such a column an older reader
+/// reads too. A setting added since is a bit of the byte and, if it has
+/// a value, the value after it.
 pub fn put_column(w: &mut Writer, c: &ColumnDef) {
     w.str(&c.name);
     put_type(w, &c.ty);
     w.bool(c.nullable);
     put_opt_expr(w, &c.default);
-    w.bool(c.auto_increment);
+    let mut flags = 0;
+    if c.auto_increment {
+        flags |= COLUMN_AUTO_INCREMENT;
+    }
+    if c.keep_start > 0 {
+        flags |= COLUMN_KEEP_START;
+    }
+    w.u8(flags);
+    if c.keep_start > 0 {
+        w.varint(u64::from(c.keep_start));
+    }
 }
 
 pub fn get_column(r: &mut Reader) -> DbResult<ColumnDef> {
-    Ok(ColumnDef { name: r.str()?, ty: get_type(r)?, nullable: r.bool()?, default: get_opt_expr(r)?, auto_increment: r.bool()? })
+    let (name, ty, nullable, default) = (r.str()?, get_type(r)?, r.bool()?, get_opt_expr(r)?);
+    let flags = r.u8()?;
+    if flags & !(COLUMN_AUTO_INCREMENT | COLUMN_KEEP_START) != 0 {
+        return Err(malformed("a column has a setting this version does not know"));
+    }
+    let keep_start = if flags & COLUMN_KEEP_START != 0 {
+        match u32::try_from(r.varint()?) {
+            Ok(bytes) if bytes > 0 => bytes,
+            _ => return Err(malformed("a column keeps a start of no length, or of too great a one")),
+        }
+    } else {
+        0
+    };
+    Ok(ColumnDef { name, ty, nullable, default, auto_increment: flags & COLUMN_AUTO_INCREMENT != 0, keep_start })
 }
 
 pub fn put_index(w: &mut Writer, i: &IndexDef) {
@@ -995,4 +1029,80 @@ pub fn put_error(w: &mut Writer, e: &DbError) {
 
 pub fn get_error(r: &mut Reader) -> DbResult<DbError> {
     Ok(DbError { code: ErrorCode::from_u8(r.u8()?), message: r.str()?, constraint: r.opt_str()?, table: r.opt_str()? })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::now;
+
+    /// A column as it was written before a column had any setting but
+    /// `auto_increment`: its last byte is that flag, 0 or 1.
+    fn as_once_written(c: &ColumnDef) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(&c.name);
+        put_type(&mut w, &c.ty);
+        w.bool(c.nullable);
+        put_opt_expr(&mut w, &c.default);
+        w.bool(c.auto_increment);
+        w.buf
+    }
+
+    fn written(c: &ColumnDef) -> Vec<u8> {
+        let mut w = Writer::new();
+        put_column(&mut w, c);
+        w.buf
+    }
+
+    fn read(bytes: &[u8]) -> DbResult<ColumnDef> {
+        let mut r = Reader::new(bytes);
+        let column = get_column(&mut r)?;
+        r.finish()?;
+        Ok(column)
+    }
+
+    #[test]
+    fn a_column_without_newer_settings_is_stored_as_it_always_was() {
+        // Catalogs in checkpoints, log records and dumps hold columns in
+        // this form: what is there must read as it did, and what is
+        // written now for such a column must be what was written then.
+        let columns = [
+            ColumnDef::new("id", Type::Int).auto_increment(),
+            ColumnDef::new("body", Type::Text).nullable(),
+            ColumnDef::new("at", Type::Timestamp).default_expr(now()),
+            ColumnDef::new("tags", Type::list(Type::Text)).default(Vec::<String>::new()),
+        ];
+        for column in columns {
+            let old = as_once_written(&column);
+            assert_eq!(read(&old).unwrap(), column);
+            assert_eq!(written(&column), old);
+        }
+    }
+
+    #[test]
+    fn a_kept_start_is_a_flag_and_a_length_after_the_old_form() {
+        let plain = ColumnDef::new("body", Type::Text).auto_increment();
+        let keeping = plain.clone().keep_start(256);
+        let mut expected = as_once_written(&plain);
+        // The flag byte gains a bit, and the length follows.
+        *expected.last_mut().unwrap() = 1 | 2;
+        expected.extend_from_slice(&[0x80, 0x02]);
+        assert_eq!(written(&keeping), expected);
+        assert_eq!(read(&expected).unwrap(), keeping);
+        assert_eq!(read(&written(&ColumnDef::new("b", Type::Bytes).keep_start(1))).unwrap().keep_start, 1);
+
+        // A reader from before sees a flag that is neither 0 nor 1 and
+        // refuses the column, which is what this one does with a bit it
+        // does not know; and a length of nothing is not a setting.
+        let mut unknown = as_once_written(&plain);
+        *unknown.last_mut().unwrap() = 4;
+        assert!(read(&unknown).is_err());
+        let mut empty = as_once_written(&plain);
+        *empty.last_mut().unwrap() = 2;
+        empty.push(0);
+        assert!(read(&empty).is_err());
+        let mut cut = expected.clone();
+        cut.truncate(cut.len() - 2);
+        assert!(read(&cut).is_err());
+    }
 }

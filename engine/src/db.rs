@@ -576,9 +576,17 @@ impl Database {
             btree::walk(pages, table.root, &mut |id| claim(id, &table.name), &mut |key, value| {
                 rows += 1;
                 keys.push(key.to_vec());
-                for b in Row::parse(value.to_vec())?.blobs() {
+                let row = Row::parse(value.to_vec())?;
+                for i in 0..row.stored() {
+                    let Some(b) = row.blob(i) else { continue };
                     if blob_bytes.insert(b.id, b.len).is_some() {
                         return Err(Error::corrupt(format!("large value {} of table {:?} belongs to two rows", b.id, table.name)));
+                    }
+                    // The start a row keeps of a value is the value's.
+                    if let Some((start, _)) = row.kept_start(i) {
+                        if start.len() as u64 > b.len || crate::blob::read_range(pages, table.blobs, b.id, b.len, 0, start.len() as u64)? != start {
+                            return Err(Error::corrupt(format!("a row of table {:?} keeps a start of large value {} that is not how the value starts", table.name, b.id)));
+                        }
                     }
                 }
                 Ok(())

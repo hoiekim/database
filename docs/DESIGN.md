@@ -135,9 +135,13 @@ the same leading bytes.
 ### Rows (`row.rs`, `blob.rs`)
 
 A row is its column values in the protocol's encoding, with a count in
-front. A row read from disk is kept as bytes and each column is decoded
-when first asked for, so a query that selects two columns of a wide row
-pays for two.
+front. A row read from disk is kept as bytes, with where each column
+starts beside them, and a column is decoded when asked for, so a query
+that selects two columns of a wide row pays for two. Reading a row of
+up to fifteen columns is one allocation, for its bytes. A number or a
+text is made from them each time it is asked for, which costs what
+copying a kept value would; only a value that costs more to make (a
+document, a list, a large value) is kept once made.
 
 A value too large to share a page with its row (a long text) is moved to
 the table's tree of large values, cut into chunks keyed by `(id, chunk
@@ -145,6 +149,36 @@ number)`, and the row keeps the id and the length. `octet_length` reads
 the length; `left` and `substr_bytes` read only the chunks they need. A
 column added to a table with rows is not written to them: a row shorter
 than the table's column list reads the new column's fill value.
+
+Reading the start of a large value is still a second descent, of the
+tree of large values, for every row: a page of mails with a preview of
+each body made fifty. A column can ask to **keep the start in the row**
+(`keep_start`): the reference to the value then carries the value's
+first bytes, cut after a whole character for a text, and `left`,
+`substr` and `substr_bytes` are answered from them when they hold all
+that is asked. Three rules keep this from changing anything else:
+
+- The start is a copy. The value is stored whole where it was, a
+  reference without a start reads the same, and `check` compares every
+  start with the value it belongs to.
+- A start takes only the room a row has left. Which values leave a row
+  is decided as before, with no start counted; what room the row then
+  has goes to the starts, in column order, shortened or left out where
+  it is not enough. So a start never pushes another value out of its
+  row, and a row with a long key keeps a short one or none.
+- A row written again around a value that stays where it is (an update
+  of another column) carries the reference over with its start, without
+  reading the value. A reference stored without a start (every one
+  written before the setting existed, and one written where the row had
+  no room) stays without one until the value itself is written again.
+
+A reference with a start has a tag of its own beside the plain one, so
+a row stored before reads as it did. The setting travels in the byte
+that ended a column's stored definition, once the flag for
+`auto_increment` alone: a definition that does not use it is stored,
+logged, dumped and sent byte for byte as it was, so files from before
+read as they did, and a server from before reads the files of a
+database that does not use the setting.
 
 ### The log (`wal.rs`)
 

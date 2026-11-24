@@ -519,7 +519,9 @@ async fn setup_ours(db: &Client) -> DbResult<()> {
             .column(ColumnDef::new("from_text", Type::Text))
             .column(ColumnDef::new("read", Type::Bool).default(false))
             .column(ColumnDef::new("saved", Type::Bool).default(false))
-            .column(ColumnDef::new("text", Type::Text))
+            // The mailbox page shows the first 200 characters of each
+            // body: they stay in the row, and the page reads no body.
+            .column(ColumnDef::new("text", Type::Text).keep_start(256))
             .column(ColumnDef::new("updated", Type::Timestamp).default_now())
             .primary_key(["mail_id"])
             .index(IndexDef::new("mails_user_date").on(["user_id"]).on_desc("date").on(["mail_id"]))

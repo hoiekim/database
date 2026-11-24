@@ -82,6 +82,27 @@ db.create_table_if_not_exists(
 - `volatile()` marks a table whose rows need not survive a restart
   (Postgres' `UNLOGGED`): its writes are cheaper, and it is empty after
   the server starts.
+- `keep_start(bytes)`, on a text or bytes column, keeps the first bytes
+  of a large value in its row. A value too large for its row (about two
+  kilobytes, less with a long key) is stored outside it, and reading any
+  part of it is a second lookup. With `keep_start(256)`,
+  `col("text").left(200)`, and any `substr` or `substr_bytes` that ends
+  within those bytes, are answered from the row whenever the 256 bytes
+  hold all they ask for: a page of fifty mails with a preview of each
+  reads fifty rows and no body. Nothing else
+  changes: every read gives what it gave, the value is stored whole as
+  before, and a longer prefix is looked up as before. The row grows by
+  what is kept, which every read of the row then carries, so keep what
+  the previews show and no more; 1,024 bytes at most. A text is cut
+  after a whole character, so a start of 256 bytes holds between 64 and
+  256 characters. Where a row has no room for all of it (a long key,
+  many other columns) less is kept, or nothing. The setting is given
+  when the column is created (`create_table` or `add_column`): a table
+  that exists already keeps its columns as they are, and
+  `create_table_if_not_exists` does not change them. A client from
+  before the setting existed is described such a table without it, and
+  reads and writes the table as any other. A server from before it
+  refuses the database and a dump of it (`OPERATIONS.md`).
 - `describe()` returns every table as the server holds it. `add_column`
   adds a column to a table with rows; they read its default. Schema
   changes can run inside a transaction and roll back with it.
