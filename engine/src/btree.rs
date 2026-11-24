@@ -617,6 +617,48 @@ pub fn destroy<P: PagesMut>(p: &mut P, root: PageId, on_value: &mut dyn FnMut(&m
     Ok(())
 }
 
+/// The numbers of every page of a tree, added to `out`, without reading
+/// its leaves: a tree is as deep everywhere, so once the leftmost way
+/// down has shown how deep, the pages a branch one above the leaves
+/// names are known to be leaves. To free a tree that was read by
+/// someone else, or that is not worth reading again.
+pub fn page_ids<P: Pages + ?Sized>(p: &P, root: PageId, out: &mut Vec<PageId>) -> Result<()> {
+    if root == NO_PAGE {
+        return Ok(());
+    }
+    // How many levels of branches lie above the leaves.
+    let mut branches = 0;
+    let mut id = root;
+    loop {
+        let page = p.page(id)?;
+        let node = Node::new(&page, id)?;
+        if node.is_leaf() {
+            break;
+        }
+        if node.len() == 0 {
+            return Err(Error::corrupt(format!("tree page {id} is empty")));
+        }
+        branches += 1;
+        id = node.child(0);
+    }
+    fn rec<P: Pages + ?Sized>(p: &P, id: PageId, branches: usize, out: &mut Vec<PageId>) -> Result<()> {
+        out.push(id);
+        if branches == 0 {
+            return Ok(());
+        }
+        let page = p.page(id)?;
+        let node = Node::new(&page, id)?;
+        if node.is_leaf() {
+            return Err(Error::corrupt(format!("page {id} is a leaf where the tree has a branch")));
+        }
+        for i in 0..node.len() {
+            rec(p, node.child(i), branches - 1, out)?;
+        }
+        Ok(())
+    }
+    rec(p, root, branches, out)
+}
+
 /// Every page of a tree, for the consistency check. Calls `on_page` with
 /// each page number and `on_entry` with each key and value in order.
 pub fn walk<P: Pages + ?Sized>(
@@ -1315,6 +1357,35 @@ pub(crate) mod tests {
         let mut builder = Builder::new();
         builder.push(&mut p, b"b", b"").unwrap();
         assert!(builder.push(&mut p, b"a", b"").is_err(), "keys must rise");
+    }
+
+    #[test]
+    fn the_pages_of_a_built_tree_are_found_without_reading_its_leaves() {
+        for count in [0u32, 1, 5, 400, 40_000] {
+            let mut p = MemPages::new();
+            let mut builder = Builder::new();
+            for n in 0..count {
+                builder.push(&mut p, &n.to_be_bytes(), &[7; 40]).unwrap();
+            }
+            let root = builder.finish(&mut p).unwrap();
+            let mut found = Vec::new();
+            page_ids(&p, root, &mut found).unwrap();
+            let mut walked = Vec::new();
+            walk(
+                &p,
+                root,
+                &mut |id| {
+                    walked.push(id);
+                    Ok(())
+                },
+                &mut |_, _| Ok(()),
+            )
+            .unwrap();
+            found.sort();
+            walked.sort();
+            assert_eq!(found, walked, "{count} entries");
+            assert_eq!(found.len(), p.pages.len());
+        }
     }
 
     #[test]

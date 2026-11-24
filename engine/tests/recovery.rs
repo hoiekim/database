@@ -34,7 +34,44 @@ fn options() -> EngineOptions {
 }
 
 fn open(vfs: &MemVfs) -> Engine {
-    Engine::open_with(Arc::new(vfs.clone()), Path::new(DIR), options(), None).expect("the engine opens")
+    let engine = Engine::open_with(Arc::new(vfs.clone()), Path::new(DIR), options(), None).expect("the engine opens");
+    // Writers leave the merging of full-text segments to be done beside
+    // them. Here it is done by hand (`Merger`), at moments that a seed
+    // decides, so that a run can be had again; one test lets the
+    // engine's own thread do it.
+    engine.pause_merging(true);
+    engine
+}
+
+/// Merges full-text segments beside the workload, now and then: between
+/// two transactions, with a fork standing open or not, before a
+/// checkpoint and after, and into a power cut.
+struct Merger {
+    rng: Rng,
+    /// Merges made and put in place.
+    made: u64,
+}
+
+impl Merger {
+    fn new(seed: u64) -> Merger {
+        Merger { rng: Rng::new(seed ^ 0x0003_E26E), made: 0 }
+    }
+
+    fn step(&mut self, db: &Arc<Database>) {
+        match self.rng.below(4) {
+            // One merge, so that what else is due stays due through
+            // whatever comes next.
+            0 => self.made += u64::from(db.merge_text_segments(&|| false).unwrap_or(false)),
+            // Everything that is due. A failure is the disk gone: the
+            // next transaction finds that out.
+            1 => {
+                while db.merge_text_segments(&|| false).unwrap_or(false) {
+                    self.made += 1;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn items() -> TableDef {
@@ -248,8 +285,10 @@ fn a_workload_matches_its_model_and_survives_clean_restarts() {
     let mut engine = open(&vfs);
     let mut db = create(&engine);
     let mut bystander = Bystander::new(11);
+    let mut merger = Merger::new(11);
     for step in 0..600 {
         bystander.step(&db);
+        merger.step(&db);
         if let Some(after) = random_transaction(&mut rng, &db, &model, &mut next_id).unwrap() {
             model = after;
         }
@@ -275,6 +314,8 @@ fn a_workload_matches_its_model_and_survives_clean_restarts() {
     }
     verify(&db, &model);
     assert!(model.len() > 20, "the workload left data behind");
+    assert!(merger.made > 20, "segments were merged beside the workload ({} times)", merger.made);
+    assert!(db.merges_dropped.load(std::sync::atomic::Ordering::Relaxed) == 0, "between two transactions nothing changes under a merge");
 }
 
 #[test]
@@ -290,9 +331,11 @@ fn a_power_cut_at_any_moment_loses_no_commit_and_keeps_no_other() {
         let engine = open(&vfs);
         let db = create(&engine);
         let mut bystander = Bystander::new(seed);
+        let mut merger = Merger::new(seed);
         // Some history first, then the cut somewhere in what follows.
         for _ in 0..rng.below(40) {
             bystander.step(&db);
+            merger.step(&db);
             if let Some(after) = random_transaction(&mut rng, &db, &model, &mut next_id).unwrap() {
                 model = after;
             }
@@ -306,6 +349,9 @@ fn a_power_cut_at_any_moment_loses_no_commit_and_keeps_no_other() {
         let mut in_flight: Option<Model> = None;
         loop {
             bystander.step(&db);
+            // A merge the cut falls into changes no row: whatever of it
+            // reached the disk, recovery gives the last commit.
+            merger.step(&db);
             let mut attempt_rng = rng.clone();
             let mut attempt_id = next_id;
             match random_transaction(&mut attempt_rng, &db, &model, &mut attempt_id) {
@@ -399,6 +445,193 @@ fn model_of_transaction(rng: &mut Rng, model: &Model, next_id: &mut i64) -> Opti
         return None;
     }
     Some(after)
+}
+
+#[test]
+fn segments_are_merged_beside_writers_that_do_not_wait_for_it() {
+    // The engine's own thread merges, at moments nobody chose, while
+    // three threads write and one searches. No writer ever merges a run
+    // of segments itself (there are never enough of them for that), no
+    // search ever misses a committed row or meets one that is gone, and
+    // in the end the index is whole and its segments few.
+    let vfs = MemVfs::new();
+    let engine = open(&vfs);
+    let db = create(&engine);
+    engine.pause_merging(false);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..3i64)
+        .map(|w| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let mut rng = Rng::new(100 + w as u64);
+                let mut mine: Model = Model::new();
+                for n in 0..400i64 {
+                    let id = w * 1_000_000 + n;
+                    let mut txn = db.begin_write(WAIT, false).unwrap();
+                    let mut item = random_item(&mut rng, id);
+                    item.owner = w;
+                    txn.insert(&insert_of(id, &item), None).unwrap();
+                    mine.insert(id, item);
+                    // Now and then an earlier row of this writer's goes,
+                    // so that segments have dead rows when they merge.
+                    if n % 5 == 4 {
+                        let gone = w * 1_000_000 + rng.below(n as u64) as i64;
+                        if mine.remove(&gone).is_some() {
+                            txn.delete(&Delete::from("items").key([gone]), None).unwrap();
+                        }
+                    }
+                    txn.commit().unwrap();
+                }
+                mine
+            })
+        })
+        .collect();
+    let searching = {
+        let (db, stop) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut searches = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let txn = db.begin_read();
+                for owner in 0..3i64 {
+                    // What a search finds is what the rows say, at the
+                    // one moment the reader holds.
+                    let found = txn.query(&Query::table("items").search("items_search", [owner], "gamma").columns(["id"]), None).unwrap();
+                    let mut ids: Vec<i64> = found.rows.iter().map(|r| if let Value::Int(n) = r[0] { n } else { panic!() }).collect();
+                    ids.sort();
+                    let rows = txn.query(&Query::table("items").index("items_owner", KeyRange::eq([owner])).columns(["id", "body"]), None).unwrap();
+                    let want: Vec<i64> = rows
+                        .rows
+                        .iter()
+                        .filter_map(|r| match (&r[0], &r[1]) {
+                            (Value::Int(id), Value::Text(body)) if body.split(' ').any(|word| word == "gamma") => Some(*id),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(ids, want, "a search beside writers and merges, owner {owner}");
+                }
+                searches += 1;
+            }
+            searches
+        })
+    };
+    let mut model = Model::new();
+    for writer in writers {
+        model.extend(writer.join().unwrap());
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(searching.join().unwrap() > 0);
+    // The merging thread is given a moment to finish what is due.
+    let made = || db.merges_beside.load(std::sync::atomic::Ordering::Relaxed);
+    let mut settled = made();
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(20));
+        if made() == settled {
+            break;
+        }
+        settled = made();
+    }
+    assert!(made() > 10, "{} merges were made beside the writers", made());
+    engine.pause_merging(true);
+    while db.merge_text_segments(&|| false).unwrap() {}
+    verify(&db, &model);
+    // And all of it is as good after a restart that replays the log.
+    drop(db);
+    drop(engine);
+    let engine = open(&vfs);
+    verify(&engine.database("test").unwrap(), &model);
+}
+
+/// The rows a search of `items` for a word finds, for owner 0.
+fn found(db: &Arc<Database>, word: &str) -> Vec<i64> {
+    let found = db.begin_read().query(&Query::table("items").search("items_search", [0], word).columns(["id"]), None).unwrap();
+    let mut ids: Vec<i64> = found.rows.iter().map(|r| if let Value::Int(n) = r[0] { n } else { panic!() }).collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn a_merge_beside_is_dropped_if_its_segments_change_meanwhile() {
+    // Rows of forty words of their own each, so that a merge of a few
+    // segments reads enough words to ask, as it goes, whether to give
+    // up: that is where these commits are made, while it merges.
+    let vfs = MemVfs::new();
+    let engine = open(&vfs);
+    let db = create(&engine);
+    let merges = |db: &Arc<Database>| (db.merges_beside.load(std::sync::atomic::Ordering::Relaxed), db.merges_dropped.load(std::sync::atomic::Ordering::Relaxed));
+    let mut model = Model::new();
+    let add = |model: &mut Model, id: i64| {
+        let body = (0..40).map(|k| format!("u{id}x{k}")).collect::<Vec<_>>().join(" ");
+        let item = Item { owner: 0, name: format!("n{id}"), body, tags: Vec::new() };
+        let mut txn = db.begin_write(WAIT, false).unwrap();
+        txn.insert(&insert_of(id, &item), None).unwrap();
+        txn.commit().unwrap();
+        model.insert(id, item);
+    };
+    for id in 0..12 {
+        add(&mut model, id);
+    }
+
+    // A row of a merged segment dies while the merge is made: the merge
+    // is thrown away, and the row is not found.
+    let asked = std::cell::Cell::new(0);
+    let made = db
+        .merge_text_segments(&|| {
+            if asked.replace(asked.get() + 1) == 0 {
+                let mut txn = db.begin_write(WAIT, false).unwrap();
+                txn.delete(&Delete::from("items").key([1]), None).unwrap();
+                txn.commit().unwrap();
+            }
+            false
+        })
+        .unwrap();
+    assert!(made && asked.get() > 0, "a merge was made, and asked whether to give up");
+    assert_eq!(merges(&db), (0, 1), "and it was dropped");
+    model.remove(&1);
+    assert!(found(&db, "u1x7").is_empty());
+    assert_eq!(found(&db, "u2x7"), [2]);
+    verify(&db, &model);
+
+    // Made again with nothing changing, it is put in place.
+    assert!(db.merge_text_segments(&|| false).unwrap());
+    assert_eq!(merges(&db), (1, 1));
+    assert!(found(&db, "u1x7").is_empty());
+    assert_eq!(found(&db, "u0x39"), [0]);
+    verify(&db, &model);
+
+    // Rows added while a merge is made go into segments of their own,
+    // after the merged ones: the merge still fits, and is put in place.
+    for id in 12..24 {
+        add(&mut model, id);
+    }
+    let asked = std::cell::Cell::new(0);
+    let more = std::cell::RefCell::new(Model::new());
+    assert!(db
+        .merge_text_segments(&|| {
+            if asked.replace(asked.get() + 1) == 0 {
+                for id in 100..104 {
+                    add(&mut more.borrow_mut(), id);
+                }
+            }
+            false
+        })
+        .unwrap());
+    assert!(asked.get() > 0);
+    assert_eq!(merges(&db), (2, 1));
+    model.extend(more.into_inner());
+    assert_eq!(found(&db, "u101x3"), [101]);
+    assert_eq!(found(&db, "u13x3"), [13]);
+    verify(&db, &model);
+
+    // A merge given up on leaves the index as it was.
+    let before = merges(&db);
+    assert!(!db.merge_text_segments(&|| true).unwrap());
+    assert_eq!(merges(&db), before);
+    while db.merge_text_segments(&|| false).unwrap() {}
+    verify(&db, &model);
+    drop(db);
+    drop(engine);
+    let engine = open(&vfs);
+    verify(&engine.database("test").unwrap(), &model);
 }
 
 #[test]

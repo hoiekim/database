@@ -23,6 +23,16 @@
 //! longer leads to a row, and the lists that hold it are cleaned when
 //! their segment is next merged, or at once when half a segment is dead.
 //!
+//! Merging is the larger part of what the index costs to keep, and it
+//! reads nothing but segments, which never change once written. So it
+//! need not be done by whoever adds the row that made it due, holding up
+//! every other writer meanwhile. A writer may leave it (`Merging::Beside`)
+//! to someone who merges beside the writers (`merge_beside`), from the
+//! index as some commit left it, into a tree nothing refers to; and who
+//! then takes the writer's place for the moment it takes to put that
+//! tree where the merged segments were (`install`), if they are still
+//! as they were read.
+//!
 //! The index's own tree holds, by the first byte of the key:
 //!
 //! ```text
@@ -587,8 +597,26 @@ fn for_each_pending<P: Pages + ?Sized>(p: &P, root: PageId, f: &mut dyn FnMut(&[
 
 // --------------------------------------------------------------- changes
 
+/// Who merges the segments that come due as rows are added and removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Merging {
+    /// Whoever makes them due, before it goes on.
+    AtOnce,
+    /// Someone else, beside the writers: see `merge_beside`. Whoever
+    /// makes them due only says so, and merges itself only what must not
+    /// wait: a segment that is mostly dead, and the cheapest of what is
+    /// due once there are more segments than a search should look in.
+    Beside,
+}
+
 /// Adds a row that is not in the index.
-pub fn add<P: PagesMut>(p: &mut P, mut root: PageId, pk: &[u8], words: &Words) -> Result<PageId> {
+pub fn add<P: PagesMut>(p: &mut P, root: PageId, pk: &[u8], words: &Words) -> Result<PageId> {
+    Ok(add_merging(p, root, pk, words, Merging::AtOnce)?.0)
+}
+
+/// `add`, saying who merges. Returns the root, and whether segments are
+/// left that are due to be merged.
+pub fn add_merging<P: PagesMut>(p: &mut P, mut root: PageId, pk: &[u8], words: &Words, merging: Merging) -> Result<(PageId, bool)> {
     if pk.len() + 2 > btree::MAX_KEY {
         return Err(Error::db(ErrorCode::KeyTooLong, format!("a primary key of {} bytes is too long for a full-text index", pk.len())));
     }
@@ -601,17 +629,23 @@ pub fn add<P: PagesMut>(p: &mut P, mut root: PageId, pk: &[u8], words: &Words) -
         state.pending = btree::put(p, state.pending, &key, bytes)?.0;
     }
     state.pending_rows += 1;
+    let mut left = false;
     if state.pending_bytes >= PENDING_BYTES.load(Ordering::Relaxed) {
         root = flush(p, root, &mut state)?;
-        maintain(p, root, &mut state)?;
+        left = maintain(p, root, &mut state, merging)?;
     }
-    store(p, root, &state)
+    Ok((store(p, root, &state)?, left))
 }
 
 /// Takes a row out of the index, if it is in it.
-pub fn remove<P: PagesMut>(p: &mut P, mut root: PageId, pk: &[u8]) -> Result<PageId> {
+pub fn remove<P: PagesMut>(p: &mut P, root: PageId, pk: &[u8]) -> Result<PageId> {
+    Ok(remove_merging(p, root, pk, Merging::AtOnce)?.0)
+}
+
+/// `remove`, saying who merges: see `add_merging`.
+pub fn remove_merging<P: PagesMut>(p: &mut P, mut root: PageId, pk: &[u8], merging: Merging) -> Result<(PageId, bool)> {
     if root == NO_PAGE {
-        return Ok(root);
+        return Ok((root, false));
     }
     let mut state = load(p, root)?;
     let (parts, bytes) = pending_parts(p, state.pending, pk)?;
@@ -621,20 +655,21 @@ pub fn remove<P: PagesMut>(p: &mut P, mut root: PageId, pk: &[u8]) -> Result<Pag
         }
         state.pending_rows = state.pending_rows.saturating_sub(1);
         state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
-        return store(p, root, &state);
+        return Ok((store(p, root, &state)?, false));
     }
-    let Some(number) = btree::get(p, root, &tagged(NUMBER_OF, pk))? else { return Ok(root) };
+    let Some(number) = btree::get(p, root, &tagged(NUMBER_OF, pk))? else { return Ok((root, false)) };
     let number = varint(&number, &mut 0)?;
     root = btree::delete(p, root, &tagged(NUMBER_OF, pk))?.0;
     root = btree::delete(p, root, &tagged(KEY_OF, &number.to_be_bytes()))?.0;
     // Its entries stay in their segment until that is next rewritten.
+    let mut left = false;
     if let Some(segment) = state.segments.iter_mut().find(|s| s.low <= number && number <= s.high) {
         segment.dead += 1;
         if segment.dead * 2 > segment.rows {
-            maintain(p, root, &mut state)?;
+            left = maintain(p, root, &mut state, merging)?;
         }
     }
-    store(p, root, &state)
+    Ok((store(p, root, &state)?, left))
 }
 
 /// Frees the index's trees.
@@ -769,9 +804,31 @@ fn level(segment: &Segment) -> u32 {
     (segment.entries / LEVEL_BASE).max(1).ilog2() / 2
 }
 
+/// The cheapest run of segments that is due to be merged, as places in
+/// `segments`: neighbours in age, `FANOUT` of them or more, none on a
+/// later step of size than the newest of them. It is the run `maintain`
+/// would have merged when its newest segment was written, had nothing
+/// been left for later; and of several, the one with the fewest entries,
+/// so that many small segments never wait behind a few large ones.
+fn due(segments: &[Segment]) -> Option<(usize, usize)> {
+    let mut best: Option<(u64, usize, usize)> = None;
+    for end in 0..segments.len() {
+        let at = level(&segments[end]);
+        let alike = segments[..=end].iter().rev().take_while(|s| level(s) <= at).count();
+        if alike >= FANOUT {
+            let entries = segments[end + 1 - alike..=end].iter().map(|s| s.entries).sum();
+            if best.is_none_or(|(least, _, _)| entries < least) {
+                best = Some((entries, end + 1 - alike, end + 1));
+            }
+        }
+    }
+    best.map(|(_, from, to)| (from, to))
+}
+
 /// Rewrites segments that are mostly dead, and merges the newest ones
-/// while enough of them are of a size.
-fn maintain<P: PagesMut>(p: &mut P, root: PageId, state: &mut State) -> Result<()> {
+/// while enough of them are of a size, or leaves that to whoever merges
+/// beside the writers. Returns whether segments are left that are due.
+fn maintain<P: PagesMut>(p: &mut P, root: PageId, state: &mut State, merging: Merging) -> Result<bool> {
     loop {
         if let Some(i) = state.segments.iter().position(|s| s.dead * 2 > s.rows) {
             merge(p, root, state, i, i + 1)?;
@@ -779,6 +836,16 @@ fn maintain<P: PagesMut>(p: &mut P, root: PageId, state: &mut State) -> Result<(
         }
         let count = state.segments.len();
         let Some(newest) = state.segments.last() else { break };
+        if merging == Merging::Beside {
+            // Left to be merged beside the writers, unless that has
+            // fallen so far behind that searches would pay for it.
+            if count <= MAX_SEGMENTS {
+                break;
+            }
+            let (from, to) = due(&state.segments).unwrap_or((0, count));
+            merge(p, root, state, from, to)?;
+            continue;
+        }
         let at = level(newest);
         let alike = state.segments.iter().rev().take_while(|s| level(s) <= at).count();
         if alike >= FANOUT {
@@ -789,19 +856,39 @@ fn maintain<P: PagesMut>(p: &mut P, root: PageId, state: &mut State) -> Result<(
             break;
         }
     }
-    Ok(())
+    Ok(merging == Merging::Beside && due(&state.segments).is_some())
 }
 
 /// Merges the segments `from..to`, which are neighbours in age, into one
 /// without their dead rows.
 fn merge<P: PagesMut>(p: &mut P, root: PageId, state: &mut State, from: usize, to: usize) -> Result<()> {
-    let (low, high) = (state.segments[from].low, state.segments[to - 1].high);
+    let merged = merged_of(p, root, &state.segments[from..to], &|| false)?.ok_or_else(malformed)?;
+    // A segment's tree was built in one pass and is as deep everywhere:
+    // its pages are found, to be freed, without reading its leaves again.
+    let mut pages = Vec::new();
+    for segment in &state.segments[from..to] {
+        btree::page_ids(p, segment.root, &mut pages)?;
+    }
+    for id in pages {
+        p.free(id);
+    }
+    state.segments.splice(from..to, merged);
+    Ok(())
+}
+
+/// Writes one segment that holds what `segments` hold, which are
+/// neighbours in age, without their dead rows: `None` inside if no row
+/// of theirs is left. The index is read as `root` has it; the segments
+/// themselves are left as they are. Gives up, with `None`, once
+/// `give_up` says so: what it wrote is then the caller's to drop.
+fn merged_of<P: PagesMut>(p: &mut P, root: PageId, segments: &[Segment], give_up: &dyn Fn() -> bool) -> Result<Option<Option<Segment>>> {
+    let (low, high) = (segments[0].low, segments[segments.len() - 1].high);
     // With no row of theirs dead, as when rows are only ever added, the
     // runs are joined as they are. Otherwise each row is looked at:
     // which numbers in their range still lead to a row.
-    let whole = state.segments[from..to].iter().all(|s| s.dead == 0);
+    let whole = segments.iter().all(|s| s.dead == 0);
     let mut live: Vec<u64> = Vec::new();
-    let mut rows: u64 = state.segments[from..to].iter().map(|s| s.rows).sum();
+    let mut rows: u64 = segments.iter().map(|s| s.rows).sum();
     if !whole {
         live = vec![0u64; ((high - low) / 64 + 1) as usize];
         rows = 0;
@@ -820,7 +907,7 @@ fn merge<P: PagesMut>(p: &mut P, root: PageId, state: &mut State, from: usize, t
             cursor.next()?;
         }
     }
-    let mut scans: Vec<Scan> = state.segments[from..to].iter().map(|s| Scan::new(s.root)).collect();
+    let mut scans: Vec<Scan> = segments.iter().map(|s| Scan::new(s.root)).collect();
     for scan in &mut scans {
         scan.first(p)?;
     }
@@ -829,7 +916,12 @@ fn merge<P: PagesMut>(p: &mut P, root: PageId, state: &mut State, from: usize, t
     let mut entries = 0u64;
     let mut word: Vec<u8> = Vec::new();
     let mut run: Vec<(u64, u32)> = Vec::new();
+    let mut words = 0u32;
     loop {
+        words += 1;
+        if words.is_multiple_of(256) && give_up() {
+            return Ok(None);
+        }
         // The least word any segment has left.
         let mut any = false;
         for scan in &scans {
@@ -876,12 +968,72 @@ fn merge<P: PagesMut>(p: &mut P, root: PageId, state: &mut State, from: usize, t
     }
     drop(scans);
     let tree = tree.finish(p)?;
-    for segment in &state.segments[from..to] {
-        btree::destroy(p, segment.root, &mut |_, _| Ok(()))?;
+    Ok(Some((rows > 0).then_some(Segment { root: tree, low, high, entries, rows, dead: 0 })))
+}
+
+// ------------------------------------------------- merging beside writers
+
+/// Segments merged beside the writers, to be put in their place.
+pub struct Merged {
+    /// The segments, as the index had them when they were read.
+    of: Vec<Segment>,
+    /// What they become: nothing, if no row of theirs was left.
+    into: Option<Segment>,
+    /// Every page of their trees, to free when they are replaced.
+    pages: Vec<PageId>,
+}
+
+impl Merged {
+    /// How many segments were merged, and the entries they held.
+    pub fn size(&self) -> (usize, u64) {
+        (self.of.len(), self.of.iter().map(|s| s.entries).sum())
     }
-    let merged = (rows > 0).then_some(Segment { root: tree, low, high, entries, rows, dead: 0 });
-    state.segments.splice(from..to, merged);
-    Ok(())
+}
+
+/// Merges the cheapest run of segments that is due in the index as
+/// `root` has it, writing the merged tree through `p`: pages nothing
+/// refers to until `install` puts them in place. The index itself is
+/// only read. `None` if nothing is due, or if `give_up` said to stop:
+/// what `p` was made to write is then of no use.
+pub fn merge_beside<P: PagesMut>(p: &mut P, root: PageId, give_up: &dyn Fn() -> bool) -> Result<Option<Merged>> {
+    if root == NO_PAGE {
+        return Ok(None);
+    }
+    let state = load(p, root)?;
+    let Some((from, to)) = due(&state.segments) else { return Ok(None) };
+    let of = state.segments[from..to].to_vec();
+    let Some(into) = merged_of(p, root, &of, give_up)? else { return Ok(None) };
+    let mut pages = Vec::new();
+    for segment in &of {
+        btree::page_ids(p, segment.root, &mut pages)?;
+    }
+    Ok(Some(Merged { of, into, pages }))
+}
+
+/// Puts a merge made beside the writers in the place of the segments it
+/// read, in the index as `root` has it now, and returns the index's new
+/// root. `None`, with nothing changed, if those segments are no longer
+/// as they were read: the merge is then to be dropped.
+///
+/// What is compared is each segment's tree, its range of numbers and
+/// its count of dead rows. A segment's tree is never changed, only
+/// replaced, and its pages are not given out again while the merge
+/// holds the version it read: so the same tree is the same entries. And
+/// a row of a segment cannot die without the segment's count of dead
+/// rows rising. Equal on all three, the segments hold exactly the rows
+/// the merge kept and the rows it left out, whatever else was added to
+/// the index, or merged in it, meanwhile.
+pub fn install<P: PagesMut>(p: &mut P, root: PageId, merged: &Merged) -> Result<Option<PageId>> {
+    if root == NO_PAGE {
+        return Ok(None);
+    }
+    let mut state = load(p, root)?;
+    let Some(at) = state.segments.windows(merged.of.len()).position(|now| now == merged.of) else { return Ok(None) };
+    for id in &merged.pages {
+        p.free(*id);
+    }
+    state.segments.splice(at..at + merged.of.len(), merged.into.clone());
+    store(p, root, &state).map(Some)
 }
 
 // ---------------------------------------------------------------- search
@@ -1166,6 +1318,168 @@ mod tests {
         root = remove(&mut p, root, b"d").unwrap();
         assert_eq!(rows_with(&p, root, 1, "red"), [(b"b".to_vec(), 48)]);
         assert!(rows_with(&p, root, 1, "fox").is_empty());
+        destroy(&mut p, root).unwrap();
+        assert!(p.pages.is_empty(), "{} pages leaked", p.pages.len());
+    }
+
+    /// Segments of a handful of rows, for as long as this is held: the
+    /// size at which pending rows become a segment is one for the whole
+    /// process, and the tests that need it small must not undo each
+    /// other's.
+    struct SmallSegments(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    fn small_segments() -> SmallSegments {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let held = ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_pending_bytes(600);
+        SmallSegments(held)
+    }
+
+    impl Drop for SmallSegments {
+        fn drop(&mut self) {
+            set_pending_bytes(256 * 1024);
+        }
+    }
+
+    /// Adds rows of a few words each until `segments` segments have been
+    /// written and none merged, as a writer does that leaves merging to
+    /// someone else. Returns the root.
+    fn pile(p: &mut MemPages, mut root: PageId, model: &mut BTreeMap<Vec<u8>, Words>, from: u32, segments: usize) -> PageId {
+        let vocabulary: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
+        let mut n = from;
+        while load(p, root).unwrap().segments.len() < segments {
+            let pk = format!("row{n:06}").into_bytes();
+            let mut terms: Vec<(&str, u32)> = (0..8).map(|i| (vocabulary[((n * 7 + i * 3) % 40) as usize].as_str(), 1 + n % 5)).collect();
+            terms.sort();
+            terms.dedup_by(|a, b| a.0 == b.0);
+            let w = words((n % 2) as u8, &terms);
+            let (next, _) = add_merging(p, root, &pk, &w, Merging::Beside).unwrap();
+            root = next;
+            model.insert(pk, w);
+            n += 1;
+        }
+        root
+    }
+
+    fn check_against(p: &MemPages, root: PageId, model: &BTreeMap<Vec<u8>, Words>) {
+        for lead in 0..2u8 {
+            for term in ["w0", "w7", "w13", "w39"] {
+                let mut expected: Vec<(Vec<u8>, u32)> = model
+                    .iter()
+                    .filter(|(_, w)| w.lead() == [lead])
+                    .filter_map(|(pk, w)| w.terms().find(|(t, _)| *t == term.as_bytes()).map(|(_, s)| (pk.clone(), s)))
+                    .collect();
+                expected.sort();
+                assert_eq!(rows_with(p, root, lead, term), expected, "{lead} {term}");
+            }
+        }
+    }
+
+    #[test]
+    fn segments_left_to_be_merged_beside_are_merged_and_put_in_place() {
+        let _small = small_segments();
+        let mut p = MemPages::new();
+        let mut model = BTreeMap::new();
+        // A writer that leaves merging to someone else lets segments
+        // gather, and says that some are due.
+        let mut root = pile(&mut p, NO_PAGE, &mut model, 0, FANOUT - 1);
+        assert!(merge_beside(&mut p, root, &|| false).unwrap().is_none(), "nothing is due yet");
+        root = pile(&mut p, root, &mut model, 1000, FANOUT + 2);
+        p.commit();
+        let before = load(&p, root).unwrap();
+        assert!(due(&before.segments).is_some());
+
+        // The merge reads the index as it is and changes nothing of it.
+        let merged = merge_beside(&mut p, root, &|| false).unwrap().expect("segments are due");
+        assert!(merged.size().0 >= FANOUT);
+        assert_eq!(load(&p, root).unwrap(), before);
+        check_against(&p, root, &model);
+
+        // Meanwhile rows are added, and segments written after the ones
+        // that were merged: the merge still fits.
+        root = pile(&mut p, root, &mut model, 2000, before.segments.len() + 2);
+        root = install(&mut p, root, &merged).unwrap().expect("the merged segments are as they were");
+        let after = load(&p, root).unwrap();
+        assert_eq!(after.segments.len(), before.segments.len() + 2 - merged.size().0 + 1);
+        assert!(after.segments.windows(2).all(|pair| pair[0].high < pair[1].low), "numbers still rise from segment to segment");
+        check_against(&p, root, &model);
+        // It cannot be put in place twice.
+        assert!(install(&mut p, root, &merged).unwrap().is_none());
+
+        // Everything is merged in the end, and every page accounted for.
+        p.commit();
+        while let Some(merged) = merge_beside(&mut p, root, &|| false).unwrap() {
+            root = install(&mut p, root, &merged).unwrap().unwrap();
+            p.commit();
+        }
+        assert!(due(&load(&p, root).unwrap().segments).is_none());
+        check_against(&p, root, &model);
+        destroy(&mut p, root).unwrap();
+        assert!(p.pages.is_empty(), "{} pages leaked", p.pages.len());
+    }
+
+    #[test]
+    fn a_merge_whose_rows_died_meanwhile_is_dropped() {
+        let _small = small_segments();
+        let mut p = MemPages::new();
+        let mut model = BTreeMap::new();
+        let mut root = pile(&mut p, NO_PAGE, &mut model, 0, FANOUT + 1);
+        p.commit();
+        // A row of a segment dies before the merge is made: the merge
+        // leaves it out.
+        let first = model.keys().next().unwrap().clone();
+        root = remove_merging(&mut p, root, &first, Merging::Beside).unwrap().0;
+        model.remove(&first);
+        let merged = merge_beside(&mut p, root, &|| false).unwrap().expect("segments are due");
+        let built: Vec<PageId> = merged.into.iter().map(|s| s.root).collect();
+        // Another dies after: what was merged still lists it, and is of
+        // no use.
+        let second = model.keys().next().unwrap().clone();
+        root = remove_merging(&mut p, root, &second, Merging::Beside).unwrap().0;
+        model.remove(&second);
+        assert!(install(&mut p, root, &merged).unwrap().is_none());
+        check_against(&p, root, &model);
+        // Made again, it fits, and neither row is found.
+        for tree in built {
+            btree::destroy(&mut p, tree, &mut |_, _| Ok(())).unwrap();
+        }
+        let merged = merge_beside(&mut p, root, &|| false).unwrap().expect("segments are still due");
+        root = install(&mut p, root, &merged).unwrap().expect("nothing died meanwhile");
+        check_against(&p, root, &model);
+        let state = load(&p, root).unwrap();
+        assert!(state.segments.iter().all(|s| s.dead == 0 || s.high >= merged.of[merged.of.len() - 1].high));
+        // A merge given up on leaves the index as it was.
+        root = pile(&mut p, root, &mut model, 5000, state.segments.len() + FANOUT);
+        assert!(merge_beside(&mut p, root, &|| true).unwrap().is_none() || load(&p, root).unwrap().segments.len() >= FANOUT);
+        check_against(&p, root, &model);
+    }
+
+    #[test]
+    fn a_writer_that_leaves_merging_still_keeps_segments_few() {
+        let _small = small_segments();
+        let mut p = MemPages::new();
+        let mut model = BTreeMap::new();
+        let mut root = NO_PAGE;
+        let mut most = 0;
+        // Nobody merges beside this writer: it merges the cheapest run
+        // itself once there are more segments than a search should meet.
+        for round in 0..40u32 {
+            let now = load(&p, root).map(|s| s.segments.len()).unwrap_or(0);
+            root = pile(&mut p, root, &mut model, round * 1000, now + 1);
+            p.commit();
+            most = most.max(load(&p, root).unwrap().segments.len());
+        }
+        for round in 40..400u32 {
+            let pk = format!("more{round:06}").into_bytes();
+            let w = words(0, &[("w0", 1), ("w1", 2), ("w2", 3), ("w3", 4), ("w4", 5), ("w5", 6), ("w6", 7), ("w7", 8)]);
+            root = add_merging(&mut p, root, &pk, &w, Merging::Beside).unwrap().0;
+            model.insert(pk, w);
+            p.commit();
+            most = most.max(load(&p, root).unwrap().segments.len());
+        }
+        assert!(most > FANOUT * 2, "segments gathered ({most} at most)");
+        assert!(most <= MAX_SEGMENTS + 1, "but not without end ({most} at most)");
+        check_against(&p, root, &model);
         destroy(&mut p, root).unwrap();
         assert!(p.pages.is_empty(), "{} pages leaked", p.pages.len());
     }

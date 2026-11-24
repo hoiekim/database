@@ -761,6 +761,11 @@ pub struct Writer {
     alloc_log: Vec<PageId>,
     /// Whether this writes beside the database's one writer: see `fork`.
     fork: bool,
+    /// Whether work its trees leave due, and that can be done beside the
+    /// writers, is left to whoever does it there: see `fts::Merging`.
+    leaves_beside: bool,
+    /// Whether it has left such work.
+    left_due: bool,
 }
 
 /// A point in a transaction's page writes to return to.
@@ -783,7 +788,40 @@ impl Writer {
             frozen_freed: Vec::new(),
             alloc_log: Vec::new(),
             fork: false,
+            leaves_beside: false,
+            left_due: false,
         }
+    }
+
+    /// Says whether work that can be done beside the writers is left to
+    /// whoever does it there. A writer leaves none unless told to.
+    pub fn leave_beside(&mut self, on: bool) {
+        self.leaves_beside = on;
+    }
+
+    pub fn leaves_beside(&self) -> bool {
+        self.leaves_beside
+    }
+
+    /// Notes that the transaction has left such work due.
+    pub fn note_due(&mut self) {
+        self.left_due = true;
+    }
+
+    pub fn left_due(&self) -> bool {
+        self.left_due
+    }
+
+    /// Writes every page the transaction holds in memory to the file,
+    /// where it will lie once the transaction commits: so that its
+    /// commit has nothing left to carry, and is over in a moment. As
+    /// with `spill_if_many`, nothing durable is touched.
+    pub fn spill_all(&mut self) -> Result<()> {
+        for (id, page) in std::mem::take(&mut self.private) {
+            self.store.write_page(id, &page)?;
+            self.spilled.insert(id);
+        }
+        Ok(())
     }
 
     /// A writer that may work while another does: on a version it does

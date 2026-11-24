@@ -212,6 +212,14 @@ impl Tx {
         Arc::make_mut(self.catalog.tables.get_mut(name).expect("the table was just read"))
     }
 
+    /// Gives an index of a table another root: for whoever rebuilt the
+    /// index's tree beside the writers and now takes its place.
+    pub(crate) fn set_index_root(&mut self, name: &str, index: usize, root: PageId) -> Result<()> {
+        self.table(name)?;
+        self.table_mut(name).index_roots[index] = root;
+        Ok(())
+    }
+
     // ------------------------------------------------------ row changes
 
     /// Stores a new row. `values` holds one value per stored column, of
@@ -219,6 +227,15 @@ impl Tx {
     pub fn apply_insert(&mut self, name: &str, values: &[Value]) -> Result<Vec<u8>> {
         let stored = Row::from_values(values);
         self.apply_insert_row(name, values, &stored, None)
+    }
+
+    /// Who merges the full-text segments this transaction leaves due.
+    fn merging(&self) -> fts::Merging {
+        if self.writer.leaves_beside() {
+            fts::Merging::Beside
+        } else {
+            fts::Merging::AtOnce
+        }
     }
 
     /// `apply_insert` for a row already made of its values. `ahead` holds
@@ -250,8 +267,13 @@ impl Tx {
                 index_roots[i] = btree::put(&mut self.writer, index_roots[i], &entry.key, &entry.value)?.0;
             }
         }
+        let merging = self.merging();
         for (i, words) in &words {
-            index_roots[*i] = fts::add(&mut self.writer, index_roots[*i], &pk, words)?;
+            let (root, left) = fts::add_merging(&mut self.writer, index_roots[*i], &pk, words, merging)?;
+            index_roots[*i] = root;
+            if left {
+                self.writer.note_due();
+            }
         }
         if self.logging && !table.volatile {
             self.log.u8(OP_INSERT);
@@ -357,10 +379,17 @@ impl Tx {
                 }
             }
         }
+        let merging = self.merging();
         for (i, words) in &reworded {
-            index_roots[*i] = fts::remove(&mut self.writer, index_roots[*i], pk)?;
+            let (mut root, mut left) = fts::remove_merging(&mut self.writer, index_roots[*i], pk, merging)?;
             if let Some(words) = words {
-                index_roots[*i] = fts::add(&mut self.writer, index_roots[*i], pk, words)?;
+                let added = fts::add_merging(&mut self.writer, root, pk, words, merging)?;
+                root = added.0;
+                left |= added.1;
+            }
+            index_roots[*i] = root;
+            if left {
+                self.writer.note_due();
             }
         }
         if self.logging && !table.volatile {
@@ -404,7 +433,12 @@ impl Tx {
                 index_roots[i] = btree::delete(&mut self.writer, index_roots[i], &entry.key)?.0;
             }
             if is_full_text(&table, i) {
-                index_roots[i] = fts::remove(&mut self.writer, index_roots[i], pk)?;
+                let merging = self.merging();
+                let (root, left) = fts::remove_merging(&mut self.writer, index_roots[i], pk, merging)?;
+                index_roots[i] = root;
+                if left {
+                    self.writer.note_due();
+                }
             }
         }
         let mut blobs = table.blobs;

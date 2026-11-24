@@ -1,9 +1,10 @@
-//! The engine: every database in one directory, sharing one page cache
-//! and one background thread that checkpoints them.
+//! The engine: every database in one directory, sharing one page cache,
+//! one background thread that checkpoints them, and one that merges
+//! their full-text segments beside their writers.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -27,6 +28,26 @@ impl Default for EngineOptions {
     }
 }
 
+/// How the databases tell the merging thread that one of them has
+/// full-text segments due to be merged. It is theirs and the engine's
+/// both, and holds neither.
+#[derive(Default)]
+struct Due {
+    /// Whether some database has said so since the thread last looked.
+    said: Mutex<bool>,
+    wake: Condvar,
+    /// Set to have the thread leave segments be: tests then merge by
+    /// hand, at moments of their choosing.
+    paused: AtomicBool,
+}
+
+impl Due {
+    fn say(&self) {
+        *self.said.lock().unwrap() = true;
+        self.wake.notify_one();
+    }
+}
+
 struct Inner {
     vfs: Arc<dyn Vfs>,
     dir: PathBuf,
@@ -36,14 +57,26 @@ struct Inner {
     next_store: AtomicU32,
     stopping: Mutex<bool>,
     wake: Condvar,
+    due: Arc<Due>,
     /// Held for as long as the engine lives, so that two processes never
     /// open one directory.
     _lock: Option<std::fs::File>,
 }
 
+impl Inner {
+    /// Takes a database into the engine's care: the merging of its
+    /// full-text segments is left to the engine's thread from here on.
+    fn adopt(&self, db: Arc<Database>) -> Arc<Database> {
+        let due = self.due.clone();
+        db.merge_beside(Box::new(move || due.say()));
+        db
+    }
+}
+
 pub struct Engine {
     inner: Arc<Inner>,
     checkpointer: Option<std::thread::JoinHandle<()>>,
+    merger: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Ends the name a database is built under while a dump is loaded.
@@ -83,6 +116,7 @@ impl Engine {
             next_store: AtomicU32::new(1),
             stopping: Mutex::new(false),
             wake: Condvar::new(),
+            due: Arc::default(),
             _lock: lock,
         });
         // What a restore was building when the server stopped is no use.
@@ -100,7 +134,7 @@ impl Engine {
             if let Some(name) = file.strip_suffix(".db") {
                 if check_database_name(name).is_ok() {
                     let id = inner.next_store.fetch_add(1, Ordering::Relaxed);
-                    let db = Database::open(vfs.clone(), dir, name, inner.cache.clone(), id, inner.options.db.clone())?;
+                    let db = inner.adopt(Database::open(vfs.clone(), dir, name, inner.cache.clone(), id, inner.options.db.clone())?);
                     inner.dbs.lock().unwrap().insert(name.to_string(), db);
                 }
             }
@@ -123,7 +157,47 @@ impl Engine {
                 }
             }
         })?;
-        Ok(Engine { inner, checkpointer: Some(checkpointer) })
+        // Merges wait for a database to say that segments are due: an
+        // engine nobody writes to merges nothing and wakes for nothing.
+        let merging = inner.clone();
+        let merger = std::thread::Builder::new().name("merger".into()).spawn(move || loop {
+            let stopping = || *merging.stopping.lock().unwrap();
+            {
+                let mut said = merging.due.said.lock().unwrap();
+                loop {
+                    if stopping() {
+                        return;
+                    }
+                    if *said && !merging.due.paused.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    said = merging.due.wake.wait(said).unwrap();
+                }
+                *said = false;
+            }
+            let dbs: Vec<Arc<Database>> = merging.dbs.lock().unwrap().values().cloned().collect();
+            for db in dbs {
+                // A failure marks the database failed, or it was dropped
+                // meanwhile: either way there is nothing more to do here.
+                let mut more = true;
+                while more && !stopping() && !merging.due.paused.load(Ordering::Relaxed) {
+                    more = db.merge_text_segments(&stopping).unwrap_or(false);
+                }
+            }
+        })?;
+        Ok(Engine { inner, checkpointer: Some(checkpointer), merger: Some(merger) })
+    }
+
+    /// Has the engine's thread leave full-text segments unmerged, or
+    /// take them up again. While it is paused, writers still leave their
+    /// merges to be made beside them, and whoever paused it makes them,
+    /// with `Database::merge_text_segments`: tests do, to merge at
+    /// moments of their choosing.
+    pub fn pause_merging(&self, paused: bool) {
+        self.inner.due.paused.store(paused, Ordering::Relaxed);
+        if !paused {
+            self.inner.due.say();
+        }
     }
 
     pub fn create_database(&self, name: &str) -> Result<Arc<Database>> {
@@ -138,7 +212,7 @@ impl Engine {
             return Err(Error::db(ErrorCode::AlreadyExists, format!("database {name:?} already exists")));
         }
         let id = self.inner.next_store.fetch_add(1, Ordering::Relaxed);
-        let db = Database::create(self.inner.vfs.clone(), &self.inner.dir, name, self.inner.cache.clone(), id, self.inner.options.db.clone())?;
+        let db = self.inner.adopt(Database::create(self.inner.vfs.clone(), &self.inner.dir, name, self.inner.cache.clone(), id, self.inner.options.db.clone())?);
         dbs.insert(name.to_string(), db.clone());
         Ok(db)
     }
@@ -172,7 +246,7 @@ impl Engine {
         crate::wal::remove_logs(vfs, dir, temp, |_| true)?;
         vfs.sync_dir(dir)?;
         let id = self.inner.next_store.fetch_add(1, Ordering::Relaxed);
-        let db = Database::open(self.inner.vfs.clone(), dir, name, self.inner.cache.clone(), id, self.inner.options.db.clone())?;
+        let db = self.inner.adopt(Database::open(self.inner.vfs.clone(), dir, name, self.inner.cache.clone(), id, self.inner.options.db.clone())?);
         self.inner.dbs.lock().unwrap().insert(name.to_string(), db);
         Ok(())
     }
@@ -200,10 +274,15 @@ impl Engine {
         (self.inner.cache.len(), self.inner.cache.capacity())
     }
 
+    /// Stops the engine's two threads. A merge under way gives up.
     fn stop_checkpointer(&mut self) {
         *self.inner.stopping.lock().unwrap() = true;
         self.inner.wake.notify_all();
-        if let Some(thread) = self.checkpointer.take() {
+        // Told with what it waits on held, so that it is either before
+        // its look at `stopping` or already waiting.
+        drop(self.inner.due.said.lock().unwrap());
+        self.inner.due.wake.notify_all();
+        for thread in [self.checkpointer.take(), self.merger.take()].into_iter().flatten() {
             let _ = thread.join();
         }
     }
