@@ -21,11 +21,13 @@
 //! | `DATABASE_ADMIN_PASSWORD` | (required) | for every command but `serve` to reach the server |
 //! | `DATABASE_DATA` | `./data` | where the files live |
 //! | `DATABASE_LISTEN` | `0.0.0.0:5454` | address to listen on |
+//! | `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well, for clients on the same host |
 //! | `DATABASE_CACHE_MB` | `32` | memory for cached pages |
 //!
 //! The other commands connect to `DATABASE_HOST` (default `127.0.0.1`) on
-//! the port of `DATABASE_LISTEN`, with `DATABASE_ADMIN_PASSWORD`: run
-//! inside the server's container, they need nothing else.
+//! the port of `DATABASE_LISTEN`, or through `DATABASE_SOCKET` if that is
+//! set, with `DATABASE_ADMIN_PASSWORD`: run inside the server's container,
+//! they need nothing else.
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -50,6 +52,7 @@ fn admin_password() -> Result<String, String> {
 async fn admin() -> Result<Client, String> {
     let host = env("DATABASE_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let mut config = Config::new(&host, listen_address()?.port(), "", &admin_password()?);
+    config.socket = env("DATABASE_SOCKET").map(Into::into);
     config.name = "database-cli".to_string();
     config.pool_size = 1;
     // A dump or a restore of everything takes as long as it takes.
@@ -64,12 +67,16 @@ fn text(e: DbError) -> String {
 async fn serve() -> Result<(), String> {
     let mut config = ServerConfig::new(env("DATABASE_DATA").unwrap_or_else(|| "./data".to_string()), &admin_password()?);
     config.listen = listen_address()?;
+    config.socket = env("DATABASE_SOCKET").map(Into::into);
     if let Some(mb) = env("DATABASE_CACHE_MB") {
         config.cache_bytes = mb.parse::<usize>().map_err(|_| "DATABASE_CACHE_MB is not a number".to_string())? * 1024 * 1024;
     }
     let data_dir = config.data_dir.clone();
     let server = Server::start(config).await.map_err(|e| format!("cannot start: {e}"))?;
-    eprintln!("database: serving {} on {}", data_dir.display(), server.addr());
+    match server.socket() {
+        Some(socket) => eprintln!("database: serving {} on {} and {}", data_dir.display(), server.addr(), socket.display()),
+        None => eprintln!("database: serving {} on {}", data_dir.display(), server.addr()),
+    }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| e.to_string())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}

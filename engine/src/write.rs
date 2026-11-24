@@ -57,6 +57,8 @@ pub struct Tx {
     pub logging: bool,
     /// What its statements draw: random ids and counters' numbers.
     pub tape: Tape,
+    /// The values the statement being run was given for its parameters.
+    pub params: Vec<Value>,
     /// The tables it has made, which nobody else can see until it commits.
     created: Vec<u32>,
 }
@@ -196,11 +198,11 @@ fn unique_holder(ctx: &Ctx, table: &Table, i: usize, entry: &Entry, own_pk: &[u8
 
 impl Tx {
     pub fn new(writer: Writer, catalog: Catalog, now: i64) -> Tx {
-        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), created: Vec::new() }
+        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), params: Vec::new(), created: Vec::new() }
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape) }
+        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape), params: &self.params }
     }
 
     fn table(&self, name: &str) -> Result<Arc<Table>> {

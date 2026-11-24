@@ -1,25 +1,21 @@
 //! The client: statements, transactions, named locks, administration.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::expr::Expr;
-use database_protocol::message::{Admin as AdminRequest, Ddl, Request, Response, TxnKind};
+use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Request, Response, TxnKind};
 use database_protocol::query::{Delete, Insert, Query, Update};
 use database_protocol::schema::{ColumnDef, IndexDef, TableDef};
-use database_protocol::value::Timestamp;
+use database_protocol::value::{Timestamp, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::conn::{Pool, PooledConn};
 use crate::row::{Row, Rows};
-
-/// How many times `Client::transaction` runs its work beside other
-/// writers before it runs it as the only one.
-const OPTIMISTIC_RUNS: usize = 2;
 
 fn unexpected(what: &str) -> DbError {
     DbError::new(ErrorCode::Connection, format!("the server answered {what} with something else"))
@@ -36,6 +32,124 @@ fn ok(response: Response) -> DbResult<()> {
     match response {
         Response::Ok => Ok(()),
         _ => Err(unexpected("a command")),
+    }
+}
+
+/// A query, an insert, an update or a delete: what can be prepared, and
+/// what a batch holds.
+pub trait Statement {
+    #[doc(hidden)]
+    fn into_request(self) -> Request;
+}
+
+impl Statement for Query {
+    fn into_request(self) -> Request {
+        Request::Query(self)
+    }
+}
+
+impl Statement for Insert {
+    fn into_request(self) -> Request {
+        Request::Insert(self)
+    }
+}
+
+impl Statement for Update {
+    fn into_request(self) -> Request {
+        Request::Update(self)
+    }
+}
+
+impl Statement for Delete {
+    fn into_request(self) -> Request {
+        Request::Delete(self)
+    }
+}
+
+/// A statement to run many times with different values, as a prepared
+/// statement is in SQL. Where the values go it says `param(0)`,
+/// `param(1)`, and so on; `Db::execute` then runs it with a value for
+/// each.
+///
+/// Each connection sends the statement to the server once, which keeps
+/// it as it is decoded; after that only its number and the values
+/// travel. That is most of what a small request costs either side, so it
+/// is worth doing for whatever an application runs often: build each such
+/// statement once, when the application starts, and keep it.
+///
+/// ```ignore
+/// let by_token = Prepared::new(
+///     Query::table("sessions").index("sessions_token", KeyRange::eq([param(0)])).filter(col("expires_at").gt(now())),
+/// );
+/// let session = db.execute(&by_token, [token_hash]).await?.opt();
+/// ```
+///
+/// Cheap to clone and to share between tasks. It belongs to no client or
+/// connection, and may be used with any, inside a transaction or not.
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    /// What connections know it by: unlike any other's in this process.
+    id: u64,
+    statement: Arc<Request>,
+}
+
+impl Prepared {
+    pub fn new(statement: impl Statement) -> Prepared {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Prepared { id: NEXT.fetch_add(1, Ordering::Relaxed), statement: Arc::new(statement.into_request()) }
+    }
+
+    /// The request that runs it with these values. The statement goes
+    /// along; a connection that has sent it before leaves it out.
+    fn run<V: Into<Value>>(&self, params: impl IntoIterator<Item = V>) -> Request {
+        Request::Prepared { id: self.id, statement: Some(self.statement.clone()), params: params.into_iter().map(Into::into).collect() }
+    }
+}
+
+/// Statements to run as one transaction, sent to the server whole: see
+/// `Client::batch`.
+#[derive(Clone, Debug, Default)]
+pub struct Batch {
+    items: Vec<BatchItem>,
+}
+
+impl Batch {
+    pub fn new() -> Batch {
+        Batch::default()
+    }
+
+    /// Adds a statement, to run after those added before it.
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(mut self, statement: impl Statement) -> Batch {
+        self.items.push(BatchItem { statement: statement.into_request(), expect: None });
+        self
+    }
+
+    /// Adds a prepared statement with the values to run it with.
+    pub fn add_prepared<V: Into<Value>>(mut self, prepared: &Prepared, params: impl IntoIterator<Item = V>) -> Batch {
+        self.items.push(BatchItem { statement: prepared.run(params), expect: None });
+        self
+    }
+
+    /// Says how many rows the statement added last must affect (a query:
+    /// return). If it affects any other number the batch stops there
+    /// with `ErrorCode::Unmet`, and nothing of it takes effect. This is
+    /// how a later statement is made to depend on an earlier one: debit
+    /// an account `filter`ed on its balance and `expect(1)`, and the
+    /// credit after it happens only if the debit did.
+    pub fn expect(mut self, rows: u64) -> Batch {
+        if let Some(last) = self.items.last_mut() {
+            last.expect = Some(rows);
+        }
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 }
 
@@ -82,6 +196,14 @@ pub trait Db: Sync {
 
     fn delete(&self, delete: Delete) -> impl Future<Output = DbResult<Rows>> + Send {
         async move { rows(self.call(Request::Delete(delete)).await?) }
+    }
+
+    /// Runs a prepared statement with a value for each of its `param`s,
+    /// in order: see `Prepared`. The result is what the statement gives
+    /// when run as it is: a query's rows, or what a write returns.
+    fn execute<V: Into<Value>>(&self, prepared: &Prepared, params: impl IntoIterator<Item = V>) -> impl Future<Output = DbResult<Rows>> + Send {
+        let request = prepared.run(params);
+        async move { rows(self.call(request).await?) }
     }
 
     /// Creates a table. An error if one of that name exists.
@@ -235,7 +357,16 @@ impl Client {
         let lock_wait_ms = self.pool.config.lock_wait.as_millis() as u64;
         ok(conn.conn().call(Request::Begin { kind, lock_wait_ms }).await?)?;
         conn.held = true;
-        Ok(Transaction { inner: Arc::new(TxInner { conn: Mutex::new(Some(conn)), conflicted: AtomicBool::new(false) }) })
+        Ok(Transaction::on(conn, None))
+    }
+
+    /// A transaction that begins on the server with its first statement:
+    /// the two travel as one request. Until then nothing has been sent,
+    /// and it reads and holds nothing.
+    async fn begin_later(&self, kind: TxnKind) -> DbResult<Transaction> {
+        let conn = self.pool.acquire().await?;
+        let lock_wait_ms = self.pool.config.lock_wait.as_millis() as u64;
+        Ok(Transaction::on(conn, Some((kind, lock_wait_ms))))
     }
 
     /// Runs `work` in a writing transaction: commits if it returns `Ok`,
@@ -252,6 +383,18 @@ impl Client {
     /// through the transaction it is given; use `exclusive` for one that
     /// must run exactly once.
     ///
+    /// How many runs it gets beside the others is `Config::optimistic_runs`,
+    /// 2 unless set. While more than a third of this client's
+    /// transactions conflict on their first run, a second such run would
+    /// mostly conflict again, and a transaction that conflicts goes
+    /// straight to the write lock instead.
+    ///
+    /// The transaction begins on the server with its first statement, not
+    /// when `work` is called: the two are sent as one request. What it
+    /// sees of the database is as of that statement. (For statements
+    /// that need no answers from each other, `batch` sends the whole
+    /// transaction as one.)
+    ///
     /// ```ignore
     /// let id = db.transaction(|tx| async move {
     ///     let row = tx.insert(Insert::into("users").set("name", "ann").returning(["id"])).await?.one()?;
@@ -265,12 +408,20 @@ impl Client {
         Fut: Future<Output = Result<T, E>>,
         E: From<DbError>,
     {
-        for _ in 0..OPTIMISTIC_RUNS {
-            let tx = self.begin_optimistic().await?;
-            match work(tx.clone()).await {
+        for run in 0..self.pool.config.optimistic_runs {
+            if run > 0 && self.pool.contended() {
+                break;
+            }
+            let tx = self.begin_later(TxnKind::Optimistic).await?;
+            let conflicted = match work(tx.clone()).await {
                 Ok(value) => match tx.commit().await {
-                    Ok(()) => return Ok(value),
-                    Err(e) if e.code == ErrorCode::Conflict => {}
+                    Ok(()) => {
+                        if run == 0 {
+                            self.pool.note_first_run(false);
+                        }
+                        return Ok(value);
+                    }
+                    Err(e) if e.code == ErrorCode::Conflict => true,
                     Err(e) => return Err(e.into()),
                 },
                 Err(e) => {
@@ -279,22 +430,60 @@ impl Client {
                     if !conflicted {
                         return Err(e);
                     }
+                    true
                 }
+            };
+            if run == 0 && conflicted {
+                self.pool.note_first_run(true);
             }
         }
         self.exclusive(work).await
     }
 
+    /// Runs the statements of `batch` as one transaction, in one request:
+    /// all of them take effect or none does, nothing else is written
+    /// between them, and they are on disk when this returns. Gives one
+    /// result for each statement, in order.
+    ///
+    /// This is for a transaction whose statements need nothing from each
+    /// other's answers. Where `transaction` talks to the server once per
+    /// statement and may be run again after a conflict, a batch is one
+    /// round trip and runs once, as the database's only writer for the
+    /// moment it takes. A statement can still be made a condition of the
+    /// rest: see `Batch::expect`. A batch of queries alone reads one
+    /// moment of the database and holds nobody up.
+    ///
+    /// ```ignore
+    /// db.batch(
+    ///     Batch::new()
+    ///         .add(Update::table("accounts").key([from]).filter(col("balance").ge(amount)).set("balance", col("balance") - amount))
+    ///         .expect(1)
+    ///         .add(Update::table("accounts").key([to]).set("balance", col("balance") + amount))
+    ///         .expect(1)
+    ///         .add(Insert::into("ledger").set("from_id", from).set("to_id", to).set("amount", amount)),
+    /// ).await?;
+    /// ```
+    pub async fn batch(&self, batch: Batch) -> DbResult<Vec<Rows>> {
+        let statements = batch.items.len();
+        if statements == 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.pool.acquire().await?;
+        let answers = conn.conn().call_batch(Request::Batch(batch.items), statements).await?;
+        answers.into_iter().map(rows).collect()
+    }
+
     /// Runs `work`, once, in a transaction that is the database's only
     /// writer while it runs (see `begin`): commits if it returns `Ok`,
-    /// rolls back if it returns `Err` or panics.
+    /// rolls back if it returns `Err` or panics. It becomes the writer
+    /// with its first statement, which is when it begins on the server.
     pub async fn exclusive<T, E, F, Fut>(&self, work: F) -> Result<T, E>
     where
         F: FnOnce(Transaction) -> Fut,
         Fut: Future<Output = Result<T, E>>,
         E: From<DbError>,
     {
-        let tx = self.begin().await?;
+        let tx = self.begin_later(TxnKind::Exclusive).await?;
         match work(tx.clone()).await {
             Ok(value) => {
                 tx.commit().await?;
@@ -308,14 +497,14 @@ impl Client {
     }
 
     /// The same for a transaction that only reads: `work` sees one moment
-    /// of the database.
+    /// of the database, that of its first statement.
     pub async fn read<T, E, F, Fut>(&self, work: F) -> Result<T, E>
     where
         F: FnOnce(Transaction) -> Fut,
         Fut: Future<Output = Result<T, E>>,
         E: From<DbError>,
     {
-        let tx = self.begin_read().await?;
+        let tx = self.begin_later(TxnKind::Read).await?;
         let result = work(tx.clone()).await;
         let _ = tx.rollback().await;
         result
@@ -364,8 +553,16 @@ impl Db for Client {
     }
 }
 
+struct TxState {
+    /// `None` once the transaction has ended.
+    conn: Option<PooledConn>,
+    /// How to begin it, while it has not begun on the server: its first
+    /// statement takes the begin along.
+    pending: Option<(TxnKind, u64)>,
+}
+
 struct TxInner {
-    conn: Mutex<Option<PooledConn>>,
+    state: Mutex<TxState>,
     /// Whether the server has said that the transaction conflicted.
     conflicted: AtomicBool,
 }
@@ -386,6 +583,10 @@ fn ended() -> DbError {
 }
 
 impl Transaction {
+    fn on(conn: PooledConn, pending: Option<(TxnKind, u64)>) -> Transaction {
+        Transaction { inner: Arc::new(TxInner { state: Mutex::new(TxState { conn: Some(conn), pending }), conflicted: AtomicBool::new(false) }) }
+    }
+
     /// Makes the transaction's changes permanent and visible. When this
     /// returns `Ok` they are on disk.
     pub async fn commit(self) -> DbResult<()> {
@@ -397,8 +598,13 @@ impl Transaction {
     }
 
     async fn finish(self, request: Request) -> DbResult<()> {
-        let mut slot = self.inner.conn.lock().await;
-        let mut conn = slot.take().ok_or_else(ended)?;
+        let mut state = self.inner.state.lock().await;
+        let mut conn = state.conn.take().ok_or_else(ended)?;
+        if state.pending.take().is_some() {
+            // It ran no statement, so it never began: there is nothing
+            // on the server to end.
+            return Ok(());
+        }
         // Whatever the answer, the server has ended the transaction: an
         // error on commit means it was rolled back.
         let result = conn.conn().call(request).await;
@@ -441,9 +647,30 @@ impl TxInner {
 
 impl Db for Transaction {
     async fn call(&self, request: Request) -> DbResult<Response> {
-        let mut slot = self.inner.conn.lock().await;
-        let conn = slot.as_mut().ok_or_else(ended)?;
+        let mut state = self.inner.state.lock().await;
+        let TxState { conn, pending } = &mut *state;
+        let conn = conn.as_mut().ok_or_else(ended)?;
+        let begin = pending.take();
+        let request = match begin {
+            // Its first statement: the server begins the transaction and
+            // runs the statement in it. Whatever it answers, the
+            // connection then carries a transaction that has to be
+            // ended (see `Request::BeginWith`).
+            Some((kind, lock_wait_ms)) => {
+                conn.held = true;
+                Request::BeginWith { kind, lock_wait_ms, statement: Box::new(request) }
+            }
+            None => request,
+        };
         let result = conn.conn().call(request).await;
+        if result.is_err() && begin.is_some() && conn.conn().never_left() {
+            // Refused here, before it was sent (it was too large to
+            // send): the server has begun nothing. The transaction is
+            // still to begin, with whatever statement comes next; were
+            // it taken for begun, that statement would go out alone.
+            *pending = begin;
+            conn.held = false;
+        }
         self.inner.note(result)
     }
 }

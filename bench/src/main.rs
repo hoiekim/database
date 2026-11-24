@@ -24,6 +24,11 @@
 //!
 //! What is printed: operations per second and latency for each workload,
 //! then what each server cost: memory, CPU time, and disk.
+//!
+//! Both clients prepare each statement once per connection and send its
+//! values after that. `BENCH_SOCKET=1` has both servers listen on a Unix
+//! domain socket and both clients connect through it, as an application
+//! on the server's own host could.
 
 mod family;
 mod http;
@@ -180,6 +185,12 @@ fn keep() -> bool {
     std::env::var_os("BENCH_KEEP").is_some()
 }
 
+/// `BENCH_SOCKET=1`: both servers are reached through a Unix domain
+/// socket instead of TCP on the loopback address.
+fn through_socket() -> bool {
+    std::env::var_os("BENCH_SOCKET").is_some()
+}
+
 fn bench_dir(name: &str) -> PathBuf {
     let base = std::env::var("BENCH_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     if keep() && name == "ours" {
@@ -193,6 +204,7 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
     if !keep() {
         let _ = std::fs::remove_dir_all(&dir);
     }
+    let socket = through_socket().then(|| dir.with_extension("sock"));
     let port = free_port();
     let cage = limits().cage("ours");
     let child = limits()
@@ -202,6 +214,7 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
         .env("DATABASE_LISTEN", format!("127.0.0.1:{port}"))
         .env("DATABASE_ADMIN_PASSWORD", "bench-admin")
         .env("DATABASE_CACHE_MB", cache_mb.to_string())
+        .envs(socket.iter().map(|socket| ("DATABASE_SOCKET", socket)))
         // BENCH_SERVER_LOG=file keeps what the server says.
         .stderr(match std::env::var_os("BENCH_SERVER_LOG") {
             Some(path) => Stdio::from(std::fs::File::create(path).expect("the server's log file")),
@@ -211,9 +224,12 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
         .unwrap_or_else(|e| panic!("cannot run {}: {e}. Build it first: cargo build --release", binary.display()));
     let server = Server { child: Some(child), dir, as_postgres: false, cage, name: "database" };
     for _ in 0..200 {
-        if let Ok(admin) = Client::connect(Config::new("127.0.0.1", port, "", "bench-admin")).await {
+        let mut admin = Config::new("127.0.0.1", port, "", "bench-admin");
+        admin.socket = socket.clone();
+        if let Ok(admin) = Client::connect(admin).await {
             admin.admin().create_database_if_not_exists("bench", "bench").await.unwrap();
             let mut config = Config::new("127.0.0.1", port, "bench", "bench");
+            config.socket = socket.clone();
             config.pool_size = CONNECTIONS;
             return (server, Client::connect(config).await.unwrap());
         }
@@ -297,12 +313,17 @@ async fn start_postgres() -> Option<(Server, Pg)> {
         &["-D", data.to_str()?, "-p", &port.to_string(), "-c", "listen_addresses=127.0.0.1", "-c", "shared_buffers=64MB", "-c", "unix_socket_directories=", "-c", "max_connections=100"],
         Some(cage.as_ref()),
     )
+    // Its socket, when it is to be reached through one, goes in its own
+    // directory, which the user it runs as owns. (Of a setting given
+    // twice, the last holds.)
+    .args(through_socket().then(|| ["-c".to_string(), format!("unix_socket_directories={}", dir.display())]).into_iter().flatten())
     .stderr(Stdio::null())
     .spawn()
     .ok()?;
     let server = Server { child: Some(child), dir, as_postgres: root, cage, name: "Postgres 16" };
     let user = if root { "postgres".to_string() } else { std::env::var("USER").unwrap_or_else(|_| "postgres".to_string()) };
-    let target = format!("host=127.0.0.1 port={port} user={user} dbname=postgres");
+    let host = if through_socket() { server.dir.to_str()?.to_string() } else { "127.0.0.1".to_string() };
+    let target = format!("host={host} port={port} user={user} dbname=postgres");
     for _ in 0..200 {
         if tokio_postgres::connect(&target, tokio_postgres::NoTls).await.is_ok() {
             let mut clients = Vec::new();
@@ -627,6 +648,76 @@ async fn load_mails(target: &Target) -> Timing {
     .await
 }
 
+/// This server's statements, each prepared once: a connection is sent
+/// one the first time it runs it and its values after that, as the
+/// Postgres client above does with its statements.
+struct Statements {
+    session: Prepared,
+    event: Prepared,
+    /// On the durable table and on the volatile one.
+    upsert: [Prepared; 2],
+    mailbox: Prepared,
+    flag: Prepared,
+    account: Prepared,
+    debit: Prepared,
+    /// The debit of a transfer sent whole: only from an account that is
+    /// not overdrawn, which the transaction tests after reading it.
+    debit_if_funded: Prepared,
+    credit: Prepared,
+    ledger: Prepared,
+    count: Prepared,
+    search: Prepared,
+}
+
+fn statements() -> &'static Statements {
+    static STATEMENTS: std::sync::OnceLock<Statements> = std::sync::OnceLock::new();
+    STATEMENTS.get_or_init(|| {
+        let upsert = |table: &str| {
+            let expired = col("window_start").le(now() - seconds(60));
+            Prepared::new(
+                Insert::into(table)
+                    .columns(["key", "window_start", "hits"])
+                    .values([param(0), now(), val(1)])
+                    .on_conflict_update(PRIMARY)
+                    .update("window_start", when(expired.clone(), now(), col("window_start")))
+                    .update("hits", when(expired, 1, col("hits") + 1))
+                    .returning(["hits"]),
+            )
+        };
+        Statements {
+            session: Prepared::new(
+                Query::table("sessions")
+                    .alias("s")
+                    .index("sessions_token", KeyRange::eq([param(0)]))
+                    .join(Query::table("users").alias("u").key([col("s.user_id")]).filter(col("u.disabled").eq(false)))
+                    .filter(col("s.expires_at").gt(now()))
+                    .select("id", col("s.id"))
+                    .select("username", col("u.username")),
+            ),
+            event: Prepared::new(Insert::into("events").columns(["actor", "action", "detail"]).values([param(0), param(1), param(2)])),
+            upsert: [upsert("throttle"), upsert("throttle_volatile")],
+            mailbox: Prepared::new(Query::table("mails").index("mails_user_date", KeyRange::eq([param(0)])).limit(50).columns(["mail_id", "subject", "date", "from_text", "read", "saved"]).select("preview", col("text").left(200))),
+            flag: Prepared::new(Update::table("mails").key([param(0)]).set("read", true).set("updated", now())),
+            account: Prepared::new(Query::table("accounts").key([param(0)])),
+            debit: Prepared::new(Update::table("accounts").key([param(0)]).set("balance", col("balance") - 1)),
+            debit_if_funded: Prepared::new(Update::table("accounts").key([param(0)]).filter(col("balance").ge(0)).set("balance", col("balance") - 1)),
+            credit: Prepared::new(Update::table("accounts").key([param(0)]).set("balance", col("balance") + 1)),
+            ledger: Prepared::new(Insert::into("ledger").columns(["from_id", "to_id", "amount"]).values([param(0), param(1), val(1)])),
+            count: Prepared::new(Query::table("mails").index("mails_user_date", KeyRange::eq([param(0)])).select("total", count()).select("unread", count().filter(col("read").eq(false)))),
+            search: Prepared::new(Query::table("mails").search("mails_search", [param(0)], param(1)).select("mail_id", col("mail_id")).select("subject", col("subject")).select("rank", Expr::Rank).order_by(Expr::Rank.desc()).limit(20)),
+        }
+    })
+}
+
+/// A transfer in one statement, for Postgres: what the batch is to this
+/// server. The rows are locked in id order first, so that two transfers
+/// never wait on each other; the debit happens only to an account that
+/// is not overdrawn, and the rest only if the debit did.
+const PG_TRANSFER: &str = "WITH held AS (SELECT id FROM accounts WHERE id IN ($1, $2) ORDER BY id FOR UPDATE), \
+     debit AS (UPDATE accounts SET balance = balance - 1 WHERE id = $1 AND balance >= 0 AND (SELECT count(*) FROM held) = 2 RETURNING id), \
+     credit AS (UPDATE accounts SET balance = balance + 1 WHERE id = $2 AND EXISTS (SELECT 1 FROM debit) RETURNING id) \
+     INSERT INTO ledger (from_id, to_id, amount) SELECT $1, $2, 1 WHERE EXISTS (SELECT 1 FROM credit)";
+
 type Workload = (&'static str, usize, u64);
 
 /// The workloads: name, connections, operations.
@@ -647,6 +738,8 @@ const WORKLOADS: &[Workload] = &[
         8,
         6_000,
     ),
+    ("transfer sent whole, as one request (8 connections)", 8, 6_000),
+    ("transfer sent whole, all into one account (8 connections)", 8, 6_000),
 ];
 
 /// The connections and operations of a workload in this run.
@@ -676,19 +769,13 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
         let target = target.clone();
         async move {
             let r = mix(n + 7 * index as u64);
+            let st = statements();
             match index {
                 0 | 1 => {
                     let hash = token(session_of(r));
                     match &target {
                         Target::Ours(db) => {
-                            let q = Query::table("sessions")
-                                .alias("s")
-                                .index("sessions_token", KeyRange::eq([hash]))
-                                .join(Query::table("users").alias("u").key([col("s.user_id")]).filter(col("u.disabled").eq(false)))
-                                .filter(col("s.expires_at").gt(now()))
-                                .select("id", col("s.id"))
-                                .select("username", col("u.username"));
-                            assert_eq!(db.query(q).await.unwrap().len(), 1);
+                            assert_eq!(db.execute(&st.session, [hash]).await.unwrap().len(), 1);
                         }
                         Target::Pg(_) => {
                             let rows = target
@@ -705,7 +792,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     match &target {
                         Target::Ours(db) => {
                             let json: Json = detail.parse().unwrap();
-                            db.insert(Insert::into("events").set("actor", actor).set("action", action).set("detail", json)).await.unwrap();
+                            db.execute(&st.event, [Value::from(actor), Value::from(action), Value::from(json)]).await.unwrap();
                         }
                         Target::Pg(_) => {
                             target.pg(worker).execute("INSERT INTO events (actor, action, detail) VALUES ($1, $2, $3::text::jsonb)", &[&actor, &action, &detail]).await.unwrap();
@@ -717,16 +804,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let key = format!("ip:10.0.{}.{}:login", r % 20, r % 250);
                     match &target {
                         Target::Ours(db) => {
-                            let expired = col("window_start").le(now() - seconds(60));
-                            let upsert = Insert::into(table)
-                                .set("key", key)
-                                .set("window_start", now())
-                                .set("hits", 1)
-                                .on_conflict_update(PRIMARY)
-                                .update("window_start", when(expired.clone(), now(), col("window_start")))
-                                .update("hits", when(expired, 1, col("hits") + 1))
-                                .returning(["hits"]);
-                            db.insert(upsert).await.unwrap();
+                            db.execute(&st.upsert[index - 4], [key]).await.unwrap();
                         }
                         Target::Pg(_) => {
                             let sql = format!(
@@ -742,8 +820,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let user = user_id((r % USERS as u64) as i64);
                     match &target {
                         Target::Ours(db) => {
-                            let q = Query::table("mails").index("mails_user_date", KeyRange::eq([user])).limit(50).columns(["mail_id", "subject", "date", "from_text", "read", "saved"]).select("preview", col("text").left(200));
-                            assert_eq!(db.query(q).await.unwrap().len(), 50);
+                            assert_eq!(db.execute(&st.mailbox, [user]).await.unwrap().len(), 50);
                         }
                         Target::Pg(_) => {
                             let rows = target
@@ -759,8 +836,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let id = mail_id((r % USERS as u64) as i64, ((r >> 8) % MAILS_PER_USER as u64) as i64);
                     match &target {
                         Target::Ours(db) => {
-                            let updated = db.update(Update::table("mails").key([id]).set("read", true).set("updated", now())).await.unwrap();
-                            assert_eq!(updated.affected(), 1);
+                            assert_eq!(db.execute(&st.flag, [id]).await.unwrap().affected(), 1);
                         }
                         Target::Pg(_) => {
                             assert_eq!(target.pg(worker).execute("UPDATE mails SET read = true, updated = now() WHERE mail_id = $1::text::uuid", &[&pg_uuid(id)]).await.unwrap(), 1);
@@ -772,14 +848,14 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     match &target {
                         Target::Ours(db) => {
                             db.transaction(|tx| async move {
-                                let a: Decimal = tx.get("accounts", [from]).await?.unwrap().get("balance")?;
-                                let _b: Decimal = tx.get("accounts", [to]).await?.unwrap().get("balance")?;
+                                let a: Decimal = tx.execute(&st.account, [from]).await?.one()?.get("balance")?;
+                                let _b: Decimal = tx.execute(&st.account, [to]).await?.one()?.get("balance")?;
                                 if a.is_negative() {
                                     return Ok(());
                                 }
-                                tx.update(Update::table("accounts").key([from]).set("balance", col("balance") - 1)).await?;
-                                tx.update(Update::table("accounts").key([to]).set("balance", col("balance") + 1)).await?;
-                                tx.insert(Insert::into("ledger").set("from_id", from).set("to_id", to).set("amount", 1)).await?;
+                                tx.execute(&st.debit, [from]).await?;
+                                tx.execute(&st.credit, [to]).await?;
+                                tx.execute(&st.ledger, [from, to]).await?;
                                 Ok::<_, DbError>(())
                             })
                             .await
@@ -804,12 +880,29 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let user = user_id((r % USERS as u64) as i64);
                     match &target {
                         Target::Ours(db) => {
-                            let q = Query::table("mails").index("mails_user_date", KeyRange::eq([user])).select("total", count()).select("unread", count().filter(col("read").eq(false)));
-                            assert_eq!(db.query_one(q).await.unwrap().get::<i64>("total").unwrap(), MAILS_PER_USER);
+                            assert_eq!(db.execute(&st.count, [user]).await.unwrap().one().unwrap().get::<i64>("total").unwrap(), MAILS_PER_USER);
                         }
                         Target::Pg(_) => {
                             let row = target.pg(worker).query_one("SELECT count(*), count(*) FILTER (WHERE NOT read) FROM mails WHERE user_id = $1::text::uuid", &[&pg_uuid(user)]).await.unwrap();
                             assert_eq!(row.get::<_, i64>(0), MAILS_PER_USER);
+                        }
+                    }
+                }
+                12 | 13 => {
+                    // The same transfers, between the same accounts, as
+                    // one request: see `Client::batch`.
+                    let s = mix(n + 7 * if index == 12 { 8 } else { 11 });
+                    let (from, to) = if index == 12 { ((s % 1000) as i64, ((s >> 10) % 1000) as i64) } else { ((1 + s % 999) as i64, 0) };
+                    if from == to {
+                        return;
+                    }
+                    match &target {
+                        Target::Ours(db) => {
+                            let transfer = Batch::new().add_prepared(&st.debit_if_funded, [from]).expect(1).add_prepared(&st.credit, [to]).expect(1).add_prepared(&st.ledger, [from, to]);
+                            db.batch(transfer).await.unwrap();
+                        }
+                        Target::Pg(_) => {
+                            assert_eq!(target.pg(worker).execute(PG_TRANSFER, &[&from, &to]).await.unwrap(), 1);
                         }
                     }
                 }
@@ -818,8 +911,7 @@ async fn run_workload(target: &Target, index: usize) -> Timing {
                     let words = format!("term{} term{}", r % 5000, (r >> 16) % 5000);
                     match &target {
                         Target::Ours(db) => {
-                            let q = Query::table("mails").search("mails_search", [user], words).select("mail_id", col("mail_id")).select("subject", col("subject")).select("rank", Expr::Rank).order_by(Expr::Rank.desc()).limit(20);
-                            assert!(db.query(q).await.unwrap().len() <= 20);
+                            assert!(db.execute(&st.search, [Value::from(user), Value::from(words)]).await.unwrap().len() <= 20);
                         }
                         Target::Pg(_) => {
                             let rows = target
