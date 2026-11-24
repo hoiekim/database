@@ -145,7 +145,11 @@ docker rm -f drill
   every page is either in use once or free. It holds writers off while
   it runs. Prints a line per table, or the first inconsistency.
 - `database stats`: per database, its version, pages, free pages, log
-  size, and counts of commits and disk reads and writes.
+  size, and counts of commits and disk reads and writes; then how the
+  commits of optimistic transactions went: as they stood, run again
+  beside another's commit, or in conflict (and so run again by their
+  client). Many conflicts mean transactions that read and write the
+  same rows: see `PERFORMANCE.md`.
 - `database checkpoint`: writes everything committed into the data
   files now and empties the logs. Never needed; useful before copying
   the files of a stopped server.

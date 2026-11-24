@@ -97,6 +97,60 @@ struct Mem {
     flushing: PageMap<Page>,
 }
 
+/// Which page numbers may be in `Mem`, for a reader to ask without its
+/// lock: a bit for each number, many numbers to a bit. A reader takes
+/// the lock only for a number whose bit is set, which few of the pages
+/// it reads have: nearly all are in the cache or the file.
+struct MaybeInMem {
+    bits: Vec<AtomicU64>,
+    /// Numbers marked since the bits were last set afresh.
+    marked: AtomicUsize,
+}
+
+/// 65,536 bits: a few hundred pages wait in memory at a time.
+const MAYBE_WORDS: usize = 1024;
+
+impl MaybeInMem {
+    fn new() -> MaybeInMem {
+        MaybeInMem { bits: (0..MAYBE_WORDS).map(|_| AtomicU64::new(0)).collect(), marked: AtomicUsize::new(0) }
+    }
+
+    fn place(id: PageId) -> (usize, u64) {
+        let h = u64::from(id).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48;
+        ((h >> 6) as usize % MAYBE_WORDS, 1 << (h & 63))
+    }
+
+    fn may_hold(&self, id: PageId) -> bool {
+        let (word, bit) = Self::place(id);
+        self.bits[word].load(Ordering::Acquire) & bit != 0
+    }
+
+    /// Marks a page about to be put in `Mem`. Called with its lock held
+    /// for writing.
+    fn mark(&self, id: PageId) {
+        let (word, bit) = Self::place(id);
+        self.bits[word].fetch_or(bit, Ordering::Release);
+        self.marked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sets the bits afresh from what `mem` holds now, dropping the
+    /// marks of pages that have left it. Called with its lock held for
+    /// writing. Each word goes from one value that covers every page in
+    /// `mem` to another that does, so a reader that looks meanwhile is
+    /// never told that a page there is not.
+    fn renew(&self, mem: &Mem) {
+        let mut fresh = vec![0u64; MAYBE_WORDS];
+        for id in mem.dirty.keys().chain(mem.flushing.keys()) {
+            let (word, bit) = Self::place(*id);
+            fresh[word] |= bit;
+        }
+        for (word, bits) in fresh.into_iter().enumerate() {
+            self.bits[word].store(bits, Ordering::Release);
+        }
+        self.marked.store(0, Ordering::Relaxed);
+    }
+}
+
 struct Alloc {
     free: Vec<PageId>,
     next_page: PageId,
@@ -161,6 +215,8 @@ pub struct Store {
     /// only when this says there is something to find: after a
     /// checkpoint, until the next commit, there is not.
     in_mem: AtomicUsize,
+    /// And, when there is, which pages it may be.
+    maybe: MaybeInMem,
     pub disk_reads: AtomicU64,
     pub disk_writes: AtomicU64,
 }
@@ -274,6 +330,7 @@ impl Store {
             failed: AtomicBool::new(false),
             serials: Mutex::new(HashMap::new()),
             in_mem: AtomicUsize::new(0),
+            maybe: MaybeInMem::new(),
             disk_reads: AtomicU64::new(0),
             disk_writes: AtomicU64::new(0),
         }
@@ -291,8 +348,14 @@ impl Store {
     }
 
     /// Notes how many pages `mem` holds, for readers: called with its
-    /// lock held for writing, after every change to it.
-    fn count_mem(&self, mem: &Mem) {
+    /// lock held for writing, after every change to it. `left` says
+    /// that pages have gone from it, which is the time to forget their
+    /// marks; so is having marked many since that was last done, as
+    /// pages also leave one by one when they are freed.
+    fn count_mem(&self, mem: &Mem, left: bool) {
+        if left || self.maybe.marked.load(Ordering::Relaxed) > MAYBE_WORDS * 8 {
+            self.maybe.renew(mem);
+        }
         self.in_mem.store(mem.dirty.len() + mem.flushing.len(), Ordering::Release);
     }
 
@@ -328,7 +391,7 @@ impl Store {
         // A page a reader can reach was put in `mem`, and counted, before
         // the version that holds it was shown to anyone; and it is in
         // the cache or the file before it leaves and is counted out.
-        if self.in_mem.load(Ordering::Acquire) > 0 {
+        if self.in_mem.load(Ordering::Acquire) > 0 && self.maybe.may_hold(id) {
             let mem = self.mem.read().unwrap();
             if let Some(page) = mem.dirty.get(&id).or_else(|| mem.flushing.get(&id)) {
                 return Ok(page.clone());
@@ -451,7 +514,7 @@ impl Store {
             for id in &released {
                 mem.dirty.remove(id);
             }
-            self.count_mem(&mem);
+            self.count_mem(&mem, false);
         }
         for id in &released {
             self.cache.remove(self.id, *id);
@@ -482,7 +545,7 @@ impl Store {
                 mem.dirty.remove(&id);
             }
         }
-        self.count_mem(&mem);
+        self.count_mem(&mem, true);
         Ok(())
     }
 
@@ -595,7 +658,7 @@ impl Store {
         {
             let mut mem = self.mem.write().unwrap();
             mem.flushing.clear();
-            self.count_mem(&mem);
+            self.count_mem(&mem, true);
         }
         {
             let mut alloc = self.alloc.lock().unwrap();
@@ -827,9 +890,10 @@ impl Writer {
                 }
             }
             for (id, page) in self.private.drain() {
+                self.store.maybe.mark(id);
                 mem.dirty.insert(id, page);
             }
-            self.store.count_mem(&mem);
+            self.store.count_mem(&mem, false);
             alloc.free.append(&mut self.recycled);
         }
         self.spilled.clear();

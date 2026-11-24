@@ -29,7 +29,7 @@ let page = db.query(
     Query::table("mails").index("mails_user_date", KeyRange::eq([user_id])).limit(50),
 ).await?;
 
-// Several statements as one: nothing else writes while this runs.
+// Several statements as one, as if nothing else wrote while it ran.
 db.transaction(|tx| async move {
     let unread = tx.query_one(Query::table("mails").index("mails_user_date", KeyRange::eq([user_id]))
         .select("n", count().filter(col("read").eq(false)))).await?.get::<i64>("n")?;
@@ -49,8 +49,10 @@ db.transaction(|tx| async move {
 - **ACID transactions.** A commit is on disk before the client hears of
   it; a crash at any moment loses no acknowledged commit and keeps no
   part of any other. Readers see a snapshot and never wait; one writer
-  runs at a time per database, so there are no row locks, no deadlocks
-  and nothing to retry.
+  commits at a time per database, so there are no row locks and no
+  deadlocks. A transaction runs beside other writers until it commits,
+  and the client runs it again by itself if one of them changed what it
+  had read.
 - **Backup and restore**, in place of `pg_dumpall`: `database dump`
   streams every database from a consistent snapshot while the server
   runs; `database restore` loads one, and changes nothing unless the

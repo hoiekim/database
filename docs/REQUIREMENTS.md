@@ -109,8 +109,8 @@ replication, explicit isolation levels, cursors, `COPY`.
 
 | Id | Requirement | How |
 |---|---|---|
-| R-X1 | Several statements as one: all applied at commit, none after a rollback, a dropped connection or a crash; after a failed statement the transaction cannot commit | `Client::begin`, `Transaction::commit`; dropping one rolls it back |
-| R-X2 | No reader sees a change before it is committed; a writer sees the latest committed state and is not interleaved with another. This is what every `FOR UPDATE`, `FOR SHARE`, transaction-scoped advisory lock and lock-ordering rule in an application exists for | One writer at a time per database; readers on snapshots |
+| R-X1 | Several statements as one: all applied at commit, none after a rollback, a dropped connection or a crash; after a failed statement the transaction cannot commit | `Client::transaction`, `begin`, `Transaction::commit`; dropping one rolls it back |
+| R-X2 | No reader sees a change before it is committed; a transaction's result is as if no other had been interleaved with it. This is what every `FOR UPDATE`, `FOR SHARE`, transaction-scoped advisory lock and lock-ordering rule in an application exists for | One writer at a time per database; readers on snapshots; a transaction that ran beside a writer commits only if it would have answered the same alone, and is otherwise run again |
 | R-X3 | Of several clients racing to do a once-only thing, exactly one succeeds | R-W7 under R-X2 |
 | R-X4 | A commit is visible to every connection as soon as the client hears of it, because one operation may span pooled connections | Published before the reply is sent |
 | R-X5 | A named lock held by a connection across statements, waited for or only tried, freed when the connection drops (migrations, maintenance that one process should do) | `Client::lock`, `try_lock` |

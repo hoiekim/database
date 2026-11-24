@@ -28,15 +28,16 @@ guess, so the same request always costs the same, and the executor is a
 few hundred lines.
 
 There is one writer per database at a time. That removes row locks, lock
-ordering, deadlocks, serialization failures and write-write conflict
-detection: a writing transaction reads the latest committed state and
-nothing can change under it. Every `FOR UPDATE`, `FOR SHARE`, `SKIP
-LOCKED` and advisory transaction lock an application takes reduces to
-"do it in a transaction". The price is that writes do not run in
-parallel within one database. Where each application has its own
-database, write transactions are a handful of statements and commits
-from different connections share a sync, the price is usually small;
-`docs/PERFORMANCE.md` shows where it is not, and what could be done.
+ordering and deadlocks: whatever is written is written by one
+transaction at a time, on the latest committed state. Every `FOR
+UPDATE`, `FOR SHARE`, `SKIP LOCKED` and advisory transaction lock an
+application takes reduces to "do it in a transaction". The price is that
+writes do not run in parallel within one database, and two things keep
+that price small. Commits from different connections share a sync. And a
+transaction of several requests does not hold the writer's place while
+its owner thinks: it runs on a copy beside the writer and takes the
+place only to commit (see "Transactions"). `docs/PERFORMANCE.md` shows
+what is left of the price, and what could be done.
 
 ## Files
 
@@ -91,7 +92,10 @@ Pages are held in three places:
   durable; the next checkpoint writes them.
 - **The cache**: clean pages read from the file, shared by all databases,
   with a byte budget (`DATABASE_CACHE_MB`, 32 by default) and CLOCK
-  eviction.
+  eviction. Every query passes through the same few pages at the top of
+  each tree, so finding a page there takes no lock that another reader
+  could hold: a lookup only reads its part of the cache, and a query
+  keeps the upper pages it has met at hand for its next row.
 
 ### Trees (`btree.rs`)
 
@@ -102,9 +106,12 @@ lowest key`. Cells are at most a quarter of a page, so a split always
 has somewhere to put things. There are no sibling links (copy-on-write
 would have to rewrite them); a cursor keeps the path it came down by.
 
-Keys that arrive in rising order fill their pages: a full rightmost page
-is left as it is and a new one started. A `Builder` writes a whole tree
-from sorted entries, each page once.
+A change to one entry moves the bytes after it within its page, on the
+page itself if the writer made the page in this transaction and on one
+copy otherwise; a page is taken apart into its cells only when it must
+split. Keys that arrive in rising order fill their pages: a full
+rightmost page is left as it is and a new one started. A `Builder`
+writes a whole tree from sorted entries, each page once.
 
 ### Keys (`keys.rs`)
 
@@ -203,6 +210,25 @@ time as current.
   savepoint was taken.
 - `now()` is read once when the transaction begins.
 
+A **fork** is a writer without the write lock: a transaction on a private
+copy of the newest durable catalog, running beside the writer and other
+forks. It reads as a reader does and writes pages nobody else can reach
+(lent to it by the store, and counted free by any checkpoint taken
+meanwhile, since a crash ends the fork). To commit it takes the lock. If
+no commit was made since it began, its copy is the next version as it
+stands. Otherwise it cannot be: its pages build on trees that have moved
+on. The fork is dropped and its owner (the server, which kept the
+requests) runs them again in an ordinary writer, checking that each
+answers as it did the first time. If all do, the transaction's owner was
+told nothing that is no longer true, and committing the second run is
+the same as having run alone at that moment; if one does not, the
+transaction fails with `Conflict`, having changed nothing. So that the
+second run can answer the same, what a statement draws rather than
+derives is kept from the first run and given to the second: random ids,
+and the numbers of `auto_increment` counters, which forks take from a
+count they share so that no two are given the same. The clock is the
+fork's own.
+
 A statement on its own reads the newest commit, which may still be on
 its way to the disk. Whatever it then answers, rows or none or an error
 such as a key already taken, rests on that commit, so the answer waits
@@ -246,8 +272,11 @@ would be hundreds of writes all over a tree for each row. Instead:
 - When pending rows pass 256 KiB they become a **segment**: for each
   word, the list of rows that hold it, as differences between row
   numbers (two or three bytes a row), written as a tree in one pass.
+  Each row's words are stored in order, so the segment is written by
+  merging the rows as they lie, with nothing copied out per word.
 - Segments of a similar size are **merged** four at a time, so each
-  entry is rewritten only as often as the index quadruples.
+  entry is rewritten only as often as the index quadruples. Where no row
+  of theirs has died, their lists are joined as stored, not taken apart.
 - A row deleted or changed is forgotten (its number no longer leads to
   a row) and its entries are dropped when its segment is next merged,
   or at once when half a segment is dead.
@@ -275,16 +304,31 @@ Postgres took 53, and a durable insert 400 µs against 170. So:
   nothing is lost but that moment; and a slow query cannot hold up the
   connections that share the thread.
 - **Writers queue for their turn** at a database without holding a
-  thread: the turn is an asynchronous lock in the server, and the one
-  that has it finds the engine's own write lock free (but for the
-  moments a checkpoint holds it).
+  thread, in a gate the server keeps per database; whoever has the turn
+  finds the engine's own write lock free (but for the moments a
+  checkpoint holds it).
 - A **brief write** (a few rows inserted, rows updated by key, in a
-  small request) runs in place. Anything else, and every delete, for
-  what it may cascade to, runs on a thread of its own.
+  small request) is a job for the gate: it runs where it arrives if the
+  turn is free, and otherwise whoever holds the turn runs the jobs
+  waiting behind it, back to back, before passing it on. Each
+  connection then sends its own answer. Between two small writes
+  nothing waits for a task to be woken, which costs more than the write.
+- Anything else, and every delete not by key, for what it may cascade
+  to, takes the turn itself and runs on a thread of its own.
+- An **optimistic transaction** is a fork (see "Transactions"): its
+  statements run without the turn, and the connection keeps each
+  request with a digest of its answer and what it drew. Its commit is a
+  job like a brief write: attach the fork if nothing was committed
+  beside it, or else run the requests again and compare the digests. A
+  transaction asked for something not worth doing twice (a large
+  statement, a change of schema) is settled the same way early and
+  carries on holding the turn.
 - A **commit** writes its log record, passes the turn on, and then
   waits for the disk without holding a thread: if nobody is syncing the
   log it syncs it itself, once, and otherwise it is told by whoever is.
   Only when its version is on disk and published does the client hear.
+  A commit that put nothing in the log (it changed only tables that
+  need not survive a crash) is published at once.
 
 A connection says which database it wants and proves it with that
 database's password (stored as a salted hash; the admin password comes
@@ -320,5 +364,5 @@ damaged leaves the server as it was.
 | One transaction's changes | 1 GiB of log; a larger one fails at commit and must be made in parts |
 | Text cut into words for a full-text index | the first 1,000,000 bytes; words over 64 bytes are skipped |
 | Nesting of expressions and JSON | 100 levels |
-| Writers | one at a time per database; a transaction of several requests holds its turn between them |
+| Writers | one at a time per database; an optimistic transaction runs beside them and takes its turn only to commit, an exclusive one holds it between its requests |
 | Text order | by bytes (use `lower()` for case-insensitive order) |
