@@ -67,6 +67,12 @@ usually said in SQL are said here. The bytes on the wire are
 - **`db.transaction(work)` may call `work` more than once,** as in the
   Rust client: twice beside other writers, then as the database's only
   writer.
+- **It greets the server with protocol version 2** (`PROTOCOL_VERSION`),
+  so it has none of what later versions added: no prepared statements
+  or `param(n)`, no transaction that begins with its first statement in
+  one request, no batches, and no `explain`. It cannot set `keep_start`
+  on a column, and a table that uses `keep_start` is described to it
+  without the setting.
 
 ## Values
 

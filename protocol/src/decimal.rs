@@ -270,9 +270,12 @@ impl FromStr for Decimal {
         if round_up {
             mantissa = mantissa.checked_add(1).ok_or(ParseDecimalError)?;
         }
-        let mut scale = fraction.len() as i32 - exponent;
+        // In 64 bits: an exponent may be any that 32 bits hold, and the
+        // difference of two of those does not fit in 32.
+        let mut scale = fraction.len() as i64 - i64::from(exponent);
         if scale < 0 {
-            mantissa = pow10((-scale) as u32).and_then(|p| mantissa.checked_mul(p)).ok_or(ParseDecimalError)?;
+            let shift = u32::try_from(-scale).map_err(|_| ParseDecimalError)?;
+            mantissa = pow10(shift).and_then(|p| mantissa.checked_mul(p)).ok_or(ParseDecimalError)?;
             scale = 0;
         }
         let d = Decimal { mantissa: if negative { -mantissa } else { mantissa }, scale: u8::try_from(scale).map_err(|_| ParseDecimalError)? };
@@ -310,6 +313,25 @@ mod tests {
         assert_eq!(least.neg().mantissa(), i128::MAX);
         assert!(Decimal::new(i128::MAX, 0).checked_add(&d("1")).is_none());
         assert!(d("1").checked_div(&d("0")).is_none());
+    }
+
+    #[test]
+    fn an_exponent_at_the_edge_of_32_bits_is_an_error_not_a_panic() {
+        // The scale is the digits after the point less the exponent:
+        // with an exponent this far down, more than 32 bits hold.
+        for text in ["1e-2147483648", "1.5e-2147483647", "0.123e-2147483648", "-7.25E-2147483646", "1e-2147483647", "0e-2147483648"] {
+            assert!(text.parse::<Decimal>().is_err(), "{text}");
+        }
+        // As far up, the number is too large, or is nothing times it.
+        for text in ["1e2147483647", "1.5e2147483647", "0.001e2147483647"] {
+            assert!(text.parse::<Decimal>().is_err(), "{text}");
+        }
+        // An exponent that 32 bits do not hold is not a number at all.
+        assert!("1e2147483648".parse::<Decimal>().is_err() && "1e-2147483649".parse::<Decimal>().is_err());
+        // Exponents of ordinary size read as they did.
+        assert_eq!(d("1e3"), d("1000"));
+        assert_eq!(d("2.5E-4"), d("0.00025"));
+        assert_eq!(d("1e-30").to_string(), "0.000000000000000000000000000001");
     }
 
     #[test]

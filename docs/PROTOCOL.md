@@ -21,10 +21,10 @@ What a request *means* (what a query reads, when a transaction
 conflicts) is in `CLIENT.md`. This file says how each one is written and
 what the server answers.
 
-This document describes protocol version **2**, which is also the
-version the golden vectors are of and the clients in `clients/` speak.
-Numbers set aside for version 3 are marked where they fall; what they
-carry is not described here.
+This document describes protocol version **5**. What a version after 2
+added is marked "from version N" where it is described; "Versions" lists
+it all in one place. The golden vectors are of version 2, and the
+clients in `clients/` greet with version 2.
 
 ## The connection
 
@@ -48,9 +48,10 @@ it accepts no more than 16,384 bytes.
 **One request at a time.** A client sends a request and reads the whole
 of its answer before it sends the next; the server reads the next frame
 only after it has answered the last. Every request gets exactly one
-response frame, with two exceptions: a result may come as several `Rows`
-frames (see "Results in several frames"), and a dump is answered with
-`Chunk` frames until a final `Ok` or `Error`.
+response frame, with three exceptions: a result may come as several
+`Rows` frames (see "Results in several frames"), a dump is answered with
+`Chunk` frames until a final `Ok` or `Error`, and a batch is answered
+with one result for each of its statements (see "Batches").
 
 A request the server cannot decode is answered with an `Error` of code
 `InvalidRequest`, and the connection carries on. An `Error` is always an
@@ -92,7 +93,8 @@ Every choice between kinds is a **tag**: one `u8`, or for a function a
 100 levels deep, counted together: a query is one level, an expression
 inside it the next, a subquery inside that a third. A message nested
 deeper is refused. JSON text is separately held to 100 levels of arrays
-and objects.
+and objects. Requests that hold requests (see "Requests inside
+requests") are counted apart from both.
 
 ## The greeting
 
@@ -104,8 +106,9 @@ begins with `timeout_ms`, here unused, and its tag, 1; then:
 Hello: version u32, database str, password str, client str
 ```
 
-- `version` is the protocol version whose requests the client uses: 2
-  for everything in this document.
+- `version` is the protocol version the client speaks: the newest one
+  whose messages it implements, both those it sends and those it reads
+  (see "Versions"). A server answers versions 2 to 5.
 - `database` is the database to use. It may be empty, with the
   administrator's password, for a connection that only administers.
 - `password` is that database's password, or the administrator's, which
@@ -116,11 +119,12 @@ Hello: version u32, database str, password str, client str
 The server answers with a `Hello` response, and the connection is open:
 
 ```text
-Hello: version u32, server str        the server's own version, and its name: "database 0.1.0"
+Hello: version u32, server str        the server's own version, 5, whatever the client said;
+                                      and its name: "database 0.1.0"
 ```
 
 or with an `Error` response, after which it closes the connection:
-`ProtocolMismatch` if the server does not speak the client's version
+`ProtocolMismatch` if the client's version is below 2 or above 5
 (see "Versions"), `AccessDenied` if the database does not exist or the
 password is wrong (the two are not told apart), `InvalidRequest` if the
 first frame was not a `Hello`.
@@ -156,16 +160,24 @@ tag        u8         which request
 | 16 | Unlock | `name str` | `Ok`, also when the lock was not held |
 | 17 | Now | | `Time`: the server's clock; inside a transaction, the moment it began |
 | 18 | Admin | an admin request, below | see "Administration" |
+| 19 | Prepared | `id varint, statement opt(Request), params list(Value)` | What the statement answers. From version 3; see "Prepared statements" |
+| 20 | BeginWith | `kind u8, lock_wait_ms varint, statement Request` | What the statement answers. From version 3; see "Beginning with a statement" |
+| 21 | Batch | `items list(BatchItem)`, where `BatchItem` is `statement Request, expect opt(varint)` | One result per statement, or one `Error`. From version 3; see "Batches" |
+| 22 | Explain | `statement Request` | `Rows`: one row of four ints. From version 4; see "Explain" |
 
-Tags 19, 20 and 21 are requests of version 3 and are not described
-here. A server that does not know a request's tag answers
-`InvalidRequest`.
+In tags 19 to 22, a field of type `Request` is a request as this table
+gives it, without a `timeout_ms` of its own: its `u8` tag, then its
+fields. The frame's one `timeout_ms` is the deadline of every statement
+in it. Which requests may stand in such a field is in "Requests inside
+requests".
 
-A statement (tags 9 to 14) and a `Begin` need a connection that named
-a database: on a connection that named none they are `InvalidRequest`.
-After the database has been dropped, or replaced by a restore, they
-answer `Unavailable` on every connection that was open before: the
-client reconnects.
+A server that does not know a request's tag answers `InvalidRequest`.
+
+A statement (tags 9 to 14), a `Begin`, and tags 19 to 22 need a
+connection that named a database: on a connection that named none they
+are `InvalidRequest`. After the database has been dropped, or replaced
+by a restore, they answer `Unavailable` on every connection that was
+open before: the client reconnects.
 
 ### Schema changes
 
@@ -182,6 +194,181 @@ client reconnects.
 
 Without the flag, creating what exists is `AlreadyExists` and dropping
 what does not is `NotFound`; with it, both are `Ok` and change nothing.
+
+### Prepared statements
+
+From version 3. A connection keeps statements under numbers its client
+chooses, so that a statement run often is sent and decoded once and
+afterwards named by its number.
+
+```text
+Prepared: id varint, statement opt(Request), params list(Value)
+```
+
+- `id` is the client's number for the statement: any `varint`. Numbers
+  belong to the connection; another connection, or the same client
+  after a reconnect, keeps nothing under them.
+- **With `statement`**, the connection keeps the statement under `id`,
+  in place of any it kept under that number, then runs it. The
+  statement is a `Query`, `Insert`, `Update` or `Delete` (tags 9 to 12);
+  any other request is `InvalidRequest`. So is a statement over 65,536
+  bytes, counted as the payload it would be sent as on its own with a
+  `timeout_ms` of 0 (one byte for `timeout_ms`, then its tag and fields):
+  such a statement is sent as an ordinary request instead. After either
+  refusal nothing has run, and what the connection kept under `id` is
+  still kept. A statement that is kept stays kept whatever its run
+  answers.
+- **Without `statement`**, the connection runs the statement it keeps
+  under `id`. If it keeps none, the answer is `NotPrepared` and nothing
+  has run; the client sends the same request again, this time with the
+  statement.
+- `params` are the values the statement is run with, sent with every
+  run, with the statement or without it. An expression `Param` (tag 22)
+  with number `n` reads `params[n]`, counting from 0 (see "Expressions").
+- The answer is what the statement answers when sent as it is, the
+  `Param`s read as the values given: `Rows`, or an `Error`. A value is
+  checked where it is used, as one written into the statement would be.
+- A connection keeps at most 256 statements, and at most 1,048,576 bytes
+  of them together, each counted as above. To keep one more, it first
+  lets go of the ones used longest ago, a use being any `Prepared` that
+  sent or named it, wherever it stood. The client is not told: it learns
+  of it from a `NotPrepared`.
+- Inside a transaction, the statement runs in the transaction, as any
+  statement does. `NotPrepared` and the two refusals above come before
+  anything runs: they do not abort the transaction.
+
+### Beginning with a statement
+
+From version 3. `BeginWith` is a `Begin` and the transaction's first
+statement in one request.
+
+```text
+BeginWith: kind u8, lock_wait_ms varint, statement Request
+```
+
+- `kind` and `lock_wait_ms` are those of `Begin` (see "Transactions").
+- `statement` is one a transaction runs: a `Savepoint`, `RollbackTo`,
+  `Release`, `Query`, `Insert`, `Update`, `Delete`, `Ddl`, `Describe` or
+  `Now` (tags 6 to 14 and 17); a `Prepared` (tag 19); or an `Explain`
+  (tag 22, see "Explain").
+- The answer is what the statement answers, as if `Begin` had been sent
+  and answered `Ok`, then the statement.
+
+A client takes it that the connection holds a transaction after a
+`BeginWith`, whatever it answered, and ends it with `Commit` or
+`Rollback`. The server makes that so:
+
+- **If the transaction began and the statement ran**, the transaction
+  is as `Begin` and then the statement would leave it. A statement that
+  failed leaves a writing transaction aborted (see "Transactions"); a
+  reading transaction carries on.
+- **If the transaction could not begin, or the statement was refused
+  before it ran**, the answer is that error and the connection holds a
+  dead transaction. The transaction could not begin when the wait for
+  the write lock ran out (`LockTimeout`), the database is gone
+  (`Unavailable`), or the connection named no database
+  (`InvalidRequest`). The statement was refused when it is not one of
+  those listed above, when a `Prepared` with its statement was refused
+  (see "Prepared statements"), or when what is explained is not a
+  query. All are `InvalidRequest`. In a dead transaction every statement
+  answers `TransactionAborted`; `Commit` answers the error the
+  `BeginWith` answered and ends it; `Rollback` answers `Ok` and ends it.
+  So nothing the client sends next runs outside the transaction it was
+  meant for.
+
+Two answers leave no transaction behind, and nothing has begun:
+
+- `NotPrepared`, when the statement is a `Prepared` without its
+  statement, or an `Explain` of one, that the connection does not keep.
+  The client sends the same `BeginWith` again with the statement.
+- `InvalidRequest` on a connection that already holds a transaction.
+  The transaction it holds is as it was.
+
+### Batches
+
+From version 3. A batch is a transaction sent whole: statements that
+need nothing from each other's answers, run in one request.
+
+```text
+Batch:      items list(BatchItem)
+BatchItem:  statement Request, expect opt(varint)
+```
+
+- Each `statement` is a `Query`, `Insert`, `Update` or `Delete`, or a
+  `Prepared` of one. Any other request is `InvalidRequest`, as is a
+  batch of no statements.
+- A batch is a transaction of its own. On a connection that holds a
+  transaction it is `InvalidRequest`, and the transaction it holds is as
+  it was.
+- Before any statement runs, the server finds every `Prepared` of the
+  batch, in order. One it does not keep is `NotPrepared`, and one it
+  refuses is `InvalidRequest`, with nothing run: the client sends the
+  batch again, with the statement. Statements sent with their
+  `Prepared` before that one are kept.
+- The statements run in order. Each sees what those before it did, and
+  nothing else is written between them.
+- **`expect`**, when present, is the number of rows the statement must
+  affect for the batch to go on: its result's `affected`, the rows it
+  inserted, updated or deleted, or for a query the rows it returned.
+  Any other number stops the batch with `Unmet`.
+- **When every statement succeeds**, the answer is each statement's
+  result, in order: for each, one or more `Rows` frames, the last with
+  `more` clear (see "Results in several frames"). A client reads as many
+  results as it sent statements. A batch that wrote is on disk when it
+  is answered.
+- **When a statement fails, or its `expect` is not met**, the batch
+  stops there, nothing of it takes effect, and the answer is one `Error`
+  frame: the statement's own error, or `Unmet`. The message names the
+  statement by its place in the batch, counting from 1.
+- A batch of queries alone reads one moment of the database and holds
+  no writer up. A batch that writes waits for the write lock as a lone
+  write does (see "Time limits"), then holds it until it is answered.
+
+### Explain
+
+From version 4. `Explain` runs a query and answers with what it read in
+place of its rows.
+
+```text
+Explain: statement Request
+```
+
+- `statement` is a `Query`, or a `Prepared` whose statement is a query.
+  Any other request is `InvalidRequest`, and nothing runs; a `Prepared`
+  sent with an insert, an update or a delete as its statement keeps that
+  statement all the same. A `Prepared` without its statement that the
+  connection does not keep is `NotPrepared`.
+- The query runs as it would if it were sent alone: in the connection's
+  transaction if it holds one, else on its own. A query that fails
+  answers with its error, and in a transaction counts as a failed
+  statement.
+- The answer is one `Rows` frame: `more` false, `affected` 1, no
+  `total`, the columns `index_entries`, `rows_read`, `rows_returned` and
+  `micros`, and one row of four ints:
+
+| Column | |
+|---|---|
+| `index_entries` | Entries read from indexes: those of an ordered index's range, the children a tree walk found, a search's hits |
+| `rows_read` | Rows read from tables: in key order, through an index, by a join or a subquery |
+| `rows_returned` | The rows the query returned: its `affected` |
+| `micros` | Microseconds from when the server began on the request to when the query finished. For a `BeginWith`, the wait to begin is included |
+
+### Requests inside requests
+
+Requests 19 to 22 hold requests. A decoder takes at most three levels of
+requests inside the frame's own, and refuses a frame that holds more as
+`InvalidRequest`. Which requests the server runs where:
+
+| In | May stand |
+|---|---|
+| `Prepared`'s `statement` | `Query`, `Insert`, `Update`, `Delete` |
+| `BeginWith`'s `statement` | a statement (tags 6 to 14 and 17), `Prepared`, `Explain` |
+| `BatchItem`'s `statement` | `Query`, `Insert`, `Update`, `Delete`, `Prepared` |
+| `Explain`'s `statement` | `Query`, `Prepared` |
+
+The deepest that runs is a `BeginWith` of an `Explain` of a `Prepared`
+with its `Query`: three levels inside the frame's own. A request that
+decodes but stands where it may not is `InvalidRequest`.
 
 ## Responses
 
@@ -249,8 +436,8 @@ errors the name of what was broken and its table.
 | 20 | Arithmetic | Arithmetic that has no answer: division by zero, overflow |
 | 21 | OutOfRange | A number too large for its column |
 | 22 | Conflict | An optimistic transaction was told something that a commit made beside it has since changed. Nothing of it took effect |
-
-Codes 23 and 24 are errors of version 3 and are not described here.
+| 23 | NotPrepared | From version 3. A `Prepared` without its statement named a number the connection does not keep. Nothing was run: send it again with the statement (see "Prepared statements") |
+| 24 | Unmet | From version 3. A statement of a batch did not affect the number of rows its `expect` gave. Nothing of the batch took effect (see "Batches") |
 
 A client reads a code it does not know as `Internal` (19), which is
 what the Rust decoder does: a newer server's new code is then an error
@@ -342,8 +529,13 @@ they are written, which is not always the order of the Rust struct.
 | 19 | List | `list(Expr)` | A list of the items' values. Lists compare item by item, as SQL row values do |
 | 20 | Agg | `func u8, distinct bool, arg opt(Expr), filter opt(Expr)` | An aggregate, over the rows where `filter` is true |
 | 21 | Subquery | `kind u8, Query` | A query inside an expression |
+| 22 | Param | `n varint` | From version 3. The value `params[n]` of the `Prepared` request the statement is run by, counting from 0 (see "Prepared statements"). `n` must fit 32 bits |
 
-Tag 22 is an expression of version 3 and is not described here.
+A `Param` is evaluated as any expression is: one whose number is past
+the end of `params`, or in a statement not run by a `Prepared` (which
+has no `params`), is `InvalidRequest` when it is evaluated. A column's
+default, a check and an index cannot hold one: the definition is
+`InvalidRequest`.
 
 Comparison operators (`Cmp`):
 
@@ -530,11 +722,13 @@ TableDef:
   checks        list(Check)
   volatile      bool                  rows need not survive a restart
 
-ColumnDef:   name str, type Type, nullable bool, default opt(Expr), auto_increment bool
-             from version 5, the last field is flags u8 in place of auto_increment:
-               bit 0  auto_increment
-               bit 1  keep_start varint follows: bytes of a large value's start kept in its row
-             a server sends a column with bit 1 set only to a client that said 5 or more
+ColumnDef:
+  name         str
+  type         Type
+  nullable     bool
+  default      opt(Expr)
+  flags        u8                     bit 0: auto_increment; bit 1: keep_start follows. No other bit
+  keep_start   varint                 only when bit 1 is set: 1 to 1,024
 
 IndexDef:
   name     str
@@ -553,6 +747,16 @@ Check:       name str, expr Expr
 - An index key is a column (an `Expr` of tag 2) or any expression over
   the row. With `each`, the expression gives a list and the row is
   indexed once under each distinct item.
+- A column's `flags` byte is, from version 5, what was the bool
+  `auto_increment` in versions 2 to 4. A column without `keep_start` has
+  `flags` 0 or 1, the same byte in every version. A decoder refuses a
+  byte with any other bit set, and a `keep_start` of 0 or of more than
+  32 bits.
+- `keep_start` is how many bytes of the start of a large value the
+  column keeps in its row (`CLIENT.md`, "Tables"). It is for a text or
+  bytes column; on any other type, or above 1,024, the definition is
+  `InvalidRequest`. A server describes a column's `keep_start` only to a
+  client that greeted with version 5 or more (see "Versions").
 - `on_delete` is 0 restrict, 1 cascade, 2 set NULL.
 - `ref_columns` may be sent empty, for the parent's primary key. The
   server fills it in: `Describe` returns the parent's key columns there.
@@ -570,9 +774,12 @@ Outside a transaction, every statement is a transaction of its own: it
 takes effect whole or not at all, and is on disk when its answer
 arrives.
 
-`Begin` opens a transaction on the connection, of one of three kinds.
-The connection carries at most one; a `Begin` inside one is
-`InvalidRequest`.
+`Begin` opens a transaction on the connection, of one of three kinds;
+`BeginWith` opens one and runs its first statement (see "Beginning with
+a statement"). The connection carries at most one; a `Begin`, a
+`BeginWith` or a `Batch` inside one is `InvalidRequest`, and leaves the
+transaction as it was. A `Batch` is a transaction of its own (see
+"Batches").
 
 | Kind | | |
 |---:|---|---|
@@ -624,8 +831,10 @@ talk to the database.
   that runs past it is stopped and undone, and answers `Timeout`; the
   connection carries on. The Rust client sends 60,000 unless configured
   otherwise. 0 asks for no limit.
-- A lone write waits for the database's write lock for the server's own
-  limit (30 seconds unless configured), then answers `LockTimeout`.
+- A lone write, and a batch that writes, waits for the database's write
+  lock for the server's own limit (30 seconds unless configured), then
+  answers `LockTimeout`. A batch's `timeout_ms` is one deadline for all
+  its statements together.
 - **A client waits a little longer than it asked the server to:** the
   server enforces the deadline and answers; the client's own limit
   (statement timeout, plus lock wait, plus 10 seconds, in the Rust
@@ -634,8 +843,8 @@ talk to the database.
 - **Idle transactions.** A connection that holds an exclusive
   transaction open and sends nothing for 60 seconds is closed, and the
   transaction rolled back: it was holding every other writer up. One
-  that holds a reading or an optimistic transaction is closed after ten
-  minutes; an optimistic one that has become the database's writer (a
+  that holds a reading, an optimistic or a dead transaction (see
+  "Beginning with a statement") is closed after ten minutes; an optimistic one that has become the database's writer (a
   large statement makes it so, see `CLIENT.md`) counts as exclusive. A
   connection outside any transaction may idle for ever.
 
@@ -716,6 +925,9 @@ A pool that keeps connections for reuse should also:
 | The greeting | within 10 seconds of connecting |
 | Nesting of expressions, queries, list values and list types | 100 levels |
 | Nesting of JSON | 100 levels |
+| Nesting of requests (tags 19 to 22) | 3 levels inside the frame's own |
+| Prepared statements a connection keeps | 256, of at most 65,536 bytes each and 1,048,576 bytes together |
+| `keep_start` | 1 to 1,024 bytes, on a text or bytes column |
 | A decimal | a 127-bit mantissa and its sign; at most 30 digits after the point |
 | A `varint` | 64 bits, in at most 10 bytes |
 | A key (primary or index, all parts together) | 1,900 bytes, else `KeyTooLong` |
@@ -726,15 +938,31 @@ A pool that keeps connections for reuse should also:
 The greeting carries a protocol version, and the answer to it is where
 a client and a server that cannot talk find out.
 
-**What the server does today.** It speaks one version, 2, and refuses a
-`Hello` that names any other with `ProtocolMismatch`, then closes the
-connection.
+**What each version added.** Each version adds to the one before and
+takes nothing away:
+
+| Version | Added |
+|---:|---|
+| 2 | Everything not marked otherwise |
+| 3 | Requests `Prepared` (19), `BeginWith` (20) and `Batch` (21); the expression `Param` (22); the error codes `NotPrepared` (23) and `Unmet` (24) |
+| 4 | The request `Explain` (22) |
+| 5 | A column's last byte is `flags`, which may be followed by `keep_start` (see "Definitions") |
+
+**What the server does today.** It speaks versions 2 to 5. It answers a
+`Hello` that names a version in that range with its own, 5, and refuses
+any other with `ProtocolMismatch`, then closes the connection. It
+answers every request it can decode in the same way whatever version
+the client greeted with, with one difference: to a client that greeted
+with less than 5, it describes its tables without `keep_start`.
 
 **The rule a client is written to.** It holds for this server and for
 those after it:
 
-- A client sends the version whose requests it uses: one that uses only
-  what this document describes sends 2, whatever versions exist by then.
+- A client sends the newest version whose messages it implements, both
+  those it sends and those it reads. One that implements only version 2
+  sends 2, whatever versions exist by then; one that sends `Prepared`
+  sends at least 3, one that sends `Explain` at least 4, and one that
+  reads `keep_start` 5.
 - A server answers `ProtocolMismatch` to a version it does not speak,
   in its answer to `Hello`, and to nothing later. A server may speak
   several versions; a client must not assume which, and must be ready
@@ -743,18 +971,10 @@ those after it:
   client does not need it to equal the one it sent.
 - Within a version, the meaning of a frame does not change.
 
-**What is set aside.** Version 3 adds to version 2 and takes nothing
-away. These numbers are its own, described where it is described, and
-are not to be used for anything else:
-
-| | Numbers |
-|---|---|
-| Requests | 19, 20, 21 |
-| Expressions | 22 |
-| Error codes | 23, 24 |
-
-A version 2 client never sends the first two, and reads the third as it
-reads any code it does not know: as `Internal`.
+**Versions 3 and 4** add requests, an expression and error codes and
+change nothing a version 2 client sends or reads. The two error codes
+come only in answer to the requests of version 3, so a client that does
+not send those never meets them.
 
 **Version 5** changes one thing a client reads: the last byte of a
 `ColumnDef` is a byte of flags, bit 0 `auto_increment` and bit 1 a
@@ -762,8 +982,9 @@ reads any code it does not know: as `Internal`.
 `keep_start` is the same bytes in every version. A server describes its
 tables to a client that said less than 5 with `keep_start` left out, so
 such a client never meets the bit; the setting changes where a server
-stores values, not what any request answers. A client of any version
-may send a column with `keep_start` in `CreateTable` or `AddColumn`.
+stores values, not what any request answers. The server takes a column
+with `keep_start` in `CreateTable` or `AddColumn` from a client of any
+version.
 
 **What a client does with what it does not know:**
 
@@ -797,7 +1018,9 @@ In a description every choice between kinds is an object with a `kind`;
 of its bits, most significant first, so that NaN and the infinities can
 be written. The vectors cover every request and response, every kind of
 value at the edges of its range, every expression, operator, function
-and aggregate, every way into a table, and every error code.
+and aggregate, every way into a table, and every error code, all of
+version 2. What versions 3 to 5 added has no vectors; "Requests of
+versions 3 and 4, byte by byte" below gives an example of each request.
 
 A client's tests should at least:
 
@@ -857,4 +1080,109 @@ An answer of one row, `id` 1 and `name` "ann", is `response.rows.one`:
 01                    one row
 03 02                   int, zigzag 2 = 1
 06 03 61 6e 6e          text, "ann"
+```
+
+## Requests of versions 3 and 4, byte by byte
+
+Each of these has a `timeout_ms` of 1,000 (`e8 07`). The statement they
+share is `Query::table("t").key([param(0)])`, the row of `t` whose key
+is the first value given:
+
+```text
+09                    Query
+01 74                 table: "t"
+00                    alias: none
+01                    access: Primary
+00                      reverse: false
+01                      one range
+01 01                     lower: Included, one value
+16 00                       Expr Param, n 0
+01 01                     upper: Included, one value
+16 00                       the same
+00                        nulls: false
+00 00 00 00 00 00     joins, unnest, filter, group_by, having, order_by: none
+00 00 00 00 00        offset 0, limit none, select every column, distinct false, with_total false
+```
+
+Run as statement 7 with the value 5, sent with the statement the first
+time:
+
+```text
+e8 07                 timeout_ms: 1000
+13                    Prepared
+07                    id: 7
+01                    statement: present
+09 01 74 00 01 ...      the query above, 27 bytes, with no timeout_ms of its own
+01                    params: one value
+03 0a                   int, zigzag 10 = 5
+```
+
+and by its number alone after that:
+
+```text
+e8 07                 timeout_ms: 1000
+13                    Prepared
+07                    id: 7
+00                    statement: none
+01                    params: one value
+03 0a                   int 5
+```
+
+An optimistic transaction that begins with it, waiting up to 5 seconds
+for its turn to commit:
+
+```text
+e8 07                 timeout_ms: 1000
+14                    BeginWith
+02                    kind: optimistic
+88 27                 lock_wait_ms: 5000
+13 07 00 01 03 0a     statement: Prepared 7, no statement, params [5]
+```
+
+A batch that takes 1 from column `a` of the row with key 1, which must
+change exactly one row, then runs statement 7:
+
+```text
+e8 07                 timeout_ms: 1000
+15                    Batch
+02                    two statements
+0b                      Update
+01 74 00 01 00 01         rows: table "t", no alias, Primary, not reversed, one range
+01 01 01 03 02              lower: Included, Value int 1
+01 01 01 03 02              upper: the same
+00                          nulls: false
+00 00 00 00 00 00 00 00 00 00 00   the rest of the query, as above
+01                        set: one assignment
+01 61                       column "a"
+0e 01                       Arith subtract
+02 00 01 61                   Column, no table, "a"
+01 03 02                      Value int 1
+00                        returning: none
+01 01                   expect: present, 1
+13 07 00 01 03 0a       Prepared 7, no statement, params [5]
+00                      expect: none
+```
+
+Statement 7 explained, then its answer: 50 index entries and 50 rows
+read, 50 rows returned, in 240 microseconds:
+
+```text
+e8 07                 timeout_ms: 1000
+16                    Explain
+13 07 00 01 03 0a     statement: Prepared 7, no statement, params [5]
+```
+
+```text
+03                    Rows
+00                    more: false
+04                    four columns
+0d 69 6e 64 65 78 5f 65 6e 74 72 69 65 73     "index_entries"
+09 72 6f 77 73 5f 72 65 61 64                 "rows_read"
+0d 72 6f 77 73 5f 72 65 74 75 72 6e 65 64     "rows_returned"
+06 6d 69 63 72 6f 73                          "micros"
+01                    affected: 1
+00                    total: none
+01                    one row
+03 64 03 64 03 64       int 50, int 50, int 50
+03 e0 03                int, zigzag 480 = 240
 ```

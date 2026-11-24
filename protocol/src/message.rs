@@ -102,9 +102,12 @@ pub enum Request {
     /// request: answered as the statement is.
     ///
     /// Whatever the answer, a transaction is open afterwards and has to
-    /// be ended. If it could not begin, or the statement was refused or
-    /// failed, it is one that can only be rolled back, so that nothing
-    /// sent after it runs outside the transaction it was meant for.
+    /// be ended. If it could not begin, or the statement was refused
+    /// before it began, it is one that can only be rolled back, so that
+    /// nothing sent after it runs outside the transaction it was meant
+    /// for. A statement that fails once the transaction has begun leaves
+    /// it as a failed statement leaves any transaction: one that writes
+    /// can only be rolled back, one that reads carries on.
     /// There are two exceptions, both answered before anything begins:
     /// `NotPrepared`, after which the same request is sent again with the
     /// statement; and a connection that already has a transaction open,

@@ -183,7 +183,7 @@ function civilFromDays(days: number): [year: number, month: number, day: number]
   return [yoe + era * 400 + (month <= 2 ? 1 : 0), month, day];
 }
 
-/** `YYYY-MM-DD` as Rust's `{:04}` writes the year: `-0007`, `10000`. */
+/** `YYYY-MM-DD` as Rust's `{:04}` writes the year: `-007`, `10000`. */
 function formatDay(days: number): string {
   const [y, m, d] = civilFromDays(days);
   const year = y < 0 ? `-${String(-y).padStart(3, "0")}` : String(y).padStart(4, "0");
