@@ -331,12 +331,110 @@ through the network stack, which a client on the server's own host
 shortens with the Unix socket. A durable insert on one
 connection is the disk's sync and little else on both servers.
 
+## The SQLite family
+
+`bench/` runs six of the workloads against embedded SQLite, rqlite and
+libSQL's server as well: the session lookup on 1 and 16 connections, the
+durable insert on 1 and 16, and the two transfers. The data and the row
+picks are those of the other targets (20 users, 20,000 sessions, 1,000
+accounts; the same `mix`, `token` and `user_id`). The other workloads
+are not run against them: the mails and their search were not set up
+three more ways.
+
+How each is run, and what that does to a comparison:
+
+- **Embedded SQLite** (`--only sqlite`; `rusqlite` 0.32 with the SQLite
+  it bundles) is opened in the benchmark's own process: no server and
+  no socket, so a read costs no round trip at all, and it has no
+  process whose memory and CPU could be measured apart. WAL mode with
+  `synchronous=FULL`, so that every commit is synced before it returns
+  (and `fullfsync=ON`, which on macOS makes that the sync this server
+  makes, and elsewhere changes nothing). Statements are prepared once
+  per connection; a writing transaction begins with `BEGIN IMMEDIATE`.
+  A worker is a thread. Readers get a connection each. Writers are
+  measured two ways, a column each:
+  - **one write connection** behind a lock, which is how an application
+    usually runs embedded SQLite from many threads;
+  - **a connection each**, with a busy timeout of 10 s. Writers then
+    wait for each other inside SQLite, and one that waits out the
+    timeout gives up; the report counts those. This column runs a
+    quarter of each workload's operations, because on a disk with a
+    slow sync it takes minutes over them, and only the workloads where
+    several connections write.
+- **rqlite** (`--only rqlite`) is one node, `rqlited -node-id 1`, with
+  its defaults: every write is an entry in its Raft log, which is
+  synced before the answer, while its SQLite file is written with
+  `synchronous=OFF`, and foreign keys are not enforced. Reads ask with
+  `level=none`: the node answers from its own state without asking
+  whether it still leads, as every other target answers. rqlite has no
+  transaction that spans requests, so its transfer is sent whole as one
+  request, with the balance check folded into the first `UPDATE`: one
+  round trip, where this server's transfer is seven and has its
+  statements run twice. That is the batch request listed under 4 above.
+- **libSQL's server** (`--only libsql`) is `sqld -d <dir>`, asked
+  through Hrana over HTTP. Its transfer is an interactive transaction
+  in two requests: `BEGIN IMMEDIATE` and the reads, then the writes and
+  `COMMIT`. When the comparison was first made (version 0.24.32) it ran
+  SQLite with `synchronous=NORMAL` and refused `PRAGMA synchronous`
+  from clients: a commit was then not synced on its own, and its
+  durable insert is not the same work as the others'.
+
+Both servers are reached over HTTP with JSON, on one connection kept
+open per worker. Keys that are bytes elsewhere travel as hex text,
+because rqlite's JSON parameters carry no bytes. A request that gets no
+answer within `BENCH_HTTP_TIMEOUT` seconds (120) ends that target's run:
+the report says which workload did not complete, and keeps what came
+before.
+
+The embedded SQLite and rqlite targets have been run from this
+repository, on Linux (rqlite 10.7.4). The libSQL target has not: it was
+written from the program the comparison was first made with, and only
+its requests have been tested, not their answers from a real `sqld`.
+
+## At the small end, and the large
+
+Where CPU per request decides throughput, on one vCPU with a small
+memory limit, the benchmark can put each server it starts under those
+limits (Linux only):
+
+```sh
+BENCH_SERVER_CPUS=1 BENCH_SERVER_MEMORY_MB=256 ./target/release/bench
+```
+
+- `BENCH_SERVER_CPUS=n` pins each server, with `taskset`, to the first
+  `n` CPUs the benchmark may use, and moves the benchmark's own client
+  to the others, so that the client's work is not taken out of the
+  server's share. (An ordinary run has both on the same cores.)
+- `BENCH_SERVER_MEMORY_MB=m` starts each server in a memory cgroup of
+  its own, with that limit and no swap (`memory.max` on cgroup v2,
+  `memory.limit_in_bytes` on v1), and removes it afterwards. That is
+  what a container's memory limit is: the server's own memory and the
+  file cache of its files both count, the kernel drops cache to stay
+  under, and a server whose own memory goes over is killed. The report
+  says so if it happens. Making a cgroup takes root on the host, or a
+  container that may write to its cgroups. Where none can be made, the
+  run says that the limit is **not enforced** and goes on without it.
+- The report's **most memory held during the run** is the server's own
+  high-water mark (`VmHWM`) for a server that is one process, and for
+  Postgres the largest of two samples a second of all its processes,
+  shared pages counted once. With no enforced limit it is the figure to
+  read against the limit.
+
+Embedded SQLite runs inside the benchmark, on the client's CPUs and
+under no memory limit.
+
+The large end needs nothing set: run it on a machine with 16 cores or
+more. `BENCH_SERVER_CPUS=16` there keeps the client off the server's
+cores. One writer per database is expected to cost more there on the
+workloads that write.
+
 ## Running it
 
 ```sh
 cargo build --release
-./target/release/bench                 # both servers, if Postgres is installed
+./target/release/bench                 # this server and Postgres, if Postgres is installed
 ./target/release/bench --only ours
+./target/release/bench --only ours,postgres   # --only takes several, or all
 BENCH_DETAILS=1 ./target/release/bench                   # also: each server's own counts
 BENCH_WORKLOADS="transfer,upsert" ./target/release/bench # only the workloads named so
 BENCH_REPEAT="mailbox:30" BENCH_WORKLOADS=mailbox ./target/release/bench --only ours   # one workload, longer, to profile
@@ -344,7 +442,21 @@ BENCH_KEEP=1 BENCH_WORKLOADS=mailbox ./target/release/bench --only ours   # keep
 BENCH_CONNECTIONS=1 BENCH_WORKLOADS=upsert ./target/release/bench --only ours
 BENCH_SOCKET=1 ./target/release/bench  # both servers through Unix domain sockets, not TCP
 BENCH_SERVER_LOG=server.log ./target/release/bench --only ours
+BENCH_SERVER_CPUS=1 BENCH_SERVER_MEMORY_MB=256 ./target/release/bench   # each server on one CPU, under 256 MB
 ```
 
 `database stats` (and `BENCH_DETAILS=1`) says how the commits of
 optimistic transactions went: as they stood, run again, or in conflict.
+
+The SQLite family, on the workloads it runs:
+
+```sh
+cargo build --release -p database-server -p database-bench --features database-bench/sqlite
+BENCH_WORKLOADS="session,durable insert,transfer" ./target/release/bench --only ours,sqlite,rqlite,libsql
+```
+
+Embedded SQLite is compiled in only with the `sqlite` feature, which an
+ordinary build leaves off because it compiles SQLite's C source.
+`rqlited` and `sqld` are found on the `PATH`, or where `BENCH_RQLITED`
+and `BENCH_SQLD` say; a target that is not installed is skipped with a
+line saying so, as Postgres is.
