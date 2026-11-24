@@ -20,11 +20,15 @@ pub struct EngineOptions {
     /// Memory for cached pages, shared by all databases.
     pub cache_bytes: usize,
     pub db: Options,
+    /// Whether the engine's thread starts with full-text segments left
+    /// unmerged, as `Engine::pause_merging(true)` leaves them: for tests
+    /// that merge by hand, at moments of their choosing, from the start.
+    pub merging_paused: bool,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
-        EngineOptions { cache_bytes: 32 * 1024 * 1024, db: Options::default() }
+        EngineOptions { cache_bytes: 32 * 1024 * 1024, db: Options::default(), merging_paused: false }
     }
 }
 
@@ -66,9 +70,13 @@ struct Inner {
 impl Inner {
     /// Takes a database into the engine's care: the merging of its
     /// full-text segments is left to the engine's thread from here on.
+    /// The thread looks at it once now: segments left due when the
+    /// engine last stopped, with a merge given up on or not yet begun,
+    /// are merged without waiting for a write to make more due.
     fn adopt(&self, db: Arc<Database>) -> Arc<Database> {
         let due = self.due.clone();
         db.merge_beside(Box::new(move || due.say()));
+        self.due.say();
         db
     }
 }
@@ -107,6 +115,7 @@ impl Engine {
     /// Opens on any file system: tests pass one that can simulate a crash.
     pub fn open_with(vfs: Arc<dyn Vfs>, dir: &Path, options: EngineOptions, lock: Option<std::fs::File>) -> Result<Engine> {
         vfs.create_dir_all(dir)?;
+        let paused = options.merging_paused;
         let inner = Arc::new(Inner {
             vfs: vfs.clone(),
             dir: dir.to_path_buf(),
@@ -116,7 +125,7 @@ impl Engine {
             next_store: AtomicU32::new(1),
             stopping: Mutex::new(false),
             wake: Condvar::new(),
-            due: Arc::default(),
+            due: Arc::new(Due { paused: AtomicBool::new(paused), ..Due::default() }),
             _lock: lock,
         });
         // What a restore was building when the server stopped is no use.

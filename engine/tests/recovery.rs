@@ -30,17 +30,16 @@ fn options() -> EngineOptions {
     // segments of a handful of rows, so that they are made, merged and
     // cleaned of dead rows all the time.
     database_engine::fts::set_pending_bytes(400);
-    EngineOptions { cache_bytes: 64 * 8192, db: Options { sync: true, limits: Limits { max_dirty: 24, max_private: 24 }, checkpoint_bytes: 64 * 1024 } }
+    // The engine's thread merges nothing on its own: see `open`.
+    EngineOptions { cache_bytes: 64 * 8192, db: Options { sync: true, limits: Limits { max_dirty: 24, max_private: 24 }, checkpoint_bytes: 64 * 1024 }, merging_paused: true }
 }
 
 fn open(vfs: &MemVfs) -> Engine {
-    let engine = Engine::open_with(Arc::new(vfs.clone()), Path::new(DIR), options(), None).expect("the engine opens");
     // Writers leave the merging of full-text segments to be done beside
     // them. Here it is done by hand (`Merger`), at moments that a seed
-    // decides, so that a run can be had again; one test lets the
-    // engine's own thread do it.
-    engine.pause_merging(true);
-    engine
+    // decides, so that a run can be had again: the engine's own thread
+    // starts paused (`options`), and one test lets it merge.
+    Engine::open_with(Arc::new(vfs.clone()), Path::new(DIR), options(), None).expect("the engine opens")
 }
 
 /// Merges full-text segments beside the workload, now and then: between
@@ -632,6 +631,42 @@ fn a_merge_beside_is_dropped_if_its_segments_change_meanwhile() {
     drop(engine);
     let engine = open(&vfs);
     verify(&engine.database("test").unwrap(), &model);
+}
+
+#[test]
+fn segments_left_due_at_a_stop_are_merged_after_the_next_start() {
+    // Segments made due, and nobody merging them, when the engine stops.
+    let vfs = MemVfs::new();
+    let engine = open(&vfs);
+    let db = create(&engine);
+    let mut model = Model::new();
+    for id in 0..12 {
+        let item = Item { owner: 0, name: format!("n{id}"), body: (0..40).map(|k| format!("u{id}x{k}")).collect::<Vec<_>>().join(" "), tags: Vec::new() };
+        let mut txn = db.begin_write(WAIT, false).unwrap();
+        txn.insert(&insert_of(id, &item), None).unwrap();
+        txn.commit().unwrap();
+        model.insert(id, item);
+    }
+    // Checkpointed, so that nothing is replayed: a replayed log merges as
+    // it goes, as writers did before merges were made beside them.
+    db.checkpoint().unwrap();
+    drop(db);
+    drop(engine);
+    // Started again with its thread merging, and nothing written: the
+    // thread looks at each database once, and merges what is due.
+    let engine = Engine::open_with(Arc::new(vfs.clone()), Path::new(DIR), EngineOptions { merging_paused: false, ..options() }, None).unwrap();
+    let db = engine.database("test").unwrap();
+    let made = || db.merges_beside.load(std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..500 {
+        if made() > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(made() > 0, "segments due before the stop were merged after the start");
+    engine.pause_merging(true);
+    assert_eq!(found(&db, "u3x7"), [3]);
+    verify(&db, &model);
 }
 
 #[test]
