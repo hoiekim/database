@@ -215,15 +215,71 @@ every pending row, a list per word, a buffer of a kilobyte per word. A
 segment is now written by merging the rows' stored words as they lie,
 segments whose rows are all alive are merged by joining their lists as
 stored, and the tree builder fills pages in place. The load went from 6
-statements a second to 10. Sampled now, 29% of the server's time is
-merging segments, 10% building them, and a quarter writing pages and
-syncing on other threads.
+statements a second to 10.
 
-| Option | What it changes | Expected effect | Cost |
+Since then, three things were done:
+
+- **Text is cut into words before the turn**, on the connection's own
+  thread (`session/load.rs`), into terms sorted and packed in one
+  buffer, and a row's words are kept in the form the index stores them.
+  The words are used only for a row whose text is the very text they
+  were cut from.
+- **Segments are merged beside the writer**, by a thread of the
+  engine's, and put in place under the write lock only if the segments
+  read are as they were. A writer still merges a mostly dead segment,
+  and the cheapest run once 40 segments have gathered.
+- **Large requests share 4 MB of memory**, and what each held is given
+  back to the system as it is answered (`session/budget.rs`).
+
+Counted by `valgrind --tool=callgrind` over a tenth of the load
+(`BENCH_LOAD_PART=10`: 40 statements of 250 mails), in instructions of
+the whole server, and of the statements' work under the turn to write:
+
+| | whole server | under the turn |
+|---|---:|---:|
+| Before | 31.7 billion | 30.7 billion |
+| Words cut before the turn | 24.7 billion | 18.2 billion |
+| And segments merged beside the writer | 22.7 billion | 11.3 billion |
+| And the memory budget | 22.5 billion | 10.6 billion |
+
+A row's words cost 12.7 billion before, counted in a table of terms,
+and 6.7 billion now, sorted and packed; 5.4 billion of that is spent
+beside the turn. Merging beside the writer took 5.0 to 5.5 billion out
+of the turn. Under `valgrind` the threads of the process run one at a
+time, so the merging thread falls behind, and writers still merged 3.5
+billion themselves past 40 segments; with the threads on cores of their
+own it should fall behind less (inference, not measured). So the
+writer's work for a statement went from 0.77 to 0.26 billion
+instructions.
+
+The most memory the server held during the whole bulk load (`VmHWM`,
+with the default 32 MB cache): 150 to 171 MB before (six runs), 177 to
+218 MB with words cut before the turn (three runs: four connections cut
+at once, and hold what they cut), 153 to 190 MB with segments merged
+beside as well (six runs), and 112 to 125 MB with the budget (six
+runs). With the budget and a trim once a second instead of five times,
+it was 144 to 159 MB (three runs).
+
+On this machine, shared with other work, the load ran at a median of
+7.3 statements a second before and 9.1 after, in runs that moved
+between 5.6 and 8.9 before and 5.5 and 14.0 after; those rates say
+little. The server's CPU time for the load was 47 to 56 s before and 43
+to 55 s after; the trims take part of what was saved (40 to 46 s
+without the budget).
+
+Merging beside the writer has a price on disk: after the load the data
+file holds 750 to 800 MB, where it held 624 to 655 MB. A merge holds the
+version it reads for as long as it runs, as a reader would, and no page
+freed meanwhile is given out again until it ends, so writers take new
+pages from the end of the file instead. That is the likely reason; it
+was not traced.
+
+| What is left | What it changes | Expected effect | Cost |
 |---|---|---|---|
-| **Merge segments beside the writer**: a merge only reads segments that no longer change, so it can run as a fork and be put in place under the turn if its segments are as it found them | The 29% leaves the writer | Up to 1.4×, which is Postgres' rate | Moderate now that forks exist: a merged tree's pages must pass from the fork to the writer that installs it, and a merge whose rows died meanwhile is thrown away |
-| **Cut text into words before taking the turn**, on the connection's own thread | Tokenizing spreads over the cores | Up to 1.1× | Moderate: an insert's index expressions must be evaluated before its transaction begins |
-| **Build indexes after loading**, for `restore`: load the rows, then write each index bottom-up from sorted entries | A restore pays for neither pending rows nor merges | Several times faster restores; nothing for ordinary inserts | Moderate; the tree builder it needs exists |
+| **Build indexes after loading**, for `restore`: load the rows, then write each index bottom-up from sorted entries with the tree `Builder` | A restore pays for neither pending rows nor merges | Several times faster restores; nothing for ordinary inserts | Moderate; not begun |
+| **Cut words ahead inside transactions** | Only a large insert that is its own transaction is cut ahead now | The same for loads made in transactions | Small |
+| **Hold only what a merge reads**: keep the pages of the segments being merged from being given out again, not every page freed meanwhile | Writers reuse freed pages while a merge runs | The fifth the data file grew | Moderate: the store keeps whole versions, not sets of pages |
+| **Trim less, at less cost**: return only the pools the large requests used | The CPU time the trims take | A few seconds of the load's CPU | Small; the C library trims all pools at once |
 
 ### 4. Transactions of several requests (0.91×)
 

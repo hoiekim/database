@@ -176,19 +176,23 @@ The server's memory is the page cache plus a part in proportion to it:
 | Page cache (`DATABASE_CACHE_MB`), shared by all databases | 32 MB |
 | Committed pages waiting for their checkpoint, per busy database | up to 4 MB |
 | Pages of a transaction in progress, per writer | up to 8 MB |
-| Requests and results in flight | their size |
+| Requests and results in flight | requests over 64 KiB: 4 MB of them at once, as sent; results: their size |
 
 An idle server with nothing cached holds about 3 MB. Under the
 benchmark's load (`bench/`) it holds 45 to 50 MB once the load has
-passed, and at most 130 to 150 MB while four connections load megabyte
-statements into a table with a full-text index: the cache, the requests
-and their log records in flight, and freed memory that the allocator
-has not yet returned (the server asks it to every five seconds while
-requests arrive). A container limit of 128 MB fits ordinary requests;
-give it 192 MB if requests or rows of a megabyte and more are common,
-and raise `DATABASE_CACHE_MB` only if `stats` shows many disk reads for
-the working set. A transaction that runs beside other writers keeps at
-most about a megabyte of its own before it takes the write lock.
+passed, and at most 112 to 125 MB while four connections load megabyte
+statements into a table with a full-text index (150 to 171 MB before
+large requests shared a budget): the cache, the requests and their log
+records in flight, and freed memory that the allocator has not yet
+returned. Large requests take turns for 4 MB of memory, a request larger
+than that runs alone, and the memory each held is returned to the system
+as it is answered. A container limit of 128 MB fits ordinary requests
+and a bulk load of megabyte statements with the default cache; give it
+192 MB if rows of a megabyte and more are common (the load above has
+rows of 4 kB, and a row is held whole), and raise `DATABASE_CACHE_MB`
+only if `stats` shows many disk reads for the working set. A transaction
+that runs beside other writers keeps at most about a megabyte of its own
+before it takes the write lock.
 
 The largest single request or result is 256 MiB, and it is held in
 memory while it is handled. A text of tens of megabytes works; a habit
