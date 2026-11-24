@@ -130,7 +130,7 @@ impl Drop for Server {
         let _ = self.child.wait();
         if self.as_postgres {
             let _ = Command::new("runuser").args(["-u", "postgres", "--", "rm", "-rf"]).arg(&self.dir).status();
-        } else {
+        } else if !keep() {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -140,14 +140,26 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// `BENCH_KEEP=1` leaves this server's data where it is when the run
+/// ends and starts the next run from it, loaded as it is: to try a
+/// change on the reading workloads without loading the mails each time.
+fn keep() -> bool {
+    std::env::var_os("BENCH_KEEP").is_some()
+}
+
 fn bench_dir(name: &str) -> PathBuf {
     let base = std::env::var("BENCH_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+    if keep() && name == "ours" {
+        return base.join("database-bench-ours-kept");
+    }
     base.join(format!("database-bench-{name}-{}", std::process::id()))
 }
 
 async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
     let dir = bench_dir("ours");
-    let _ = std::fs::remove_dir_all(&dir);
+    if !keep() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     let port = free_port();
     let child = Command::new(binary)
         .arg("serve")
@@ -165,7 +177,7 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
     let server = Server { child, dir, as_postgres: false };
     for _ in 0..200 {
         if let Ok(admin) = Client::connect(Config::new("127.0.0.1", port, "", "bench-admin")).await {
-            admin.admin().create_database("bench", "bench").await.unwrap();
+            admin.admin().create_database_if_not_exists("bench", "bench").await.unwrap();
             let mut config = Config::new("127.0.0.1", port, "bench", "bench");
             config.pool_size = CONNECTIONS;
             return (server, Client::connect(config).await.unwrap());
@@ -773,18 +785,22 @@ struct Report {
     timings: Vec<Option<Timing>>,
 }
 
-async fn run(name: &'static str, server: Server, target: Target) -> Report {
+async fn run(name: &'static str, server: Server, target: Target, loaded: bool) -> Report {
     let pid = server.child.id();
     // What the server holds before it has done anything.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let idle_memory = memory(pid);
-    eprintln!("{name}: loading");
-    load(&target).await;
     let mails = selected(BULK_LOAD) || ON_MAILS.iter().any(|index| selected(WORKLOADS[*index].0));
-    let load = if mails {
-        Some(load_mails(&target).await)
-    } else {
+    let load = if loaded {
         None
+    } else {
+        eprintln!("{name}: loading");
+        load(&target).await;
+        if mails {
+            Some(load_mails(&target).await)
+        } else {
+            None
+        }
     };
     let mut timings = Vec::new();
     for (index, (workload, _, _)) in WORKLOADS.iter().enumerate() {
@@ -938,12 +954,16 @@ async fn main() {
     let mut reports = Vec::new();
     if only.as_deref() != Some("postgres") {
         let (server, client) = start_ours(&binary, 32).await;
-        setup_ours(&client).await.unwrap();
-        reports.push(run("database", server, Target::Ours(client)).await);
+        // Data kept from an earlier run is used as it is.
+        let loaded = !client.describe().await.unwrap().is_empty();
+        if !loaded {
+            setup_ours(&client).await.unwrap();
+        }
+        reports.push(run("database", server, Target::Ours(client), loaded).await);
     }
     if only.as_deref() != Some("ours") {
         match start_postgres().await {
-            Some((server, pg)) => reports.push(run("Postgres 16", server, Target::Pg(Arc::new(pg))).await),
+            Some((server, pg)) => reports.push(run("Postgres 16", server, Target::Pg(Arc::new(pg)), false).await),
             None => eprintln!("Postgres is not installed here, or would not start: skipping it"),
         }
     }

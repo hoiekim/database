@@ -45,6 +45,15 @@ pub const fn max_value(key_len: usize) -> usize {
 
 pub trait Pages {
     fn page(&self, id: PageId) -> Result<Page>;
+
+    /// Shows a page's bytes to `read`, which keeps nothing of them. For a
+    /// holder that has the page at hand this takes no share in it, and a
+    /// page at the top of a tree is shared by every thread that reads:
+    /// each share taken and given back is a write to memory they all
+    /// watch. `read` must not ask this holder for pages.
+    fn view(&self, id: PageId, read: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        read(&self.page(id)?)
+    }
 }
 
 pub trait PagesMut: Pages {
@@ -103,12 +112,23 @@ impl<'a> Node<'a> {
     }
     fn key(&self, i: usize) -> &'a [u8] {
         // The key's length is in the cell: where the cell ends is not
-        // needed to find it.
+        // needed to find it. Lengths below 128, which nearly all are,
+        // take one byte.
         let cell = &self.page[self.offset(i)..];
         let mut pos = if self.is_leaf() { 0 } else { 4 };
-        let klen = get_varint(cell, &mut pos).unwrap_or(0) as usize;
+        let klen = match cell[pos] {
+            short if short < 0x80 => {
+                pos += 1;
+                short as usize
+            }
+            _ => get_varint(cell, &mut pos).unwrap_or(0) as usize,
+        };
         if self.is_leaf() {
-            get_varint(cell, &mut pos);
+            if cell[pos] < 0x80 {
+                pos += 1;
+            } else {
+                get_varint(cell, &mut pos);
+            }
         }
         &cell[pos..pos + klen]
     }
@@ -450,18 +470,38 @@ fn check_sizes(key: &[u8], value: &[u8]) -> Result<()> {
 // ------------------------------------------------------------ operations
 
 pub fn get<P: Pages + ?Sized>(p: &P, root: PageId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut found = None;
+    get_with(p, root, key, &mut |value| found = Some(value.to_vec()))?;
+    Ok(found)
+}
+
+/// Shows `key`'s value to `on_value`, where it lies in its page, if the
+/// tree has the key. Returns whether it has.
+pub fn get_with<P: Pages + ?Sized>(p: &P, root: PageId, key: &[u8], on_value: &mut dyn FnMut(&[u8])) -> Result<bool> {
     if root == NO_PAGE {
-        return Ok(None);
+        return Ok(false);
     }
     let mut id = root;
     loop {
-        let page = p.page(id)?;
-        let node = Node::new(&page, id)?;
-        if node.is_leaf() {
-            let (i, found) = node.search(key);
-            return Ok(found.then(|| node.value(i).to_vec()));
+        let mut child = None;
+        let mut found = false;
+        p.view(id, &mut |page| {
+            let node = Node::new(page, id)?;
+            if node.is_leaf() {
+                let (i, hit) = node.search(key);
+                if hit {
+                    on_value(node.value(i));
+                    found = true;
+                }
+            } else {
+                child = Some(node.child(node.child_for(key)));
+            }
+            Ok(())
+        })?;
+        match child {
+            Some(next) => id = next,
+            None => return Ok(found),
         }
-        id = node.child(node.child_for(key));
     }
 }
 
@@ -639,14 +679,25 @@ pub struct Builder {
     /// The page being filled at each level, leaves first.
     levels: Vec<Level>,
     last: Vec<u8>,
+    /// Where a page is put together before it is stored.
+    scratch: Vec<u8>,
 }
 
+/// A page being filled: its cells one after another, as they will lie.
 #[derive(Default)]
 struct Level {
-    cells: Vec<Vec<u8>>,
-    used: usize,
-    /// The lowest key under the page being filled.
+    cells: Vec<u8>,
+    /// Where each cell starts in `cells`.
+    starts: Vec<u16>,
+    /// The lowest key under the page.
     low: Vec<u8>,
+}
+
+impl Level {
+    /// The room the page's cells and their offsets take.
+    fn used(&self) -> usize {
+        self.cells.len() + 2 * self.starts.len()
+    }
 }
 
 impl Builder {
@@ -661,41 +712,61 @@ impl Builder {
         }
         self.last.clear();
         self.last.extend_from_slice(key);
-        self.add(p, 0, None, leaf_cell(key, value), key)
+        let size = varint_len(key.len() as u64) + varint_len(value.len() as u64) + key.len() + value.len();
+        let at = self.room(p, 0, size, key)?;
+        put_varint(&mut at.cells, key.len() as u64);
+        put_varint(&mut at.cells, value.len() as u64);
+        at.cells.extend_from_slice(key);
+        at.cells.extend_from_slice(value);
+        Ok(())
     }
 
-    /// Adds a cell to a level, first writing out the level's page if the
-    /// cell does not fit in it. `child` is given for a branch's cell, and
-    /// `low` is the lowest key under the cell.
-    fn add<P: PagesMut>(&mut self, p: &mut P, level: usize, child: Option<PageId>, mut cell: Vec<u8>, low: &[u8]) -> Result<()> {
+    /// Makes room for a cell of `size` bytes at a level, first writing
+    /// out the level's page if the cell does not fit in it, and notes
+    /// where the cell starts. `low` is the lowest key under the cell.
+    fn room<P: PagesMut>(&mut self, p: &mut P, level: usize, size: usize, low: &[u8]) -> Result<&mut Level> {
         if self.levels.len() == level {
             self.levels.push(Level::default());
         }
-        if self.levels[level].used + cell.len() + 2 > CAPACITY {
+        if self.levels[level].used() + size + 2 > CAPACITY {
             self.write(p, level)?;
         }
         let at = &mut self.levels[level];
-        if at.cells.is_empty() {
-            at.low = low.to_vec();
-            // The first key of a branch is never read: store it empty.
-            if let Some(child) = child {
-                cell = branch_cell(child, &[]);
-            }
+        if at.starts.is_empty() {
+            at.low.clear();
+            at.low.extend_from_slice(low);
         }
-        at.used += cell.len() + 2;
-        at.cells.push(cell);
-        Ok(())
+        at.starts.push(at.cells.len() as u16);
+        Ok(at)
     }
 
     /// Writes the page a level is filling and tells the level above.
     fn write<P: PagesMut>(&mut self, p: &mut P, level: usize) -> Result<PageId> {
         let at = &mut self.levels[level];
-        let cells: Vec<&[u8]> = at.cells.iter().map(|c| c.as_slice()).collect();
-        let id = p.alloc(build(if level == 0 { KIND_LEAF } else { KIND_BRANCH }, &cells))?;
+        let first = HEADER + 2 * at.starts.len();
+        let page = &mut self.scratch;
+        page.clear();
+        page.resize(HEADER, 0);
+        page[4] = if level == 0 { KIND_LEAF } else { KIND_BRANCH };
+        put_u16(page, 6, at.starts.len() as u16);
+        put_u16(page, 8, (first + at.cells.len()) as u16);
+        for start in &at.starts {
+            page.extend_from_slice(&((first + usize::from(*start)) as u16).to_le_bytes());
+        }
+        page.extend_from_slice(&at.cells);
+        page.resize(PAGE_SIZE, 0);
+        let id = p.alloc_page(Page::from(&page[..]))?;
         let low = std::mem::take(&mut at.low);
         at.cells.clear();
-        at.used = 0;
-        self.add(p, level + 1, Some(id), branch_cell(id, &low), &low)?;
+        at.starts.clear();
+        let up = self.room(p, level + 1, 4 + varint_len(low.len() as u64) + low.len(), &low)?;
+        // The first key of a branch is never read: it is stored empty.
+        let key: &[u8] = if up.starts.len() == 1 { &[] } else { &low };
+        up.cells.extend_from_slice(&id.to_le_bytes());
+        put_varint(&mut up.cells, key.len() as u64);
+        up.cells.extend_from_slice(key);
+        // Kept, to hold the next page's lowest key without allocating.
+        self.levels[level].low = low;
         Ok(id)
     }
 
@@ -708,7 +779,7 @@ impl Builder {
         loop {
             // A page that is all there is of the top level is the root.
             let id = self.write(p, level)?;
-            if level + 2 == self.levels.len() && self.levels[level + 1].cells.len() == 1 {
+            if level + 2 == self.levels.len() && self.levels[level + 1].starts.len() == 1 {
                 return Ok(id);
             }
             level += 1;

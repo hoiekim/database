@@ -149,6 +149,13 @@ pub fn encode(out: &mut Vec<u8>, value: &Value, desc: bool) {
 
 /// The start of every text key that begins with `prefix`: the text's
 /// bytes without the end mark.
+/// A text as `encode` writes it rising, from its bytes.
+pub fn encode_text(out: &mut Vec<u8>, text: &[u8]) {
+    out.push(TEXT);
+    escaped(out, text);
+    out.extend_from_slice(&[0, 0]);
+}
+
 pub fn encode_text_prefix(out: &mut Vec<u8>, prefix: &str) {
     out.push(TEXT);
     escaped(out, prefix.as_bytes());

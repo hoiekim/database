@@ -709,7 +709,21 @@ fn first_chars(bytes: &[u8], n: usize) -> String {
         Ok(s) => s,
         Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or(""),
     };
-    valid.chars().take(n).collect()
+    chars(valid, 0, n).to_string()
+}
+
+/// The `n` characters of `text` after its first `skip`, or as many as
+/// there are: found by where they start and end, and taken in one piece.
+fn chars(text: &str, skip: usize, n: usize) -> &str {
+    // In plain ASCII a character is a byte.
+    if text.is_ascii() {
+        let from = skip.min(text.len());
+        return &text[from..from.saturating_add(n).min(text.len())];
+    }
+    let mut starts = text.char_indices().map(|(at, _)| at);
+    let Some(from) = starts.nth(skip) else { return "" };
+    let to = if n == 0 { from } else { starts.nth(n - 1).unwrap_or(text.len()) };
+    &text[from..to]
 }
 
 fn substr(text: &str, start: i64, len: i64) -> String {
@@ -719,7 +733,7 @@ fn substr(text: &str, start: i64, len: i64) -> String {
     if end <= from {
         return String::new();
     }
-    text.chars().skip((from - 1) as usize).take((end - from) as usize).collect()
+    chars(text, (from - 1) as usize, (end - from) as usize).to_string()
 }
 
 /// Functions that can answer from a large value's length or a part of
@@ -925,7 +939,7 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
             arity(a.len() == 2)?;
             let (s, n) = (text_arg(&a[0], &name)?, int_arg(&a[1], &name)?);
             let keep = if n >= 0 { n as usize } else { s.chars().count().saturating_sub(n.unsigned_abs() as usize) };
-            Value::Text(s.chars().take(keep).collect())
+            Value::Text(chars(s, 0, keep).to_string())
         }
         Func::Substr => {
             arity(a.len() == 3)?;
@@ -1179,4 +1193,29 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
         Func::Now | Func::RandomUuid | Func::Coalesce | Func::Least | Func::Greatest | Func::NullIf | Func::ListConcat | Func::JsonElems | Func::JsonTexts | Func::JsonPluck
         | Func::JsonArray | Func::JsonObject | Func::ToJson | Func::JsonGet | Func::JsonGetText => unreachable!("handled above"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn characters_are_cut_where_counting_them_one_by_one_would() {
+        for text in ["", "a", "plain ascii text", "héllo wörld", "日本語のテキスト", "mixed: é日x𝄞y", "𝄞𝄞𝄞"] {
+            let count = text.chars().count();
+            for skip in 0..count + 3 {
+                for n in 0..count + 3 {
+                    let want: String = text.chars().skip(skip).take(n).collect();
+                    assert_eq!(chars(text, skip, n), want, "{text:?} skip {skip} take {n}");
+                }
+            }
+        }
+        // Bytes cut in the middle of a character end at the last whole one.
+        let bytes = "aé日".as_bytes();
+        assert_eq!(first_chars(&bytes[..bytes.len() - 1], 10), "aé");
+        assert_eq!(first_chars(bytes, 2), "aé");
+        assert_eq!(substr("héllo", 2, 3), "éll");
+        assert_eq!(substr("héllo", 0, 3), "hé");
+        assert_eq!(substr("héllo", 9, 3), "");
+    }
 }

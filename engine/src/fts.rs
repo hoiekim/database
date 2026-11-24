@@ -305,19 +305,28 @@ fn split_run_key(key: &[u8]) -> Result<(&[u8], u64)> {
     Ok((&key[..at], u64::from_be_bytes(key[at..].try_into().unwrap())))
 }
 
-/// Writes one word's rows, given in rising order, as runs.
-struct RunWriter<'w> {
-    word: &'w [u8],
+/// Writes words' rows as runs: one word's rows, in rising order, then
+/// the next word's. One writer serves a whole segment, so that nothing
+/// is allocated per word.
+struct RunWriter {
+    /// The word, with room after it for a run's first number.
+    key: Vec<u8>,
     limit: usize,
     first: u64,
     last: u64,
     buf: Vec<u8>,
 }
 
-impl<'w> RunWriter<'w> {
-    fn new(word: &'w [u8]) -> Self {
-        let limit = RUN_BYTES.min(btree::max_value(word.len() + 8).saturating_sub(16));
-        RunWriter { word, limit, first: 0, last: 0, buf: Vec::with_capacity(RUN_BYTES + 16) }
+impl RunWriter {
+    fn new() -> Self {
+        RunWriter { key: Vec::new(), limit: 0, first: 0, last: 0, buf: Vec::with_capacity(RUN_BYTES + 64) }
+    }
+
+    /// Turns to another word. The one before must have been finished.
+    fn word(&mut self, word: &[u8]) {
+        self.key.clear();
+        self.key.extend_from_slice(word);
+        self.limit = RUN_BYTES.min(btree::max_value(word.len() + 8).saturating_sub(16));
     }
 
     fn push<P: PagesMut>(&mut self, p: &mut P, tree: &mut btree::Builder, number: u64, score: u32) -> Result<()> {
@@ -334,13 +343,44 @@ impl<'w> RunWriter<'w> {
         Ok(())
     }
 
+    /// Adds a whole run as another segment stored it, every row of it,
+    /// without taking it apart: its bytes are copied, and only the first
+    /// row's number, which a run tells from its key, is told anew from
+    /// the row before. Returns how many rows the run held.
+    fn append<P: PagesMut>(&mut self, p: &mut P, tree: &mut btree::Builder, first: u64, value: &[u8]) -> Result<u64> {
+        // Its last row, to tell the next run's first from, and its count.
+        let (mut pos, mut last, mut rows) = (0, first, 0u64);
+        while pos < value.len() {
+            last += varint(value, &mut pos)?;
+            varint(value, &mut pos)?;
+            rows += 1;
+        }
+        if !self.buf.is_empty() && self.buf.len() + value.len() > self.limit {
+            self.finish(p, tree)?;
+        }
+        if self.buf.is_empty() {
+            self.first = first;
+            self.buf.extend_from_slice(value);
+        } else {
+            let mut pos = 0;
+            if varint(value, &mut pos)? != 0 || first <= self.last {
+                return Err(malformed());
+            }
+            put_varint(&mut self.buf, first - self.last);
+            self.buf.extend_from_slice(&value[pos..]);
+        }
+        self.last = last;
+        Ok(rows)
+    }
+
     fn finish<P: PagesMut>(&mut self, p: &mut P, tree: &mut btree::Builder) -> Result<()> {
         if !self.buf.is_empty() {
-            let mut key = Vec::with_capacity(self.word.len() + 8);
-            key.extend_from_slice(self.word);
-            key.extend_from_slice(&self.first.to_be_bytes());
-            tree.push(p, &key, &self.buf)?;
+            let word = self.key.len();
+            self.key.extend_from_slice(&self.first.to_be_bytes());
+            let pushed = tree.push(p, &self.key, &self.buf);
+            self.key.truncate(word);
             self.buf.clear();
+            pushed?;
         }
         Ok(())
     }
@@ -468,47 +508,114 @@ pub fn destroy<P: PagesMut>(p: &mut P, root: PageId) -> Result<()> {
     btree::destroy(p, root, &mut |_, _| Ok(()))
 }
 
+/// Where a pending row's stored words are being read: the word it is
+/// at, and what follows.
+struct Reading {
+    pos: usize,
+    left: u64,
+    term: (usize, usize),
+    score: u32,
+}
+
+impl Reading {
+    /// Moves to the row's next word. False when it has no more.
+    fn advance(&mut self, stored: &[u8]) -> Result<bool> {
+        if self.left == 0 {
+            return Ok(false);
+        }
+        let len = usize::from(*stored.get(self.pos).ok_or_else(malformed)?);
+        self.term = (self.pos + 1, self.pos + 1 + len);
+        if self.term.1 > stored.len() {
+            return Err(malformed());
+        }
+        self.pos = self.term.1;
+        self.score = varint(stored, &mut self.pos)? as u32;
+        self.left -= 1;
+        Ok(true)
+    }
+}
+
 /// Makes a segment of the pending rows.
+///
+/// Each row's words are stored in order, so the segment, which lists
+/// every word's rows in the order of the words, is written by merging
+/// the rows: for each leading key, the least word any of its rows is at,
+/// then those rows, then on. Nothing is copied out per word.
 fn flush<P: PagesMut>(p: &mut P, mut root: PageId, state: &mut State) -> Result<PageId> {
-    let mut rows: Vec<(Vec<u8>, Words)> = Vec::new();
-    for_each_pending(p, state.pending, &mut |pk, stored| {
-        rows.push((pk.to_vec(), decode_words(stored)?));
+    let mut pks: Vec<Vec<u8>> = Vec::new();
+    let mut stored: Vec<Vec<u8>> = Vec::new();
+    for_each_pending(p, state.pending, &mut |pk, words| {
+        pks.push(pk.to_vec());
+        stored.push(words.to_vec());
         Ok(())
     })?;
-    // Every word's rows, gathered by word and then put in key order, so
-    // that the segment's tree is written front to back.
     let low = state.next;
-    let mut by_word: HashMap<(&[u8], &str), Vec<(u64, u32)>> = HashMap::new();
-    for (n, (_, words)) in rows.iter().enumerate() {
-        for (term, score) in &words.terms {
-            by_word.entry((&words.lead, term)).or_default().push((low + n as u64, *score));
-        }
-    }
-    let mut lists: Vec<(Vec<u8>, Vec<(u64, u32)>)> = by_word.into_iter().map(|((lead, term), list)| (word_key(lead, term), list)).collect();
-    lists.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     btree::destroy(p, state.pending, &mut |_, _| Ok(()))?;
     state.pending = NO_PAGE;
-    for (n, (pk, _)) in rows.iter().enumerate() {
+    for (n, pk) in pks.iter().enumerate() {
         let number = low + n as u64;
         let mut value = Vec::new();
         put_varint(&mut value, number);
         root = btree::put(p, root, &tagged(NUMBER_OF, pk), &value)?.0;
         root = btree::put(p, root, &tagged(KEY_OF, &number.to_be_bytes()), pk)?.0;
     }
+    // Where each row's leading keys lie, and its reading, set before its
+    // first word.
+    let mut leads: Vec<(usize, usize)> = Vec::with_capacity(stored.len());
+    let mut readings: Vec<Reading> = Vec::with_capacity(stored.len());
+    for words in &stored {
+        let (lead, mut pos) = stored_lead(words)?;
+        leads.push((pos - lead.len(), pos));
+        let left = varint(words, &mut pos)?;
+        readings.push(Reading { pos, left, term: (0, 0), score: 0 });
+    }
+    let lead_of = |row: usize| &stored[row][leads[row].0..leads[row].1];
+    // The rows by leading keys, and in their own order under each.
+    let mut order: Vec<usize> = (0..stored.len()).collect();
+    order.sort_by(|a, b| lead_of(*a).cmp(lead_of(*b)).then(a.cmp(b)));
+
     let mut tree = btree::Builder::new();
+    let mut writer = RunWriter::new();
     let mut entries = 0u64;
-    for (word, list) in &lists {
-        let mut writer = RunWriter::new(word);
-        for (number, score) in list {
-            writer.push(p, &mut tree, *number, *score)?;
+    let mut word: Vec<u8> = Vec::new();
+    // The rows of one leading key that have words left, least word
+    // first, and of the rows at one word the lowest first: so each
+    // word's rows come out in rising order.
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(&[u8], usize)>> = std::collections::BinaryHeap::new();
+    let mut group = 0;
+    while group < order.len() {
+        let lead = lead_of(order[group]);
+        let end = group + order[group..].iter().take_while(|row| lead_of(**row) == lead).count();
+        for &row in &order[group..end] {
+            if readings[row].advance(&stored[row])? {
+                let (from, to) = readings[row].term;
+                heap.push(std::cmp::Reverse((&stored[row][from..to], row)));
+            }
+        }
+        let mut current: Option<&[u8]> = None;
+        while let Some(std::cmp::Reverse((term, row))) = heap.pop() {
+            if current != Some(term) {
+                writer.finish(p, &mut tree)?;
+                word.clear();
+                word.extend_from_slice(lead);
+                keys::encode_text(&mut word, term);
+                writer.word(&word);
+                current = Some(term);
+            }
+            writer.push(p, &mut tree, low + row as u64, readings[row].score)?;
+            entries += 1;
+            if readings[row].advance(&stored[row])? {
+                let (from, to) = readings[row].term;
+                heap.push(std::cmp::Reverse((&stored[row][from..to], row)));
+            }
         }
         writer.finish(p, &mut tree)?;
-        entries += list.len() as u64;
+        group = end;
     }
     let tree = tree.finish(p)?;
-    if !rows.is_empty() {
-        state.next = low + rows.len() as u64;
-        state.segments.push(Segment { root: tree, low, high: state.next - 1, entries, rows: rows.len() as u64, dead: 0 });
+    if !pks.is_empty() {
+        state.next = low + pks.len() as u64;
+        state.segments.push(Segment { root: tree, low, high: state.next - 1, entries, rows: pks.len() as u64, dead: 0 });
     }
     state.pending_rows = 0;
     state.pending_bytes = 0;
@@ -547,10 +654,15 @@ fn maintain<P: PagesMut>(p: &mut P, root: PageId, state: &mut State) -> Result<(
 /// without their dead rows.
 fn merge<P: PagesMut>(p: &mut P, root: PageId, state: &mut State, from: usize, to: usize) -> Result<()> {
     let (low, high) = (state.segments[from].low, state.segments[to - 1].high);
-    // Which numbers in their range still lead to a row.
-    let mut live = vec![0u64; ((high - low) / 64 + 1) as usize];
-    let mut rows = 0u64;
-    {
+    // With no row of theirs dead, as when rows are only ever added, the
+    // runs are joined as they are. Otherwise each row is looked at:
+    // which numbers in their range still lead to a row.
+    let whole = state.segments[from..to].iter().all(|s| s.dead == 0);
+    let mut live: Vec<u64> = Vec::new();
+    let mut rows: u64 = state.segments[from..to].iter().map(|s| s.rows).sum();
+    if !whole {
+        live = vec![0u64; ((high - low) / 64 + 1) as usize];
+        rows = 0;
         let mut cursor = Cursor::new(p, root);
         cursor.seek(&tagged(KEY_OF, &low.to_be_bytes()))?;
         while let Some(key) = cursor.key() {
@@ -571,6 +683,7 @@ fn merge<P: PagesMut>(p: &mut P, root: PageId, state: &mut State, from: usize, t
         scan.first(p)?;
     }
     let mut tree = btree::Builder::new();
+    let mut writer = RunWriter::new();
     let mut entries = 0u64;
     let mut word: Vec<u8> = Vec::new();
     let mut run: Vec<(u64, u32)> = Vec::new();
@@ -592,20 +705,27 @@ fn merge<P: PagesMut>(p: &mut P, root: PageId, state: &mut State, from: usize, t
         }
         // Its rows from each segment in turn: older segments hold lower
         // numbers, so the whole list rises.
-        let mut writer = RunWriter::new(&word);
+        writer.word(&word);
         for scan in &mut scans {
             loop {
-                run.clear();
                 match (scan.key(), scan.value()) {
-                    (Some(key), Some(value)) if key.len() == word.len() + 8 && key.starts_with(&word) => decode_run(split_run_key(key)?.1, value, &mut run)?,
-                    _ => break,
-                }
-                for (number, score) in &run {
-                    let n = number.checked_sub(low).filter(|_| *number <= high).ok_or_else(malformed)?;
-                    if live[(n / 64) as usize] & (1 << (n % 64)) != 0 {
-                        writer.push(p, &mut tree, *number, *score)?;
-                        entries += 1;
+                    (Some(key), Some(value)) if key.len() == word.len() + 8 && key.starts_with(&word) => {
+                        let first = split_run_key(key)?.1;
+                        if whole {
+                            entries += writer.append(p, &mut tree, first, value)?;
+                        } else {
+                            run.clear();
+                            decode_run(first, value, &mut run)?;
+                            for (number, score) in &run {
+                                let n = number.checked_sub(low).filter(|_| *number <= high).ok_or_else(malformed)?;
+                                if live[(n / 64) as usize] & (1 << (n % 64)) != 0 {
+                                    writer.push(p, &mut tree, *number, *score)?;
+                                    entries += 1;
+                                }
+                            }
+                        }
                     }
+                    _ => break,
                 }
                 scan.next(p)?;
             }

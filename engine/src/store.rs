@@ -23,7 +23,7 @@
 //! disk or under way, that still names it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::btree::{Pages, PagesMut};
@@ -157,6 +157,10 @@ pub struct Store {
     /// other, each on its own copy of the counter: this keeps them from
     /// giving out the same number twice.
     serials: Mutex<HashMap<(u32, usize), i64>>,
+    /// How many pages `mem` holds. A reader looks there, behind its lock,
+    /// only when this says there is something to find: after a
+    /// checkpoint, until the next commit, there is not.
+    in_mem: AtomicUsize,
     pub disk_reads: AtomicU64,
     pub disk_writes: AtomicU64,
 }
@@ -269,6 +273,7 @@ impl Store {
             limits,
             failed: AtomicBool::new(false),
             serials: Mutex::new(HashMap::new()),
+            in_mem: AtomicUsize::new(0),
             disk_reads: AtomicU64::new(0),
             disk_writes: AtomicU64::new(0),
         }
@@ -283,6 +288,12 @@ impl Store {
             return Err(Error::Io(std::io::Error::other("an earlier write to the data file failed")));
         }
         Ok(())
+    }
+
+    /// Notes how many pages `mem` holds, for readers: called with its
+    /// lock held for writing, after every change to it.
+    fn count_mem(&self, mem: &Mem) {
+        self.in_mem.store(mem.dirty.len() + mem.flushing.len(), Ordering::Release);
     }
 
     fn write_page(&self, id: PageId, page: &[u8]) -> Result<()> {
@@ -314,7 +325,10 @@ impl Store {
 
     /// A committed page, from memory or from the file.
     pub fn read(&self, id: PageId) -> Result<Page> {
-        {
+        // A page a reader can reach was put in `mem`, and counted, before
+        // the version that holds it was shown to anyone; and it is in
+        // the cache or the file before it leaves and is counted out.
+        if self.in_mem.load(Ordering::Acquire) > 0 {
             let mem = self.mem.read().unwrap();
             if let Some(page) = mem.dirty.get(&id).or_else(|| mem.flushing.get(&id)) {
                 return Ok(page.clone());
@@ -437,6 +451,7 @@ impl Store {
             for id in &released {
                 mem.dirty.remove(id);
             }
+            self.count_mem(&mem);
         }
         for id in &released {
             self.cache.remove(self.id, *id);
@@ -467,6 +482,7 @@ impl Store {
                 mem.dirty.remove(&id);
             }
         }
+        self.count_mem(&mem);
         Ok(())
     }
 
@@ -576,7 +592,11 @@ impl Store {
         for (id, page) in pages {
             self.cache.insert(self.id, id, page);
         }
-        self.mem.write().unwrap().flushing.clear();
+        {
+            let mut mem = self.mem.write().unwrap();
+            mem.flushing.clear();
+            self.count_mem(&mem);
+        }
         {
             let mut alloc = self.alloc.lock().unwrap();
             alloc.durable = capture.version;
@@ -809,6 +829,7 @@ impl Writer {
             for (id, page) in self.private.drain() {
                 mem.dirty.insert(id, page);
             }
+            self.store.count_mem(&mem);
             alloc.free.append(&mut self.recycled);
         }
         self.spilled.clear();

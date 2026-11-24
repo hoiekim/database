@@ -47,6 +47,20 @@ pub fn read_range<P: Pages + ?Sized>(p: &P, root: PageId, id: u64, len: u64, sta
     }
     let first = (start as usize / CHUNK) as u32;
     let last = ((end as usize - 1) / CHUNK) as u32;
+    if first == last {
+        // Within one chunk, as the start of a text is: looked up alone.
+        let (lo, hi) = (start as usize - first as usize * CHUNK, end as usize - first as usize * CHUNK);
+        let mut short = false;
+        let found = btree::get_with(p, root, &key(id, first), &mut |bytes| match bytes.get(lo..hi) {
+            Some(part) => out.extend_from_slice(part),
+            None => short = true,
+        })?;
+        return match (found, short) {
+            (false, _) => Err(Error::corrupt(format!("chunk {first} of large value {id} is missing"))),
+            (true, true) => Err(Error::corrupt(format!("chunk {first} of large value {id} is short"))),
+            (true, false) => Ok(out),
+        };
+    }
     let mut cursor = Cursor::new(p, root);
     cursor.seek(&key(id, first))?;
     for chunk in first..=last {

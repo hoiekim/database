@@ -673,10 +673,23 @@ impl Pages for Recent<'_> {
         let page = self.store.read(id)?;
         let mut pages = self.pages.borrow_mut();
         if pages.len() >= RECENT_PAGES {
-            pages.clear();
+            // The leaves go: each is read once or a few times. The pages
+            // above them are read again for every row looked up, and
+            // stay unless they alone fill the room.
+            pages.retain(|_, page| crate::page::kind(page) == crate::page::KIND_BRANCH);
+            if pages.len() >= RECENT_PAGES / 2 {
+                pages.clear();
+            }
         }
         pages.insert(id, page.clone());
         Ok(page)
+    }
+
+    fn view(&self, id: PageId, read: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        if let Some(page) = self.pages.borrow().get(&id) {
+            return read(page);
+        }
+        read(&self.page(id)?)
     }
 }
 
