@@ -13,10 +13,13 @@
 //! Then the disk is made to fail under the same workload: full from each
 //! operation on, and each operation failing once, a sync by losing what
 //! it was to make durable. Whatever the engine then answers, it must not
-//! have acknowledged anything that a restart takes back. And last the
-//! disk lies about its syncs, where no engine can keep its promise: then
-//! the database must come back as it stood at some commit, or say that
-//! its files are damaged, as far as checksums can tell.
+//! have acknowledged anything that a restart takes back. Then the disk
+//! has what was written and cannot give it back: a read that fails when
+//! the engine starts must stop the start and leave the files as they
+//! are, for a start when the disk reads again. And last the disk lies
+//! about its syncs, where no engine can keep its promise: then the
+//! database must come back as it stood at some commit, or say that its
+//! files are damaged, as far as checksums can tell.
 //!
 //! `FAULT_SCRIPTS=20` adds that many generated workloads to the fixed
 //! one, and looks closer at each.
@@ -33,7 +36,8 @@ use database_engine::engine::{Engine, EngineOptions};
 use database_engine::error::{Error, Result};
 use database_engine::page::PAGE_SIZE;
 use database_engine::store::Limits;
-use database_engine::vfs::{sectors, Entry, Fate, Fault, MemVfs, Op, OpKind, Plan, Rng};
+use database_engine::vfs::{sectors, Entry, Fate, Fault, MemVfs, Op, OpKind, Plan, Rng, Vfs};
+use database_engine::wal::wal_generation;
 use database_protocol::error::ErrorCode;
 use database_protocol::expr::*;
 use database_protocol::message::Ddl;
@@ -1306,6 +1310,78 @@ fn an_operation_that_fails_loses_no_commit() {
         println!("{name}: each of {syncs} syncs and {others} other operations failed once, {failures} steps failed ({:?})", started.elapsed());
         assert!(syncs > 20 && others > 20 && failures >= syncs);
     }
+}
+
+// ------------------------------------------- the disk that cannot be read
+
+/// A read that fails is not a read that found nothing. A start that took
+/// it for the end of the log, or for a copy of the data file's header
+/// that is not valid, would go on to delete what it had not read.
+#[test]
+fn a_read_that_fails_at_a_start_stops_it_and_loses_no_commit() {
+    let vfs = MemVfs::new();
+    let engine = try_start(&vfs).unwrap();
+    let db = create(&engine);
+    let row = |n: i64| item(n % 4, &format!("n{n}"), &"gamma ".repeat(n as usize % 5), &[format!("t{}", n % 5).as_str()]);
+    let mut model = Model::new();
+    let commit = |model: &mut Model, ids: std::ops::RangeInclusive<i64>| {
+        for n in ids {
+            let mut txn = db.begin_write(WAIT, false).unwrap();
+            txn.insert(&insert_of(n, &row(n)), None).unwrap();
+            txn.commit().unwrap();
+            model.insert(n, row(n));
+        }
+    };
+    // Rows the data file holds, then rows that only the log does, and
+    // the engine killed: nothing more is written.
+    commit(&mut model, 1..=20);
+    db.checkpoint().unwrap();
+    let checkpointed = model.clone();
+    commit(&mut model, 21..=40);
+    drop(db);
+    drop(engine);
+
+    let dir = std::path::Path::new(DIR);
+    let data = dir.join("test.db");
+    let logs: Vec<_> = vfs.list(dir).unwrap().into_iter().filter(|file| wal_generation("test", file).is_some()).collect();
+    assert_eq!(logs.len(), 1, "one log file continues from the checkpoint: {logs:?}");
+    let log = dir.join(&logs[0]);
+    // That the log alone holds those rows: the same disk without it has
+    // the checkpoint's and no more. This is what a start that took the
+    // unread log for an empty one would leave.
+    let without_log = vfs.snapshot();
+    without_log.remove(&log).unwrap();
+    assert_eq!(read_model(&try_start(&without_log).unwrap().database("test").unwrap()), checkpointed);
+
+    let refused = |what: &str| {
+        match try_start(&vfs) {
+            Err(Error::Io(_)) => {}
+            Err(other) => panic!("{what} cannot be read, and the engine says: {other}"),
+            Ok(_) => panic!("{what} cannot be read, and the engine starts"),
+        }
+        assert!(vfs.exists(&log), "{what} cannot be read, and the log is gone");
+        assert!(vfs.exists(&data), "{what} cannot be read, and the data file is gone");
+    };
+    // The log: all of it, and all but its first bytes, so that its
+    // header reads and what follows does not.
+    vfs.fail_reads(Some(&log));
+    refused("the log");
+    vfs.fail_reads_within(&log, 100..u64::MAX);
+    refused("the log past its header");
+    // The data file: all of it, and each copy of its header alone. The
+    // other copy then reads whole, which is no reason to start from it.
+    vfs.fail_reads(Some(&data));
+    refused("the data file");
+    let page = PAGE_SIZE as u64;
+    for copy in 0..2 {
+        vfs.fail_reads_within(&data, copy * page..(copy + 1) * page);
+        refused(["the first copy of the data file's header", "the second copy of the data file's header"][copy as usize]);
+    }
+
+    // The disk reads again, and every commit is there.
+    vfs.fail_reads(None);
+    let engine = try_start(&vfs).expect("the engine starts once the disk reads");
+    verify(&engine.database("test").unwrap(), &model);
 }
 
 // --------------------------------------------------------- the lying disk

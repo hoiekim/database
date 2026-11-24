@@ -239,9 +239,9 @@ writes what is there, and no tear of that changes anything.
 
 ### When the disk fails (`vfs.rs`)
 
-Every write, sync, creation, removal and renaming of a file goes through
-`Vfs`, and any of them may fail. The rule is that **after a failure the
-engine does not guess**:
+Every read, write, sync, creation, removal and renaming of a file goes
+through `Vfs`, and any of them may fail. The rule is that **after a
+failure the engine does not guess**:
 
 - A write or a sync that fails under a commit or a checkpoint marks the
   database failed. It takes no more writes, and it declines to check its
@@ -257,6 +257,22 @@ engine does not guess**:
   opened, which would be a server that cannot start. A drop removes the
   data file before the log, so a crash never leaves a database without
   its last commits.
+- A read that fails is not a read that found nothing. Recovery ends by
+  deleting: the log it has replayed, and whatever the data file holds
+  beyond the checkpoint it started from. So it takes something for
+  absent on two grounds only, both of them things it has seen: the
+  file's length says the bytes were never written, or the bytes were
+  read and do not check. A read that returns an error is neither, since
+  the bytes may all be there and the next read may give them. The start
+  stops with that error, the log and the checkpoint as they were. Taken
+  for the torn end of the log, it would end replay early, and the
+  checkpoint that follows replay would delete a log with acknowledged
+  commits in it. Taken for a meta page that is not valid, it would
+  leave the other copy to be chosen: if that is the older, a checkpoint
+  whose log was deleted when the newer was written, and to whose length
+  the file would then be cut. Only a file too short to hold a copy is
+  without it, and an error on either copy stops the start, since a copy
+  that was not read cannot be known to be the older.
 
 What no engine can do is keep its promise on a disk that reports a sync
 it has not done. The most that can be had is that the loss is seen. A
@@ -308,6 +324,12 @@ nothing may be acknowledged that a restart then takes back. After a
 lie, a log must give the database as of some commit or be refused, and a
 data file must at least never be blamed on anything but itself, nor
 make the engine panic.
+
+One test there stands apart from the workload. It commits rows that
+only the log holds, kills the engine and makes reads fail: of the log,
+of the data file, of each meta page alone. Each time the engine must
+refuse to start, with an I/O error and with the files still there, and
+once the disk reads again every commit is back.
 
 ## Transactions (`db.rs`, `write.rs`)
 

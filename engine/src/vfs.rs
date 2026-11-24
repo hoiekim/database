@@ -11,9 +11,15 @@
 //! operation, so that the disk as it stood before each one, which is where
 //! a process killed at that step would have left it, can be rebuilt and
 //! cut power to in every way that matters, one operation after another.
+//!
+//! A read changes nothing, so it has no number and no plan is asked
+//! about it. A test names instead the file that cannot be read, or the
+//! bytes of it (`fail_reads`): a disk that has them and cannot give them
+//! just now.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -380,6 +386,8 @@ struct MemState {
     image: Option<MemVfs>,
     plan: Option<Plan>,
     journal: Option<Vec<Entry>>,
+    /// The file whose reads fail, and which bytes of it: see `fail_reads`.
+    fail_reads: Option<(PathBuf, Range<u64>)>,
 }
 
 impl MemState {
@@ -464,7 +472,8 @@ pub struct MemVfs {
 
 struct MemFile {
     data: FileRef,
-    /// The name it was opened by, for a fault plan to read.
+    /// The name it was opened by, for a fault plan to read and for
+    /// `fail_reads` to know it by.
     path: PathBuf,
     vfs: MemVfs,
 }
@@ -475,6 +484,10 @@ fn crashed() -> io::Error {
 
 fn sync_failed(op: &Op) -> io::Error {
     io::Error::other(format!("simulated fault at operation {}: the sync failed", op.index))
+}
+
+fn read_failed() -> io::Error {
+    io::Error::other("simulated fault: the read failed")
 }
 
 impl MemVfs {
@@ -678,6 +691,36 @@ impl MemVfs {
         len as u64
     }
 
+    /// Makes every read of the file opened as `path` fail, until this is
+    /// called again with another path or with `None`. One file fails at
+    /// a time. The file is not touched: it still exists, has its length
+    /// and takes writes, and reads what it held once the fault is
+    /// cleared. A copy of the file system does not have the fault.
+    pub fn fail_reads(&self, path: Option<&Path>) {
+        self.state.lock().unwrap().fail_reads = path.map(|path| (path.to_path_buf(), 0..u64::MAX));
+    }
+
+    /// As `fail_reads`, for the reads that touch any of `bytes` only: a
+    /// part of the disk that cannot be read, in a file that otherwise can.
+    pub fn fail_reads_within(&self, path: &Path, bytes: Range<u64>) {
+        self.state.lock().unwrap().fail_reads = Some((path.to_path_buf(), bytes));
+    }
+
+    /// Called before each read of `len` bytes at `offset` of the file
+    /// opened as `path`.
+    fn check_read(&self, path: &Path, offset: u64, len: usize) -> io::Result<()> {
+        let state = self.state.lock().unwrap();
+        if state.crashed {
+            return Err(crashed());
+        }
+        if let Some((failing, bytes)) = &state.fail_reads {
+            if failing == path && offset < bytes.end && offset.saturating_add(len as u64) > bytes.start {
+                return Err(read_failed());
+            }
+        }
+        Ok(())
+    }
+
     /// Called before each operation that changes the disk: counts it,
     /// and asks the plan, if there is one, what goes wrong with it.
     fn begin(&self, kind: OpKind, path: &Path) -> io::Result<(Op, Fault)> {
@@ -710,9 +753,7 @@ impl MemVfs {
 
 impl File for MemFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        if self.vfs.has_crashed() {
-            return Err(crashed());
-        }
+        self.vfs.check_read(&self.path, offset, buf.len())?;
         let data = self.data.lock().unwrap();
         let start = (offset as usize).min(data.current.len());
         let n = buf.len().min(data.current.len() - start);
@@ -1060,5 +1101,45 @@ mod tests {
         assert_eq!(all(&copy), all(&vfs));
         // The copy the journal started from is untouched.
         assert_eq!(all(&base), [("old".to_string(), vec![9u8; 700])]);
+    }
+
+    #[test]
+    fn reads_of_one_file_can_be_made_to_fail_and_to_work_again() {
+        let vfs = MemVfs::new();
+        let (bad, good) = (Path::new("/d/bad"), Path::new("/d/good"));
+        for path in [bad, good] {
+            vfs.open(path, true).unwrap().write_at(b"bytes", 0).unwrap();
+        }
+        let before = vfs.open(bad, false).unwrap();
+        vfs.fail_reads(Some(bad));
+        // A handle from before the fault and one from after it both fail,
+        // and not as a file that is too short does.
+        let mut buf = [0u8; 5];
+        for file in [&before, &vfs.open(bad, false).unwrap()] {
+            let error = read_exact_at(&**file, &mut buf, 0).unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+        // The file is otherwise as it was, other files are read, and so
+        // is a copy of this one.
+        assert!(vfs.exists(bad));
+        assert_eq!(before.len().unwrap(), 5);
+        for readable in [vfs.open(good, false).unwrap(), vfs.snapshot().open(bad, false).unwrap()] {
+            read_exact_at(&*readable, &mut buf, 0).unwrap();
+            assert_eq!(&buf, b"bytes");
+        }
+        // Only a part of it: the reads that touch the part fail.
+        vfs.fail_reads_within(bad, 2..3);
+        let mut two = [0u8; 2];
+        read_exact_at(&*before, &mut two, 0).unwrap();
+        assert_eq!(&two, b"by");
+        assert!(read_exact_at(&*before, &mut two, 1).is_err());
+        assert!(read_exact_at(&*before, &mut two, 2).is_err());
+        read_exact_at(&*before, &mut two, 3).unwrap();
+        assert_eq!(&two, b"es");
+        assert!(read_exact_at(&*before, &mut buf, 0).is_err());
+        // Cleared, the bytes are what they were.
+        vfs.fail_reads(None);
+        read_exact_at(&*before, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"bytes");
     }
 }
