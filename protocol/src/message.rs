@@ -637,6 +637,15 @@ pub fn decode_response(frame: &[u8]) -> DbResult<Response> {
 
 /// Cuts a result into responses of about `ROWS_FRAME_TARGET` bytes.
 pub fn rows_responses(set: RowSet) -> Vec<Response> {
+    // A result smaller than one response, which most are, is sent as it
+    // is, without moving its rows.
+    let mut size = 0usize;
+    if set.rows.iter().all(|row| {
+        size += row.iter().map(approx_size).sum::<usize>();
+        size < ROWS_FRAME_TARGET
+    }) {
+        return vec![Response::Rows { set, more: false }];
+    }
     let RowSet { columns, rows, affected, total } = set;
     let mut out = Vec::new();
     let mut batch = Vec::new();
