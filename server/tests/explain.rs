@@ -273,7 +273,9 @@ async fn a_slow_statement_is_written_to_the_log_with_what_it_read() -> DbResult<
     find(r#"query "notes\ndatabase: slow: 9 ms, database \"forged\"" by the whole table"#);
     find(r#"by index "notes\ndatabase: slow: 9 ms, database \"forged\"""#);
     find(r#"insert into "notes\ndatabase: slow: 9 ms, database \"forged\"", 1 rows"#);
-    assert!(lines.iter().all(|line| !line.contains("database \"forged\"") && !line.starts_with("database: slow: 9 ms")), "{lines:#?}");
+    // (Told apart by the forged database's name, and not by the forged
+    // time: a statement of the server's own may well take 9 ms.)
+    assert!(lines.iter().all(|line| !line.contains("database \"forged\"")), "{lines:#?}");
     // Never a statement's values: not what it filters by, not what it
     // writes, not what a prepared one is run with.
     for line in &lines {
