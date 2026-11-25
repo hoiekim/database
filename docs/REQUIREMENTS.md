@@ -28,7 +28,10 @@ Not built, because the applications this is for do not need it:
 `UNION` (two queries, merged by the caller), sequences other than
 auto-incrementing ids, triggers and stored functions (each is an
 expression the application can build, see R-Q20 and R-Q17), views,
-replication, explicit isolation levels, cursors, `COPY`.
+explicit isolation levels, cursors, `COPY`; of replication, more than
+one standby that follows one primary and is promoted by an operator
+(R-O11 to R-O14): no failover of its own accord, no standby of a
+standby, no writes on two servers.
 
 ## A. Values
 
@@ -137,3 +140,7 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-O8 | The log kept beyond its checkpoints, in a place the operator names, with copies of the data files to apply it to: every acknowledged commit is in that archive or still in a log file of the data directory, whatever the server is killed in the middle of | `DATABASE_ARCHIVE`: a checkpoint copies each log file there, whole and synced, before it removes it; `database base`; `database archive` verifies what is there |
 | R-O9 | A database as it stood at a moment: at a time, or at a commit. It holds every commit acknowledged by then and none made after; a moment the archive cannot give exactly is refused; a restore that fails or is cut short leaves the server as it was | `database recover`: a base and the log after it, applied as recovery applies a log, built aside and renamed into place |
 | R-O10 | An archive that cannot be written (full, unreachable) costs no commit and no availability: commits go on, and the log waits in the data directory until the archive takes it | A log file is removed only once its copy is in the archive |
+| R-O11 | A second server that follows the first: it receives what the first commits and applies it, and answers reads. What it shows is the first server as of one of its commits, whole, and never an earlier one than it showed before | `DATABASE_PRIMARY`: a standby is sent its primary's log as the primary syncs it, writes it to files of its own, and applies whole records as one version |
+| R-O12 | Either server killed, the primary restarted, the network between them cut, the standby left behind: the standby is at every moment a prefix of the primary's history, and has all of it again once the two can talk | The standby's copy of the log is the primary's bytes at the primary's places; it asks from where its copy ends; behind what the primary keeps, it reads the archive or begins again from a base |
+| R-O13 | A standby made the primary by an operator; and no two servers taking writes into one history, whatever is restarted with whatever settings | `database promote`: recovery of the copy, then a new identity. A copy takes no writes until then, because a mark beside its data file says what it is, not the server's settings |
+| R-O14 | How far behind a standby is, said by the server | `database stats`, on the standby: where its copy ends, where the primary's log was when it last said, and how long ago that was |

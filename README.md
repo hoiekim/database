@@ -44,7 +44,7 @@ db.transaction(|tx| async move {
 ## What it does
 
 - **What an ordinary web application asks of Postgres**, written down as
-  78 requirements (`docs/REQUIREMENTS.md`), each covered by tests that
+  82 requirements (`docs/REQUIREMENTS.md`), each covered by tests that
   cite it. Tables with defaults, checks and foreign keys; unique,
   partial, expression and multi-valued indexes; joins, subqueries and
   aggregates; upserts and compare-and-swap; JSON; exact decimals; trees;
@@ -64,6 +64,9 @@ db.transaction(|tx| async move {
   copies each log file there before a checkpoint removes it, and
   `database recover` rebuilds a database as it stood at a time or at a
   commit (`docs/OPERATIONS.md`, "Restoring to a moment").
+- **A standby.** A second server follows the first, is sent each commit
+  as it reaches the first one's disk, answers reads, and is made the
+  primary by an operator (`docs/OPERATIONS.md`, "A standby").
 - **Small.** One process, a 3 MB binary, 3 MB of memory when idle, a
   page cache with a fixed budget, no background work when nothing
   changes. Dependencies: an async runtime, a CRC, a JSON library.
@@ -164,6 +167,8 @@ The tests, by what they prove:
 | `engine/tests/archive.rs` | the log kept in an archive, on the simulated disk: the server killed before every operation it makes on the data directory or the archive, the power cut three ways each time; the archive unreachable, full, and failing at each of its operations once; a restore cut before each of its own. Every acknowledged commit is in the archive or in a log file still kept, and a restore to a commit or a time holds exactly the commits made up to it |
 | `engine/tests/faults_archived.rs` | `faults.rs` again, whole, with an archive on the disk that fails |
 | `server/tests/archive.rs` | a server process that archives, killed with `SIGKILL` under load four times, then restored to moments in the middle of the load; an archive taken away under a running server and given back; a dropped database restored |
+| `engine/tests/standby.rs` | a database that follows another, each on a simulated disk of its own: the log arriving a few bytes at a time shows only whole commits and never an earlier one; the standby killed before every operation of applying, of being begun and of being promoted; the primary crashed and restarted under it; the standby left behind what the primary keeps |
+| `server/tests/standby.rs` | a standby and its primary as two processes: the connection between them cut and held down under load, each of them killed, the primary stopped and started; a promotion, and each server then started as the other's standby by mistake |
 | `engine/tests/recovery.rs` | a random workload on a simulated disk that loses power at any write, keeping, dropping or tearing each unsynced write, with transactions open beside the writer; after every cut the database equals a model of what was committed and no page is lost |
 | `protocol/tests/vectors.rs` | the golden vectors are what the wire format is: 105 messages, each as the bytes this crate writes, and the limits `docs/PROTOCOL.md` states |
 | `clients/typescript/test`, `clients/python/tests` | each client writes those same bytes and reads them back, its builders mean what the Rust builders mean, and every kind of request works against a real server (`npm test`; `python -m unittest discover -s tests -t .`) |

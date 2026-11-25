@@ -18,6 +18,7 @@ database base [name...]              write a base of each database to the archiv
 database archive [name] [--commits]  verify the archive; with --commits, list every commit
 database recover <name> [--to <moment>] [--as <name>] [--replace]
                                      restore a database from the archive as it stood at a moment
+database promote [name...]           on a standby: make its copies databases of its own, which take writes
 ```
 
 ## The server
@@ -34,6 +35,9 @@ database recover <name> [--to <moment>] [--as <name>] [--replace]
 | `DATABASE_SLOW_MS` | (none) | log every statement that takes this many milliseconds or more (see "Checking") |
 | `DATABASE_ARCHIVE` | (none) | a directory to keep the log in beyond its checkpoints (see "Restoring to a moment") |
 | `DATABASE_ARCHIVE_SECONDS` | `60` | with an archive: the longest a commit waits before its log file is copied there; `0` leaves it to the ordinary checkpoints |
+| `DATABASE_PRIMARY` | (none) | `host:port` of a server to follow: this one is then its standby (see "A standby") |
+| `DATABASE_PRIMARY_PASSWORD` | `DATABASE_ADMIN_PASSWORD` | the primary's administrator's password |
+| `DATABASE_KEEP_LOG_MB` | `0` | on a primary: megabytes of log kept in the data directory past its checkpoints, for standbys that were away |
 
 It recovers every database in the data directory, then listens. On
 `SIGTERM` or `SIGINT` it stops taking connections, lets requests in
@@ -340,6 +344,176 @@ this, and its log is byte for byte what it was.
 Several servers may keep their logs in one directory: a history is
 named by its data file's identity as well as by its database's name.
 
+## A standby
+
+A standby is a second server that follows the first: it is sent every
+commit as it reaches the first one's disk, applies it, and answers
+reads. When the first server is lost, an operator makes the standby
+the primary. What the archive cannot hold, the last minute before a
+disk died, a standby has.
+
+```sh
+# the primary: as ever, and keeping some log for a standby that was away
+DATABASE_KEEP_LOG_MB=256 database serve
+
+# the standby, on another machine
+DATABASE_PRIMARY=primary.internal:5454 DATABASE_PRIMARY_PASSWORD=<the primary's admin password> database serve
+```
+
+The standby follows every database of the primary, with each one's
+password: an application reads from `database://shop:<password>@standby:5454`
+as it does from the primary. A write sent there is answered `ReadOnly`.
+The connection between the two is not encrypted, like any other.
+
+### How it starts
+
+A standby begins each database it does not have yet from a **base**: a
+copy of the data file as of a checkpoint, the same thing the archive
+keeps. It takes it
+
+1. from the archive, if the standby is started with the primary's
+   `DATABASE_ARCHIVE` (the same directory, mounted on both) and the
+   database's history is there: the newest base and every log file
+   after it, which costs the primary nothing;
+2. otherwise from the primary, which sends one over the connection,
+   read from its data file while it goes on committing.
+
+Then it asks the primary for the log from where the base, or the
+archive, ends, and is sent it from there on for as long as the two are
+connected. A standby reads the archive and writes nothing there.
+
+### What the primary guarantees, and what it does not
+
+**The primary does not wait for its standby.** A commit is answered
+when it is on the primary's disk, as without a standby, and is sent to
+the standby after that: only what is synced is sent, so that a standby
+never holds a commit the primary could lose in a crash and then make
+differently. A standby is therefore behind by what is on its way, in
+ordinary running a few milliseconds of commits, and if the primary's
+disk is lost at that moment, those commits are lost with it. They were
+acknowledged. That is the price of a primary whose commits do not
+depend on a second machine or on the network between the two.
+
+A commit that waits for one standby to have it on disk before it is
+answered would close that gap, and is **not built**. What it would cost
+is known: every commit, or every group of commits that shares a sync,
+would wait for a round trip to the standby and the standby's sync as
+well as its own, and a primary whose standby is away would have to
+choose between answering no commits and quietly answering them without
+the standby, which is the gap again at the moment it matters. Which of
+those a deployment wants is its owner's decision, and the first is the
+only one that keeps the promise.
+
+### What a standby's readers see
+
+The primary as of one of its commits: never part of a commit, and never
+an earlier commit than the same standby showed before. Each piece of
+log that arrives is written to the standby's own disk and synced, and
+then the commits that are whole in it are applied together and shown
+together. A reading transaction on a standby holds its moment as on a
+primary, however much arrives meanwhile. A read on a standby may be
+older than the same read on the primary by what is on its way.
+
+### How far behind it is
+
+`database stats` on the standby says, for each copy:
+
+```text
+standby copy shop: a copy of shop.5f0c…e1, which takes no writes; it has its primary's log up to 367:20931; its primary's log was at 367:21350 when last heard from, 212 ms ago: it is 419 bytes behind
+standby: following primary.internal:5454
+standby: "shop": following
+```
+
+The primary says where its log stands with every piece it sends and at
+least once a second, so a standby that has heard nothing for several
+seconds is not connected, and says so in the last line and in its log
+(`not connected to the primary: ...`). `stats` on the primary says how
+many standbys are being sent each database's log, and from which log
+file on it is kept for them.
+
+### When they lose each other
+
+- **The network is cut, or the standby is restarted or killed.** The
+  standby's copy of the log is the primary's own bytes, at the same
+  places in files of the same numbers, so it knows where it ends. It
+  asks again from there, every half second, until it is answered. A
+  standby killed in the middle of applying starts as a slightly
+  shorter copy and is sent the rest.
+- **The primary is restarted or killed.** The same: its standby reads
+  on, a little behind, and asks again when the primary is back. A
+  primary begins a new log file whenever it starts, and a checkpoint
+  removes the files before it, among them the one the standby was in
+  the middle of. `DATABASE_KEEP_LOG_MB` on the primary is for this: it
+  keeps that many megabytes of the newest log files past their
+  checkpoints. Set it on any primary that has a standby.
+- **The standby is behind what the primary still keeps** (away for
+  longer than `DATABASE_KEEP_LOG_MB` covers, or the primary keeps
+  none). The primary says so. A standby that reads the primary's
+  archive takes from there what the primary let go, and then asks the
+  primary again. One that does not, or whose archive does not reach,
+  **drops its copy and begins it again from a base**: the database is
+  not there on the standby for as long as that takes. While a standby
+  is connected, or was just sent a base, the primary keeps what that
+  standby has not been sent yet, whatever its checkpoints pass.
+- **The standby says its primary has another history.** The primary's
+  database was dropped and made again, or restored to a moment, or the
+  standby is pointed at another server. The standby leaves its copy as
+  it is and says so in `stats`; drop the copy on the standby
+  (`database drop`) and it begins a copy of the new one.
+
+### Making a standby the primary
+
+```sh
+database promote            # on the standby: every copy; or name the databases
+```
+
+Each copy is recovered as after a crash, at the last commit the standby
+had been sent, and becomes a database of that server's own, which takes
+writes. Point the applications at it. Then take `DATABASE_PRIMARY` out
+of its settings; until then it goes on looking at its old primary and
+leaves the promoted databases alone.
+
+What was acknowledged on the old primary and not yet sent is not on the
+promoted server (see above). If the old primary's disk still exists,
+those commits are on it, and nowhere else.
+
+**What stops two servers from writing one history:**
+
+- **A copy is a copy until it is promoted**, whatever the server is
+  started as. A file beside the data file marks it
+  (`<name>.standby`), not the server's settings: a standby started
+  without `DATABASE_PRIMARY`, by mistake or because the primary is
+  gone, still refuses writes to its copies.
+- **Promotion gives the database a new identity.** From that moment it
+  and the old primary are two histories that share a past. Neither is
+  ever taken for the other: a standby of the old primary is refused by
+  the new one and the other way round, their archives are two
+  directories, and a promoted server that is started as its old
+  primary's standby again leaves its promoted databases alone, with a
+  line in `stats`, and does not copy the old primary over them.
+- **A standby never writes over a database it did not copy.** If the
+  old primary is later started as a standby of the new one, its own
+  database of each name is left as it is (`is a database of this
+  server's own`). To make it a standby in earnest, drop those
+  databases on it; it then copies them from the new primary.
+
+What nothing in the server does is stop the old primary from taking
+writes if it is still running, and reachable by applications, when its
+standby is promoted: a server cannot know that another was promoted.
+Those writes go into the old history and never reach the new one. Stop
+the old primary, or take it off the network, before promoting.
+
+### What it costs the primary
+
+Nothing on a commit's way: a thread for each standby reads the log back
+from its files, up to where it is synced, and sends it. That thread's
+work is in the primary's process, about a fifth more instructions for
+each commit; no sync, and no wait (`PERFORMANCE.md`). The log kept for
+standbys takes `DATABASE_KEEP_LOG_MB` of disk at most, for each
+database, and what a connected standby has not been sent yet besides.
+A primary without a standby, and with `DATABASE_KEEP_LOG_MB` unset,
+does none of this.
+
 ## Checking
 
 - `database ping`: the server answers. The container's health check.
@@ -427,6 +601,7 @@ costs availability and not commits.
 <data>/ACCESS             each database's salted password hash
 <data>/<name>.db          the data, in 8 KiB pages
 <data>/<name>.wal-<n>     commits since the last checkpoint
+<data>/<name>.standby     on a standby: marks the database as a copy, which takes no writes
 <archive>/<name>.<id>/    with DATABASE_ARCHIVE: one history's bases and log files
 ```
 
@@ -451,6 +626,14 @@ of its commit. Builds from before the archive do not know that record
 either, and refuse to start on a log that holds one: the same clean
 stop empties the logs. Nothing else in the data directory differs, and
 the archive directory is not read by a server started without it.
+
+A build from before standbys does not know the mark of a copy
+(`<name>.standby`) and would open a standby's copy as a database of
+its own, which takes writes into its primary's history. Do not start
+one on a standby's data directory: promote the copies first, or drop
+them. On a primary, `DATABASE_KEEP_LOG_MB` leaves log files that such a
+build removes when it starts, as it removes any log file a checkpoint
+has passed.
 
 A database with a column that keeps the start of its large values in
 its rows (`keep_start`, `CLIENT.md`) is stored in a form that a build

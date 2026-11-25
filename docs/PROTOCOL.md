@@ -21,7 +21,7 @@ What a request *means* (what a query reads, when a transaction
 conflicts) is in `CLIENT.md`. This file says how each one is written and
 what the server answers.
 
-This document describes protocol version **6**. What a version after 2
+This document describes protocol version **7**. What a version after 2
 added is marked "from version N" where it is described; "Versions" lists
 it all in one place. The golden vectors are of version 2, and the
 clients in `clients/` greet with version 2.
@@ -51,7 +51,9 @@ only after it has answered the last. Every request gets exactly one
 response frame, with three exceptions: a result may come as several
 `Rows` frames (see "Results in several frames"), a dump is answered with
 `Chunk` frames until a final `Ok` or `Error`, and a batch is answered
-with one result for each of its statements (see "Batches").
+with one result for each of its statements (see "Batches"). Two more
+are a standby's alone (see "Between servers"): a base comes as a dump
+does, and the log as frames without end.
 
 A request the server cannot decode is answered with an `Error` of code
 `InvalidRequest`, and the connection carries on. An `Error` is always an
@@ -108,7 +110,7 @@ Hello: version u32, database str, password str, client str
 
 - `version` is the protocol version the client speaks: the newest one
   whose messages it implements, both those it sends and those it reads
-  (see "Versions"). A server answers versions 2 to 6.
+  (see "Versions"). A server answers versions 2 to 7.
 - `database` is the database to use. It may be empty, with the
   administrator's password, for a connection that only administers.
 - `password` is that database's password, or the administrator's, which
@@ -164,6 +166,7 @@ tag        u8         which request
 | 20 | BeginWith | `kind u8, lock_wait_ms varint, statement Request` | What the statement answers. From version 3; see "Beginning with a statement" |
 | 21 | Batch | `items list(BatchItem)`, where `BatchItem` is `statement Request, expect opt(varint)` | One result per statement, or one `Error`. From version 3; see "Batches" |
 | 22 | Explain | `statement Request` | `Rows`: one row of four ints. From version 4; see "Explain" |
+| 23 | Follow | `database str, uuid bytes, generation varint, offset varint` | `Log` frames for as long as the connection lasts, or one `Error`. From version 7; see "Between servers" |
 
 In tags 19 to 22, a field of type `Request` is a request as this table
 gives it, without a `timeout_ms` of its own: its `u8` tag, then its
@@ -386,6 +389,8 @@ A response's payload is a `u8` tag and its fields:
 | 8 | Text | `str` |
 | 9 | Chunk | `bytes` |
 | 10 | Error | `code u8, message str, constraint opt(str), table opt(str)` |
+| 11 | Sources | a `varint` count, then for each `name str, uuid bytes, note bytes`. From version 7 |
+| 12 | Log | `generation varint, offset varint, bytes, end_generation varint, end_offset varint, time zigzag`. From version 7 |
 
 In `Rows`, `rows` is a `varint` count of rows, then each row as one
 `Value` per column, in the order of `columns`, with nothing between rows.
@@ -438,6 +443,8 @@ errors the name of what was broken and its table.
 | 22 | Conflict | An optimistic transaction was told something that a commit made beside it has since changed. Nothing of it took effect |
 | 23 | NotPrepared | From version 3. A `Prepared` without its statement named a number the connection does not keep. Nothing was run: send it again with the statement (see "Prepared statements") |
 | 24 | Unmet | From version 3. A statement of a batch did not affect the number of rows its `expect` gave. Nothing of the batch took effect (see "Batches") |
+| 25 | ReadOnly | From version 7. A write was sent to a database that follows another server's. A standby answers reads and takes no writes until it is promoted |
+| 26 | Behind | From version 7. In answer to `Follow` only: the server no longer keeps its log from the place asked for |
 
 A client reads a code it does not know as `Internal` (19), which is
 what the Rust decoder does: a newer server's new code is then an error
@@ -881,6 +888,9 @@ database's own password is answered `AccessDenied`.
 | 12 | Base | `databases list(str)` | `Text`: a line for each base written. From version 6 |
 | 13 | Archive | `history str, commits bool` | `Text`: a report. From version 6 |
 | 14 | Recover | `from str, to Moment, target str, replace bool, password str` | `Text`: what was restored. From version 6 |
+| 15 | Sources | | `Sources`. From version 7 |
+| 16 | BaseOf | `database str` | `Chunk` frames, then `Ok` or `Error`. From version 7 |
+| 17 | Promote | `databases list(str)` | `Text`: a line for each. From version 7 |
 
 `Checkpoint`, `Check` and `Stats` are about the connection's own
 database, or about every database on an administering connection.
@@ -934,6 +944,79 @@ leaves the server as it was. Connections
 to a database that was replaced are answered `Unavailable` from then
 on, as after a restore of a dump.
 
+## Between servers
+
+A **standby** is a server that keeps a copy of another server's
+databases, its **primary**, and answers reads from them
+(`OPERATIONS.md`, "A standby"). It is a client of its primary: it
+greets with the primary's administrator's password, as version 7 or
+later, and then sends these. All are refused with `AccessDenied` on a
+connection that greeted with a database's password.
+
+**`Sources`** (an admin request) is answered with the databases a
+standby would follow: each one's name, the 16 bytes that identify its
+history (a database dropped and made again under its name has others,
+and so has one restored from an archive or promoted), and its password
+as the server stores it, 48 bytes of salt and hash, which the standby
+stores for its copy so that clients reach the copy as they reach the
+original. A database that the server itself only follows is not listed.
+
+**`BaseOf`** is answered like a dump: `Chunk` frames, then `Ok`, or an
+`Error` in place of the `Ok`. The chunks' bytes are the database's data
+file as of a checkpoint, and after them 40 bytes that say which log
+file continues from it:
+
+```text
+"dbbase01"  8 bytes
+generation  u64, little-endian: the log file that continues from the base
+time        i64, little-endian: microseconds since the epoch, or 0
+length      u64, little-endian: the bytes before this trailer
+crc         u32, little-endian: CRC-32 of those bytes
+crc         u32, little-endian: CRC-32 of the 36 bytes above
+```
+
+A standby begins its copy from these bytes and then asks for the log
+from byte 36 of log file `generation`, which is where every log file's
+records begin. The server keeps its log from there for two minutes,
+whatever its checkpoints pass, for that request to come.
+
+**`Follow`** asks for a database's log from where the standby has it up
+to: byte `offset` of log file `generation`, of the history `uuid`. The
+answer is a stream of `Log` frames that ends only with the connection,
+or a single `Error`, after which the connection takes requests again:
+
+| Code | When |
+|---|---|
+| `NotFound` | The server has no database of that name |
+| `InvalidRequest` | The database is another history than `uuid`; or its log does not hold that place, which is then a place in some other history; or the database follows another server itself |
+| `Behind` | The log file asked for is no longer kept. The standby reads the server's archive if it can, or begins again from a base |
+
+A `Log` frame carries bytes of log file `generation` that lie at byte
+`offset` of it, exactly as they lie in the server's own file, cut
+wherever the frame ended: a record may come in parts. Frames come in
+order and without gaps: each begins where the one before ended, or is
+the first of the next file, with `generation` one more and `offset` 36.
+A frame may carry no bytes. One is sent at least every second when
+there is nothing else to send, and the first frame of a file may be
+one.
+
+`end_generation` and `end_offset` say where the server's log is on its
+disk up to as the frame is sent, and `time` is the server's clock then,
+in microseconds since the epoch: by these a standby knows how far
+behind it is. **Only what is on the server's disk is ever sent**, so a
+standby holds no commit its primary could lose in a crash.
+
+The standby sends nothing on the connection while the stream lasts, and
+ends it by closing the connection. What a log file's bytes mean is not
+part of this protocol: a standby is the same build as its primary, or a
+newer one.
+
+**`Promote`** is sent to a standby, by an operator's tool: each named
+database that follows another server's, or every one when none is
+named, becomes the server's own, at the last commit it was sent, with
+other identifying bytes than it had; it takes writes from then on. It
+is `InvalidRequest` when no database named follows another.
+
 ## Broken connections
 
 A connection is **broken** from the moment a request is sent until the
@@ -984,9 +1067,10 @@ takes nothing away:
 | 4 | The request `Explain` (22) |
 | 5 | A column's last byte is `flags`, which may be followed by `keep_start` (see "Definitions") |
 | 6 | The admin requests `Base` (12), `Archive` (13) and `Recover` (14) |
+| 7 | The request `Follow` (23); the admin requests `Sources` (15), `BaseOf` (16) and `Promote` (17); the responses `Sources` (11) and `Log` (12); the error codes `ReadOnly` (25) and `Behind` (26) |
 
-**What the server does today.** It speaks versions 2 to 6. It answers a
-`Hello` that names a version in that range with its own, 6, and refuses
+**What the server does today.** It speaks versions 2 to 7. It answers a
+`Hello` that names a version in that range with its own, 7, and refuses
 any other with `ProtocolMismatch`, then closes the connection. It
 answers every request it can decode in the same way whatever version
 the client greeted with, with one difference: to a client that greeted
@@ -999,8 +1083,8 @@ those after it:
   those it sends and those it reads. One that implements only version 2
   sends 2, whatever versions exist by then; one that sends `Prepared`
   sends at least 3, one that sends `Explain` at least 4, one that
-  reads `keep_start` 5, and one that sends `Base`, `Archive` or
-  `Recover` 6.
+  reads `keep_start` 5, one that sends `Base`, `Archive` or
+  `Recover` 6, and one that sends what "Between servers" describes 7.
 - A server answers `ProtocolMismatch` to a version it does not speak,
   in its answer to `Hello`, and to nothing later. A server may speak
   several versions; a client must not assume which, and must be ready
@@ -1026,6 +1110,13 @@ version.
 
 **Version 6** adds three admin requests and changes nothing a client
 of an earlier version sends or reads.
+
+**Version 7** adds what a standby and its primary say to each other,
+which no other client sends, and one error code that any client may be
+answered with: `ReadOnly`, for a write sent to a standby's copy. A
+client that does not know it reads it as `Internal`, as it reads any
+code it does not know; one that means to send its writes elsewhere
+when it meets a standby knows the code.
 
 **What a client does with what it does not know:**
 

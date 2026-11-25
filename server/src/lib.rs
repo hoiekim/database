@@ -252,6 +252,9 @@ impl Server {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                     _ = tidy_stop.changed() => return,
                 }
+                // The log kept for a standby that took a base is let go
+                // once it has had its time to come back for it.
+                tidy_state.base_pins.lock().unwrap().retain(|(since, _)| since.elapsed() < session::BASE_PIN);
                 let now = tidy_state.requests.load(Ordering::Relaxed);
                 if now != seen {
                     seen = now;

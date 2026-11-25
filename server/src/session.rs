@@ -244,7 +244,7 @@ const LOG_PIECE: usize = 1 << 20;
 const FOLLOW_BEAT: Duration = Duration::from_secs(1);
 /// How long the log from a base on is kept for the standby that took
 /// the base to come back and ask for it.
-const BASE_PIN: Duration = Duration::from_secs(120);
+pub(crate) const BASE_PIN: Duration = Duration::from_secs(120);
 
 /// The largest frame taken from a connection that has not yet said who
 /// it is: room for a greeting and little else.

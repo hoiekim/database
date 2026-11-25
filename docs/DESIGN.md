@@ -49,6 +49,7 @@ A database named `shop` is three kinds of file in the data directory:
 ```text
 shop.db             pages of 8 KiB
 shop.wal-0000000007 the log of commits since the last checkpoint
+shop.standby        on a standby: marks the database as a copy of another server's
 ACCESS              every database's password hash (one file for the server)
 LOCK                held while a server has the directory open
 ```
@@ -430,6 +431,91 @@ the archive after one more checkpoint is whole, and it restores the
 table as it stood at commits made before the kill. `faults.rs` itself
 runs a second time with an archive on the failing disk
 (`faults_archived.rs`).
+
+### A standby (`db.rs`, `server/src/standby.rs`)
+
+A standby keeps a copy of another server's databases and answers reads
+from it. The whole of it rests on one decision: **the standby's log
+files are the primary's log files**, byte for byte, under the same
+numbers. The primary sends bytes of a file and the place they lie at;
+the standby writes them at that place in its own file of that number
+(`Database::receive`). A record's CRC covers its file's number and its
+own place, so it checks in the copy exactly as in the original, and
+three things follow without further machinery:
+
+- **Where the copy ends is all a standby needs to know of itself.** It
+  asks for the log "from byte 20,931 of file 367" and is sent what
+  comes after, whether it was away for a second or restarted. There is
+  no count of what was acknowledged to keep on either side, and nothing
+  to reconcile.
+- **A crash leaves a shorter copy, and recovery already reads that.** A
+  standby that starts replays its files as any database does and goes
+  on from where the last whole record ends, cutting off a tail the
+  crash tore. It is then a prefix of the primary's history, as before.
+- **Promotion is recovery.** A copy that is to take writes is opened as
+  a database is after a crash: its log replayed, a new file begun, a
+  checkpoint written.
+
+**Only what is synced is sent** (`Database::read_log` reads up to where
+`Wal` says the log is on disk, and no further). A record that is
+written and not yet synced can be lost by a crash of the primary, which
+then goes on to write something else at that place; a standby that had
+it would hold a commit that never was. So the stream is behind the
+disk, and the disk is behind nothing a client was told.
+
+**Applying.** `receive` writes the bytes and syncs them, then takes the
+records that are now whole and applies them with the code that replays
+a log, all of them in one transaction that becomes one version. A
+reader on the standby therefore sees the primary as of a commit, and
+the versions it sees only go forward. The bytes of a record that is not
+whole yet wait in memory, and on disk, for the rest.
+
+**Checkpoints.** A checkpoint says which log file continues from it,
+and a file is replayed from its start; so a standby can checkpoint only
+where the log passes from one file to the next, and does so there
+(`turn_log`): the first bytes of the next file are the primary's word
+that the current one is complete. The standby's data file is then what
+the primary's was at that point, reached by other writes.
+
+**A copy is marked** by a file beside its data file, written before the
+data file is given its name. The mark, and not the server's settings,
+is what makes `begin_write` refuse: a copy must not take a write under
+any way of starting the server, since a write would be a commit into
+the primary's history that the primary does not have. Promotion
+replaces the mark with one that says a promotion is under way, then
+recovers the copy, gives the file a new uuid (as a restore does, and
+for the same reason: from here on it is another history) and removes
+the mark. A stop at any step is followed by the same steps from the
+start, never by following again, because recovery has by then begun a
+log file of this server's own and the copy is no longer the primary's.
+`engine/tests/standby.rs` kills a promotion before each of its
+operations: what starts afterwards is a copy that can still be sent
+its primary's log, or a promoted database, and holds the same commits
+either way.
+
+**What the primary does for a standby** is read its log back. A stream
+(`Session::follow`) is a thread that reads the log files up to the
+synced place, sends what it finds, and sleeps on the condition that a
+sync signals anyway. Nothing is added to a commit. While a stream
+lasts, the files it has not sent yet are pinned and no checkpoint
+removes them; for a standby that is away, the primary keeps as much log
+past its checkpoints as it is told to (`keep_log_bytes`), and beyond
+that the standby is told it is `Behind` and reads the archive, whose
+copies are the same bytes, or begins again.
+
+**The standby's side** is `server/src/standby.rs`: a task that asks the
+primary which databases it has, and one for each database that begins
+the copy, asks for the log, hands each piece to the engine, and asks
+again whenever the stream ends. It never touches a database it did not
+copy.
+
+The tests: `engine/tests/standby.rs` is two engines on two simulated
+disks, the log passed between them in pieces of any size. It reads the
+standby after every piece (always a commit of the primary's, never an
+earlier one), kills the standby before every operation of applying, of
+being begun and of being promoted, and crashes and restarts the primary
+under it. `server/tests/standby.rs` is two server processes with a
+relay between them that drops connections on command.
 
 ## Transactions (`db.rs`, `write.rs`)
 

@@ -169,7 +169,7 @@ impl Pair {
     }
 }
 
-// R-O11
+// R-O11, R-O14
 #[test]
 fn a_standby_reads_its_primary_as_of_one_commit_and_never_an_earlier_one_than_before() {
     let mut pair = pair(1);

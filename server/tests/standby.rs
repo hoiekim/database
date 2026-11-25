@@ -254,7 +254,7 @@ async fn ended(stop: Arc<AtomicBool>, tasks: Vec<tokio::task::JoinHandle<()>>) {
     }
 }
 
-// R-O11, R-O12
+// R-O11, R-O12, R-O14
 #[tokio::test(flavor = "multi_thread")]
 async fn a_standby_holds_whole_commits_through_cuts_and_kills_and_all_of_them_afterwards() -> DbResult<()> {
     let (primary_dir, standby_dir) = (TempDir::new(), TempDir::new());
@@ -415,10 +415,6 @@ async fn a_promoted_standby_takes_writes_and_is_never_again_a_copy_of_the_primar
     }
     assert!(batches(&old.connect("test").await?).await?.contains_key(&2_000_002));
     old.connect("").await?.admin().drop_database("test").await?;
-    // The standby task looks at its primary's databases anew when it is
-    // started.
-    old.kill();
-    let old = Process::start(primary_dir.path(), primary_port, &[("DATABASE_PRIMARY", format!("127.0.0.1:{standby_port}"))]).await;
     let held = caught_up(&standby, &old, "the old primary as a standby of the new").await;
     assert!(held.contains_key(&1_000_003) && !held.contains_key(&2_000_002));
     Ok(())

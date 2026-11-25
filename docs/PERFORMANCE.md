@@ -622,6 +622,41 @@ commits go on; no checkpoint of that database is made meanwhile, so its
 log and the pages waiting for a checkpoint grow for as long as the copy
 takes. That was not measured on a large database.
 
+## What a standby costs its primary
+
+A standby (`OPERATIONS.md`, "A standby") is sent the log by a thread of
+the primary's that reads it back from its files. Counted as above, on
+durable inserts from one connection with the standby on the same
+machine:
+
+| Per durable insert | No standby | Log kept for one (`DATABASE_KEEP_LOG_MB`) | A standby connected |
+|---|---:|---:|---:|
+| Instructions in the primary | 48,170 | 48,200 | 57,150 |
+| Syncs on the primary | 1 | 1 | 1 |
+
+The 9,000 instructions are the stream's: for each commit that reaches
+the disk it wakes, reads the record from the log file, and sends it as
+one frame. They are in the primary's process and not on a commit's
+way: the commit is answered when its own sync returns, as before, and
+5,000 inserts took 1.6 to 2.1 seconds with a standby and without one,
+which is what two runs of either differ by on this machine. The primary
+held 0.4 MB more with a standby connected. The log kept for standbys is
+disk only: the files a checkpoint would have removed stay, up to the
+megabytes asked for.
+
+Against the build before standbys, a primary with none executes about
+270 more instructions for an insert (0.6%). Some forty are in code this
+changed: where a sync notes the place the log is on disk up to, and one
+more field and two more cases where a connection reads a request. The
+rest is the compiler placing unchanged code differently, as measured by
+function: an iterator in the insert path that this does not touch moved
+by 130 instructions on its own.
+
+What was not measured: a standby on another machine, where the stream
+shares the primary's network with its clients; several standbys; and a
+primary on one CPU, where the stream's thread takes time the commits
+would have had.
+
 ## Running it
 
 ```sh
