@@ -414,6 +414,48 @@ little. The server's CPU time for the load was 47 to 56 s before and 43
 to 55 s after; the trims take part of what was saved (40 to 46 s
 without the budget).
 
+What the peak was made of was then measured, with a counter of the
+bytes in use in the server's allocator, the C library's own account of
+its pools (`mallinfo2`, `malloc_info`) and the process's resident
+memory, sampled every 20 ms during the load (five runs). At its
+highest the process held 113 to 125 MB, of which 43 to 53 MB was in
+use: about 35 MB of pages (private, committed and cached; the cache was
+not full), 3 to 4 MB of words cut ahead, and a few megabytes of decoded
+statements and log records. The C library's pools spanned 134 to 153
+MB, with 80 to 97 MB of it free, in chunks of up to 5 MB in the pools
+of the threads that had run statements. Between trims the
+resident memory climbed by 30 MB in a fifth of a second as writes took
+that free memory again, and fell back at the next trim. Free chunks
+that large are a statement's memory, freed and joined together, which
+the pool cannot give back because pages still in use lie beyond them:
+a page is allocated by the thread that reads or writes it, among the
+statement's short-lived memory, and then stays in the cache. With the
+pools limited to one, the peak was 73 MB, but the load ran slower and
+reads on several connections run at half speed (above); with two, 97
+to 102 MB.
+
+So pages are now taken from memory the server maps for them alone
+(`server/src/memory/pages.rs`): slots of a page's size, and a stack of
+the free ones, with a slot freed taken again before more is mapped, and
+the free ones beyond 4 MB given back to the system when the server
+trims. Over ten runs of the load each, alternating the two builds on
+this machine while it was shared:
+
+| | Most memory held (`VmHWM`) | Server CPU for the load |
+|---|---|---|
+| Before | 111.6, 113.9, 116.1, 118.5, 121.3, 124.4, 124.7, 125.1, 126.7, 131.4 MB | 37.1 to 39.0 s |
+| Pages kept apart | 81.2, 81.3, 82.1, 82.3, 83.1, 83.7, 83.9, 84.8, 85.1, 87.3 MB | 34.6 to 36.6 s |
+
+At the peak (measured as before, in other runs), the pages' memory was
+47 to 49 MB, about 35 MB of it in use, and the C library's pools spanned
+36 to 42 MB, 13 to 15 MB of it in use. On four cores the library makes
+eight pools rather than the six it makes on the three cores these runs
+had; with eight, five runs held 82.1 to 87.3 MB. The peak no longer
+rests on the trims made as large requests are answered: without them it
+was 94 to 96 MB with six pools and 102 MB with eight (two runs each).
+The load's statements a second moved between 6.8 and 14.4 in both builds
+with the machine's other work, and say nothing either way.
+
 Merging beside the writer leaves the data file larger. Stopped as soon
 as the load was over, the server's file held 803 MB: 83,729 pages in
 use and 14,316 free, where it held 665 MB, 73,968 in use and 7,221
@@ -441,6 +483,7 @@ grew by 598 MB and then by 612 MB: 1,800 MB and 1,210 MB in all, with
 | **Hold only what a merge reads**: keep the pages of the segments being merged from being given out again, not every page freed meanwhile | Writers reuse freed pages while a merge runs | Fewer free pages after a load (how many is not measured) | Moderate: the store keeps whole versions, not sets of pages |
 | **Fewer merges dropped**: a writer that merges past 40 segments changes the segments a merge beside it is reading | In the engine-only loads above, 4 of 14 and 10 of 30 merges were dropped and their trees freed | Less work, fewer free pages | Small to moderate: the writer could merge only segments newer than those being merged |
 | **Trim less, at less cost**: return only the pools the large requests used | The CPU time the trims take | A few seconds of the load's CPU | Small; the C library trims all pools at once |
+| **Fewer pools for the threads that run statements**: run large statements on a few threads of their own | The 20 to 30 MB of free memory the C library's pools keep after statements | Most of that | Moderate: a statement would change threads, which a small one should not |
 
 ### 4. Transactions of several requests (0.91×)
 
