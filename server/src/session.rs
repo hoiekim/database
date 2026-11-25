@@ -1636,6 +1636,10 @@ impl Session {
                 let mut report: String = self.targets()?.iter().map(|db| db.stats()).collect();
                 let (held, capacity) = state.engine.cache_usage();
                 report.push_str(&format!("cache: {held} of {capacity} pages\n"));
+                let (mapped, free) = crate::memory::pages_held();
+                if mapped > 0 {
+                    report.push_str(&format!("memory for pages: {:.1} MB, of it free {:.1} MB\n", mapped as f64 / 1_048_576.0, free as f64 / 1_048_576.0));
+                }
                 let forks = |how: usize| state.forks[how].load(Ordering::Relaxed);
                 report.push_str(&format!("optimistic transactions: {} committed as they stood, {} run again, {} in conflict\n", forks(AS_IT_STOOD), forks(RUN_AGAIN), forks(IN_CONFLICT)));
                 report.push_str(&format!("requests: {}\n", state.requests.load(Ordering::Relaxed)));

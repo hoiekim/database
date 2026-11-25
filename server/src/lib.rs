@@ -28,6 +28,11 @@ use tokio::sync::{watch, Notify};
 
 pub use access::sha256;
 
+/// Blocks the size of a page from a pool of their own (`memory`), in the
+/// server and in its tests alike.
+#[global_allocator]
+static ALLOCATOR: memory::Allocator = memory::Allocator;
+
 /// How a server is started.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {

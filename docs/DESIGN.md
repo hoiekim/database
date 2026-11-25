@@ -100,6 +100,17 @@ Pages are held in three places:
   could hold: a lookup only reads its part of the cache, and a query
   keeps the upper pages it has met at hand for its next row.
 
+In the server, the memory of a page in any of the three comes from a
+pool of page-sized slots (`server/src/memory/pages.rs`), not from the C
+library's per-thread pools. A page lives as long as the cache keeps it,
+and in those pools it was allocated among the short-lived memory of the
+request that read or wrote it; once that was freed, the page still in
+use kept the pool around it from shrinking, and under a bulk load the
+library's pools held two to three times what was in use. A slot freed
+is taken again before more memory is mapped, so the pool holds at most
+the most pages that were in use at once, and a trim gives the memory of
+free slots beyond 4 MB back to the system.
+
 ### Trees (`btree.rs`)
 
 Everything stored is a B+tree of byte-string keys and values: a table is
@@ -588,11 +599,10 @@ requests (an exclusive transaction) never waits for the budget, since
 whoever holds the budget may be waiting for that turn: it takes what is
 free of its share, which may be less than the share or nothing, and
 runs. As a large request is answered, the memory it held is
-handed back to the system, at most five times a second; left in the
-allocator's pool of the thread that decoded it, it was most of what the
-server held during a bulk load. Only the GNU C library keeps such pools
-and is asked to (`memory.rs`); built for any other, the server has the
-budget alone.
+handed back to the system, at most five times a second, rather than
+left in the allocator's pool of the thread that decoded it. Only the GNU
+C library keeps such pools and is asked to (`memory.rs`); built for any
+other, the server has the budget alone.
 
 ## Dump and restore (`dump.rs`)
 
