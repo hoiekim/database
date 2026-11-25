@@ -98,7 +98,11 @@ fn header(generation: u64, uuid: &[u8; 16]) -> Vec<u8> {
 }
 
 fn record_crc(generation: u64, offset: u64, bytes: &[u8]) -> u32 {
-    stamped_crc(generation, offset, &[], bytes)
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&generation.to_le_bytes());
+    hasher.update(&offset.to_le_bytes());
+    hasher.update(bytes);
+    hasher.finalize()
 }
 
 /// The CRC of a record that is `stamp` and then `bytes`.
@@ -259,14 +263,18 @@ impl Wal {
             frame.extend_from_slice(&record_crc(tail.generation, tail.offset, &link).to_le_bytes());
             frame.extend_from_slice(&link);
         }
-        let mut stamp = [STAMP; STAMP_LEN];
-        let stamped = if self.stamp { tail.stamped.max(database_protocol::time::now_micros()) } else { tail.stamped };
-        stamp[1..].copy_from_slice(&stamped.to_le_bytes());
-        let stamp = &stamp[..stamp_len];
         let at = tail.offset + frame.len() as u64;
-        frame.extend_from_slice(&((bytes.len() + stamp_len) as u32).to_le_bytes());
-        frame.extend_from_slice(&stamped_crc(tail.generation, at, stamp, bytes).to_le_bytes());
-        frame.extend_from_slice(stamp);
+        if self.stamp {
+            let mut stamp = [STAMP; STAMP_LEN];
+            tail.stamped = tail.stamped.max(database_protocol::time::now_micros());
+            stamp[1..].copy_from_slice(&tail.stamped.to_le_bytes());
+            frame.extend_from_slice(&((bytes.len() + STAMP_LEN) as u32).to_le_bytes());
+            frame.extend_from_slice(&stamped_crc(tail.generation, at, &stamp, bytes).to_le_bytes());
+            frame.extend_from_slice(&stamp);
+        } else {
+            frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&record_crc(tail.generation, at, bytes).to_le_bytes());
+        }
         frame.extend_from_slice(bytes);
         let end = tail.offset + frame.len() as u64;
         let mut written = tail.file.write_at(&frame, tail.offset);
@@ -286,7 +294,6 @@ impl Wal {
         tail.link = 0;
         tail.appended = version;
         tail.last_record = version;
-        tail.stamped = stamped;
         Ok(())
     }
 

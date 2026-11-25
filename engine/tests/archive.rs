@@ -391,9 +391,12 @@ fn a_restored_database_is_a_history_of_its_own() {
     verify(&engine.database("test").unwrap(), &model_now);
 }
 
+/// What a power cut leaves of each change no sync had made durable.
+type Cut = Box<dyn FnMut(&database_engine::vfs::Unsynced) -> Fate>;
+
 /// The disk as it stood before operation `at` of a journal kept from
 /// `base` on, cut there the way `fate` says.
-fn cut(base: &MemVfs, journal: &[database_engine::vfs::Entry], at: usize, fate: &mut dyn FnMut(&database_engine::vfs::Unsynced) -> Fate) -> MemVfs {
+fn cut(base: &MemVfs, journal: &[database_engine::vfs::Entry], at: usize, fate: &mut Cut) -> MemVfs {
     let disk = base.snapshot();
     for entry in &journal[..at] {
         disk.apply(entry);
@@ -425,7 +428,7 @@ fn a_kill_before_any_operation_loses_no_commit_from_the_database_or_from_its_arc
         // lost on its own, the last write torn.
         let last = journal[..at].iter().rposition(|entry| matches!(entry.op.kind, OpKind::Write { .. })).map(|i| journal[i].op.index);
         let seed = rng.next();
-        let fates: [Box<dyn FnMut(&database_engine::vfs::Unsynced) -> Fate>; 3] = [
+        let fates: [Cut; 3] = [
             Box::new(|_| Fate::Kept),
             Box::new(|_| Fate::Lost),
             Box::new(move |change| {
@@ -584,7 +587,7 @@ fn a_restore_cut_before_any_of_its_operations_leaves_the_database_as_it_was() {
     let mut rng = Rng::new(51);
     for at in 0..=journal.len() {
         let seed = rng.next();
-        let fates: [Box<dyn FnMut(&database_engine::vfs::Unsynced) -> Fate>; 3] = [
+        let fates: [Cut; 3] = [
             Box::new(|_| Fate::Kept),
             Box::new(|_| Fate::Lost),
             Box::new(move |change| if Rng::new(seed ^ change.op).chance(2) { Fate::Lost } else { Fate::Kept }),
