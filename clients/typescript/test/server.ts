@@ -7,7 +7,7 @@
 // are skipped; with `DATABASE_BIN` set to something that is not there,
 // they fail, so that CI cannot pass by testing nothing.
 
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
@@ -57,10 +57,14 @@ export class Server {
     return server;
   }
 
+  private environment(): NodeJS.ProcessEnv {
+    return { ...process.env, DATABASE_ADMIN_PASSWORD: ADMIN_PASSWORD, DATABASE_DATA: join(this.dir, "data"), DATABASE_LISTEN: `127.0.0.1:${this.port}` };
+  }
+
   private async run(): Promise<void> {
     const log = openSync(join(this.dir, "server.log"), "a");
     this.child = spawn(this.path, ["serve"], {
-      env: { ...process.env, DATABASE_ADMIN_PASSWORD: ADMIN_PASSWORD, DATABASE_DATA: join(this.dir, "data"), DATABASE_LISTEN: `127.0.0.1:${this.port}` },
+      env: this.environment(),
       stdio: ["ignore", log, log],
     });
     const deadline = Date.now() + 60_000;
@@ -94,6 +98,20 @@ export class Server {
     await admin.admin.createDatabaseIfNotExists(database, PASSWORD);
     admin.close();
     return Client.connect({ ...this.config(database), ...settings });
+  }
+
+  /**
+   * Runs `database role <arguments>` against this server: this client
+   * greets with a protocol version that has no request to make a role or
+   * grant it anything. `password` is the new role's, for `create`.
+   */
+  role(arguments_: string[], password = ""): Promise<void> {
+    return new Promise((resolve, reject) => {
+      execFile(this.path, ["role", ...arguments_], { env: { ...this.environment(), DATABASE_PASSWORD: password }, timeout: 60_000 }, (e, _stdout, stderr) => {
+        if (e) reject(new Error(`database role ${arguments_.join(" ")} failed: ${stderr.trim() || e.message}`));
+        else resolve();
+      });
+    });
   }
 
   private async stopProcess(): Promise<void> {

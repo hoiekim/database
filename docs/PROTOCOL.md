@@ -21,7 +21,7 @@ What a request *means* (what a query reads, when a transaction
 conflicts) is in `CLIENT.md`. This file says how each one is written and
 what the server answers.
 
-This document describes protocol version **5**. What a version after 2
+This document describes protocol version **6**. What a version after 2
 added is marked "from version N" where it is described; "Versions" lists
 it all in one place. The golden vectors are of version 2, and the
 clients in `clients/` greet with version 2.
@@ -108,25 +108,29 @@ Hello: version u32, database str, password str, client str
 
 - `version` is the protocol version the client speaks: the newest one
   whose messages it implements, both those it sends and those it reads
-  (see "Versions"). A server answers versions 2 to 5.
+  (see "Versions"). A server answers versions 2 to 6.
 - `database` is the database to use. It may be empty, with the
-  administrator's password, for a connection that only administers.
+  administrator's password, for a connection that only administers. It
+  may name a role of the database after a `/`: `shop/reader` (see
+  "Roles"). A database's name holds no `/`, and in every version this
+  field is a `str`, so a client of any version greets as a role.
 - `password` is that database's password, or the administrator's, which
-  opens every database and allows the admin requests.
+  opens every database and allows the admin requests; or, when
+  `database` names a role, that role's password and no other.
 - `client` is a name for the client. The server reads it and does not
   use it at present.
 
 The server answers with a `Hello` response, and the connection is open:
 
 ```text
-Hello: version u32, server str        the server's own version, 5, whatever the client said;
+Hello: version u32, server str        the server's own version, 6, whatever the client said;
                                       and its name: "database 0.1.0"
 ```
 
 or with an `Error` response, after which it closes the connection:
-`ProtocolMismatch` if the client's version is below 2 or above 5
-(see "Versions"), `AccessDenied` if the database does not exist or the
-password is wrong (the two are not told apart), `InvalidRequest` if the
+`ProtocolMismatch` if the client's version is below 2 or above 6
+(see "Versions"), `AccessDenied` if the database or the role does not exist or the
+password is wrong (none of these is told from another), `InvalidRequest` if the
 first frame was not a `Hello`.
 
 ## Requests
@@ -878,9 +882,94 @@ database's own password is answered `AccessDenied`.
 | 9 | RestoreBegin | `replace bool` | `Ok` |
 | 10 | RestoreChunk | `bytes` | `Ok` |
 | 11 | RestoreEnd | | `Ok` |
+| 12 | CreateRole | `name str, password str, if_not_exists bool` | `Ok`. From version 6, as are the five below |
+| 13 | DropRole | `name str, if_exists bool` | `Ok` |
+| 14 | SetRolePassword | `name str, password str` | `Ok` |
+| 15 | Grant | `role str, table opt(str), rights u8` | `Ok` |
+| 16 | Revoke | `role str, table opt(str), rights u8` | `Ok` |
+| 17 | ListRoles | | `Rows` |
 
 `Checkpoint`, `Check` and `Stats` are about the connection's own
 database, or about every database on an administering connection.
+"Any connection" is any that greeted with a database's own password or
+the administrator's: a role is answered `AccessDenied` to every `Admin`
+request.
+
+### Roles
+
+A role is a name within a database, with a password of its own and
+rights on the database's tables. A connection that greeted as a role
+(`database` of `shop/reader`) has that role's rights and nothing else;
+one that greeted with the database's own password, or the
+administrator's, may do anything in the database, as before there were
+roles. A role's name is 1 to 64 of `a-z`, `0-9`, `_` and `-`.
+
+`rights` is a byte of bits. A bit beyond these is refused:
+
+| Bit | Right | What it allows on a table |
+|---:|---|---|
+| 1 | read | to be told what its rows hold, by any statement |
+| 2 | insert | to add rows |
+| 4 | update | to change rows |
+| 8 | delete | to remove rows |
+| 16 | schema | to add and drop its columns and indexes, and to drop it |
+
+Requests 12 to 17 are about the roles of the connection's database.
+They are answered to a connection that greeted with that database's own
+password, or with the administrator's and that database; to a role
+`AccessDenied`, and on a connection that named no database
+`InvalidRequest`. Each is a transaction of its own (`InvalidRequest`
+inside one) and is answered when it is durable.
+
+- **CreateRole** makes a role with no rights. `AlreadyExists` if there
+  is one, unless `if_not_exists`, which then changes nothing.
+- **DropRole** removes a role and its rights. `NotFound` unless
+  `if_exists`.
+- **Grant** adds rights: on `table`, or without one on every table of
+  the database, those made later included. `NotFound` for a role or a
+  table that is not there.
+- **Revoke** takes rights away: on `table`, or without one on every
+  table, however they were granted. Rights the role holds on every table
+  cannot be taken from one table alone: that is `InvalidRequest`, and
+  nothing is changed.
+- **ListRoles** answers `Rows` with the columns `role` (text), `table`
+  (text, or NULL for the rights held on every table) and `rights` (a
+  list of the names above, in the order of their bits). Each role has a
+  row with a NULL table, whatever it holds there, and a row for each
+  table it holds rights on.
+
+**What a role's statement needs.** A statement is refused with
+`AccessDenied` unless the role holds, on every table the statement comes
+to, the right for what it does there. The message names the role, the
+table and what was missing; it is the same whether or not the table
+exists.
+
+| What a statement does | Needs |
+|---|---|
+| Reads a table: a query's own, one it joins, one in a subquery anywhere in the statement | read |
+| Inserts | insert; and read if it has `returning` |
+| Inserts with `DoUpdate` | insert, update and read |
+| Updates | update and read (its rows are found by a query, and their count is its answer) |
+| Deletes | delete and read |
+| Writes a row whose foreign key is not NULL | read on the table the key points at |
+| Deletes from a table that others point at | for each such table: delete if its rows go too (`Cascade`), and so on through the tables that point at it; update if their pointers are cleared (`SetNull`); read if they forbid it (`Restrict`). Asked of the tables as defined, whether or not a row points |
+| Changes a unique key that another table points at | read on that table |
+| `CreateTable` | schema on every table; and read on each table a foreign key of it points at |
+| Any other schema change | schema on the table |
+| `Describe` | nothing: it lists the tables the role holds any right on |
+| `Lock` | any right but read, on any table |
+
+A table that points at itself needs nothing more for that than the
+statement needs already.
+
+**When rights change.** A grant or a revoke that has been answered
+binds every statement that begins after it, on every connection:
+prepared statements a connection keeps are held to the rights of the
+moment they run. A reading or an optimistic transaction of a role that
+was open when the role was changed or dropped is ended by the server:
+its next statement is answered `AccessDenied`, and it can then only be
+rolled back. An exclusive transaction holds up a change of rights as it
+holds up any write. A role that has been dropped is refused everything.
 
 **Dump.** The server answers with any number of `Chunk` frames and then
 one `Ok`, or one `Error` if the dump failed part-way. The dump is the
@@ -947,9 +1036,10 @@ takes nothing away:
 | 3 | Requests `Prepared` (19), `BeginWith` (20) and `Batch` (21); the expression `Param` (22); the error codes `NotPrepared` (23) and `Unmet` (24) |
 | 4 | The request `Explain` (22) |
 | 5 | A column's last byte is `flags`, which may be followed by `keep_start` (see "Definitions") |
+| 6 | The admin requests about roles, 12 to 17 (see "Roles") |
 
-**What the server does today.** It speaks versions 2 to 5. It answers a
-`Hello` that names a version in that range with its own, 5, and refuses
+**What the server does today.** It speaks versions 2 to 6. It answers a
+`Hello` that names a version in that range with its own, 6, and refuses
 any other with `ProtocolMismatch`, then closes the connection. It
 answers every request it can decode in the same way whatever version
 the client greeted with, with one difference: to a client that greeted
@@ -961,8 +1051,9 @@ those after it:
 - A client sends the newest version whose messages it implements, both
   those it sends and those it reads. One that implements only version 2
   sends 2, whatever versions exist by then; one that sends `Prepared`
-  sends at least 3, one that sends `Explain` at least 4, and one that
-  reads `keep_start` 5.
+  sends at least 3, one that sends `Explain` at least 4, one that
+  reads `keep_start` at least 5, and one that sends the requests about
+  roles 6.
 - A server answers `ProtocolMismatch` to a version it does not speak,
   in its answer to `Hello`, and to nothing later. A server may speak
   several versions; a client must not assume which, and must be ready
@@ -985,6 +1076,14 @@ such a client never meets the bit; the setting changes where a server
 stores values, not what any request answers. The server takes a column
 with `keep_start` in `CreateTable` or `AddColumn` from a client of any
 version.
+
+**Version 6** adds six admin requests and changes nothing a client of
+an earlier version sends or reads. Naming a role in the greeting is not
+of this version or of any: it is the `database` field, which a server
+from before roles answers with `AccessDenied`, as it does any database
+it does not have. A client that does not send the six requests need not
+say 6 to connect as a role, and the clients in `clients/`, which greet
+with 2, do.
 
 **What a client does with what it does not know:**
 
@@ -1019,7 +1118,7 @@ of its bits, most significant first, so that NaN and the infinities can
 be written. The vectors cover every request and response, every kind of
 value at the edges of its range, every expression, operator, function
 and aggregate, every way into a table, and every error code, all of
-version 2. What versions 3 to 5 added has no vectors; "Requests of
+version 2. What versions 3 to 6 added has no vectors; "Requests of
 versions 3 and 4, byte by byte" below gives an example of each request.
 
 A client's tests should at least:
@@ -1185,4 +1284,19 @@ e8 07                 timeout_ms: 1000
 01                    one row
 03 64 03 64 03 64       int 50, int 50, int 50
 03 e0 03                int, zigzag 480 = 240
+```
+
+## A request of version 6, byte by byte
+
+The right to read and to insert into `orders`, given to the role
+`reader`:
+
+```text
+e8 07                 timeout_ms: 1000
+12                    Admin
+0f                    Grant
+06 72 65 61 64 65 72  role: "reader"
+01                    table: present
+06 6f 72 64 65 72 73    "orders"
+03                    rights: read (1) and insert (2)
 ```

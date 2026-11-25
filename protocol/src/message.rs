@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::codec::*;
 use crate::error::{DbError, DbResult, ErrorCode};
 use crate::query::{Delete, Insert, Query, Update};
+use crate::rights::Rights;
 use crate::schema::{ColumnDef, IndexDef, TableDef};
 use crate::value::Value;
 
@@ -19,8 +20,19 @@ use crate::value::Value;
 /// meaning changes, or when the client comes to send something an older
 /// server would not know (version 3: `Prepared`, `BeginWith`, `Batch`,
 /// `Expr::Param`; version 4: `Explain`; version 5: see
-/// `COLUMN_FLAGS_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 5;
+/// `COLUMN_FLAGS_VERSION`; version 6: the requests about roles, see
+/// `ROLES_VERSION`).
+pub const PROTOCOL_VERSION: u32 = 6;
+
+/// From this version a client may send the requests that make, change
+/// and list roles (`Admin::CreateRole` to `Admin::ListRoles`). Greeting
+/// as a role needs no version: the role is named in the greeting's
+/// `database`, which every version has.
+pub const ROLES_VERSION: u32 = 6;
+
+/// What stands between a database's name and a role's in a greeting's
+/// `database`: `shop/reader`. No database's name can hold it.
+pub const ROLE_SEPARATOR: char = '/';
 
 /// From this version a column's last byte is a byte of flags, and a
 /// column may carry `keep_start` after it (`codec::put_column`). A
@@ -62,6 +74,8 @@ pub enum TxnKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     /// `database` may be empty for a connection that only administers.
+    /// It may name a role of the database after a `ROLE_SEPARATOR`; the
+    /// password is then the role's.
     Hello { version: u32, database: String, password: String, client: String },
     Ping,
     /// Starts a transaction. An exclusive one waits for the database's
@@ -189,7 +203,35 @@ pub enum Admin {
     RestoreBegin { replace: bool },
     RestoreChunk(Vec<u8>),
     RestoreEnd,
+    /// Makes a role of the connection's database: a name with a password
+    /// of its own, which may do nothing until it is granted rights. This
+    /// and the five requests after it are for a connection that greeted
+    /// with the database's own password or the administrator's, never
+    /// for a role.
+    CreateRole { name: String, password: String, if_not_exists: bool },
+    /// Removes a role and every right it held. Its open connections are
+    /// refused from their next statement on.
+    DropRole { name: String, if_exists: bool },
+    SetRolePassword { name: String, password: String },
+    /// Gives a role rights on a table, or with no table on every table
+    /// of the database, those made later included. `Rights::SCHEMA` on
+    /// every table is also the right to create tables.
+    Grant { role: String, table: Option<String>, rights: Rights },
+    /// Takes rights from a role: on one table, or with no table on every
+    /// table, whichever way they were granted. Rights held on every table
+    /// cannot be taken from one table alone: that is refused, not ignored.
+    Revoke { role: String, table: Option<String>, rights: Rights },
+    /// The database's roles and what each may do: answered as rows of
+    /// `ROLES_COLUMNS`.
+    ListRoles,
 }
+
+/// The columns of a `ListRoles` answer: a role's name; a table's name, or
+/// NULL for what the role holds on every table; and the rights it holds
+/// there, as a list of their names. A role is listed once for every
+/// table it has rights on, and once for every table whether or not it
+/// has rights there, so that a role with none is listed too.
+pub const ROLES_COLUMNS: [&str; 3] = ["role", "table", "rights"];
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct RowSet {
@@ -504,6 +546,35 @@ fn put_admin(w: &mut Writer, admin: &Admin) {
             w.bytes(bytes);
         }
         Admin::RestoreEnd => w.u8(11),
+        Admin::CreateRole { name, password, if_not_exists } => {
+            w.u8(12);
+            w.str(name);
+            w.str(password);
+            w.bool(*if_not_exists);
+        }
+        Admin::DropRole { name, if_exists } => {
+            w.u8(13);
+            w.str(name);
+            w.bool(*if_exists);
+        }
+        Admin::SetRolePassword { name, password } => {
+            w.u8(14);
+            w.str(name);
+            w.str(password);
+        }
+        Admin::Grant { role, table, rights } | Admin::Revoke { role, table, rights } => {
+            w.u8(if matches!(admin, Admin::Grant { .. }) { 15 } else { 16 });
+            w.str(role);
+            match table {
+                Some(table) => {
+                    w.u8(1);
+                    w.str(table);
+                }
+                None => w.u8(0),
+            }
+            w.u8(rights.bits());
+        }
+        Admin::ListRoles => w.u8(17),
     }
 }
 
@@ -520,6 +591,20 @@ fn get_admin(r: &mut Reader) -> DbResult<Admin> {
         9 => Admin::RestoreBegin { replace: r.bool()? },
         10 => Admin::RestoreChunk(r.bytes()?.to_vec()),
         11 => Admin::RestoreEnd,
+        12 => Admin::CreateRole { name: r.str()?, password: r.str()?, if_not_exists: r.bool()? },
+        13 => Admin::DropRole { name: r.str()?, if_exists: r.bool()? },
+        14 => Admin::SetRolePassword { name: r.str()?, password: r.str()? },
+        tag @ (15 | 16) => {
+            let role = r.str()?;
+            let table = if r.bool()? { Some(r.str()?) } else { None };
+            let rights = Rights::from_bits(r.u8()?)?;
+            if tag == 15 {
+                Admin::Grant { role, table, rights }
+            } else {
+                Admin::Revoke { role, table, rights }
+            }
+        }
+        17 => Admin::ListRoles,
         _ => return Err(DbError::new(ErrorCode::InvalidRequest, "unknown admin request")),
     })
 }
@@ -794,6 +879,14 @@ mod tests {
             Request::Admin(Admin::RestoreBegin { replace: true }),
             Request::Admin(Admin::RestoreChunk(vec![1, 2, 3])),
             Request::Admin(Admin::RestoreEnd),
+            Request::Admin(Admin::CreateRole { name: "reader".into(), password: "p".into(), if_not_exists: true }),
+            Request::Admin(Admin::DropRole { name: "reader".into(), if_exists: false }),
+            Request::Admin(Admin::SetRolePassword { name: "reader".into(), password: "q".into() }),
+            Request::Admin(Admin::Grant { role: "reader".into(), table: Some("orders".into()), rights: Rights::READ | Rights::INSERT }),
+            Request::Admin(Admin::Grant { role: "owner".into(), table: None, rights: Rights::ALL }),
+            Request::Admin(Admin::Revoke { role: "reader".into(), table: None, rights: Rights::WRITE }),
+            Request::Admin(Admin::Revoke { role: "reader".into(), table: Some("orders".into()), rights: Rights::NONE }),
+            Request::Admin(Admin::ListRoles),
             Request::Prepared { id: 7, statement: Some(Arc::new(Request::Query(Query::table("t").key([param(0)]).filter(col("a").lt(param(1)))))), params: vec![Value::Int(1), Value::Text("x".into())] },
             Request::Prepared { id: u64::MAX, statement: None, params: Vec::new() },
             Request::BeginWith { kind: TxnKind::Optimistic, lock_wait_ms: 30_000, statement: Box::new(Request::Query(sample_query())) },
@@ -811,6 +904,18 @@ mod tests {
             let frame = encode_request(&request, 1500);
             assert_eq!(decode_request(&frame).unwrap(), (request, 1500));
         }
+    }
+
+    #[test]
+    fn a_grant_is_the_bytes_the_specification_gives() {
+        // docs/PROTOCOL.md, "A request of version 6, byte by byte".
+        let grant = Request::Admin(Admin::Grant { role: "reader".into(), table: Some("orders".into()), rights: Rights::READ | Rights::INSERT });
+        let bytes = [0xe8, 0x07, 0x12, 0x0f, 0x06, b'r', b'e', b'a', b'd', b'e', b'r', 0x01, 0x06, b'o', b'r', b'd', b'e', b'r', b's', 0x03];
+        assert_eq!(encode_request(&grant, 1000), bytes);
+        // A bit that is no right is refused, not dropped.
+        let mut bad = bytes;
+        *bad.last_mut().unwrap() = 0x23;
+        assert!(decode_request(&bad).is_err());
     }
 
     #[test]

@@ -19,7 +19,7 @@ use super::*;
 
 /// The statement, with its turn held: begun, run and committed as far as
 /// the log. Returns as `lone_write` does.
-fn write(db: &Arc<Database>, insert: &database_protocol::query::Insert, ahead: &fts::Ahead, deadline: Option<Instant>, wait: Duration) -> (DbResult<Vec<Response>>, u64, Read) {
+fn write(db: &As, insert: &database_protocol::query::Insert, ahead: &fts::Ahead, deadline: Option<Instant>, wait: Duration) -> (DbResult<Vec<Response>>, u64, Read) {
     let mut txn = match begin_write(db, wait, false) {
         Ok(txn) => txn,
         Err(e) => return (Err(e), 0, Read::default()),
@@ -67,7 +67,7 @@ impl Session {
         Ok(answer.unwrap_or_else(|e| vec![Response::Error(e)]))
     }
 
-    async fn loaded(&mut self, db: Arc<Database>, insert: database_protocol::query::Insert, ahead: fts::Ahead, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
+    async fn loaded(&mut self, db: As, insert: database_protocol::query::Insert, ahead: fts::Ahead, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
         let wait = self.state.config.lock_wait;
         let turn = self.turn(wait).await?;
         let writing = db.clone();

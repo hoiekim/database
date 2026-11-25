@@ -42,6 +42,7 @@ use database_protocol::error::ErrorCode;
 use database_protocol::expr::*;
 use database_protocol::message::Ddl;
 use database_protocol::query::*;
+use database_protocol::rights::Rights;
 use database_protocol::schema::*;
 use database_protocol::value::{Type, Value};
 
@@ -81,6 +82,15 @@ struct State {
     /// The rows of `items`, once that table and `hits` are made.
     items: Option<Model>,
     notes: Option<Notes>,
+    /// The database's roles: for each, the rights it holds on every
+    /// table, and those it holds on single tables besides.
+    roles: BTreeMap<String, (Rights, BTreeMap<String, Rights>)>,
+}
+
+/// What every role of the workload is known by: the engine keeps it and
+/// does not read it, and it must come back as it was given.
+fn secret(role: &str) -> Vec<u8> {
+    role.bytes().cycle().take(48).collect()
 }
 
 /// One statement of the workload.
@@ -100,6 +110,12 @@ enum Stmt {
     Rank,
     Index,
     DropNotes,
+    /// Makes a role that holds nothing.
+    Role(&'static str),
+    /// Gives a role rights on a table, or with no table on every table.
+    Grant(&'static str, Option<&'static str>, Rights),
+    Revoke(&'static str, Option<&'static str>, Rights),
+    DropRole(&'static str),
 }
 
 fn hits() -> TableDef {
@@ -142,6 +158,11 @@ fn run(txn: &mut WriteTxn, stmt: &Stmt) -> Result<()> {
         Stmt::Rank => txn.ddl(&Ddl::AddColumn { table: "notes".into(), column: ColumnDef::new("rank", Type::Int).default(7), if_not_exists: false }, None)?,
         Stmt::Index => txn.ddl(&Ddl::CreateIndex { table: "notes".into(), index: IndexDef::new("notes_text").on(["text"]), if_not_exists: false }, None)?,
         Stmt::DropNotes => txn.ddl(&Ddl::DropTable { name: "notes".into(), if_exists: false }, None)?,
+        // R-A6: who may do what goes through the log as rows do.
+        Stmt::Role(name) => txn.change_roles(|tx| tx.create_role(name, &secret(name), false))?,
+        Stmt::Grant(name, table, rights) => txn.change_roles(|tx| tx.grant(name, *table, *rights))?,
+        Stmt::Revoke(name, table, rights) => txn.change_roles(|tx| tx.revoke(name, *table, *rights))?,
+        Stmt::DropRole(name) => txn.change_roles(|tx| tx.drop_role(name, false))?,
     }
     Ok(())
 }
@@ -173,7 +194,44 @@ fn apply(state: &mut State, stmt: &Stmt) {
             }
         }
         Stmt::Notes => state.notes = Some(Notes::default()),
-        Stmt::DropNotes => state.notes = None,
+        Stmt::DropNotes => {
+            state.notes = None;
+            // The rights held on a table go with it.
+            for (_, tables) in state.roles.values_mut() {
+                tables.remove("notes");
+            }
+        }
+        Stmt::Role(name) => {
+            state.roles.insert(name.to_string(), Default::default());
+        }
+        Stmt::DropRole(name) => {
+            state.roles.remove(*name);
+        }
+        Stmt::Grant(name, table, rights) => {
+            let (everywhere, tables) = state.roles.get_mut(*name).expect(ACCEPTED);
+            match table {
+                Some(table) => {
+                    let held = tables.entry(table.to_string()).or_default();
+                    *held = *held | *rights;
+                }
+                None => *everywhere = *everywhere | *rights,
+            }
+        }
+        Stmt::Revoke(name, table, rights) => {
+            let (everywhere, tables) = state.roles.get_mut(*name).expect(ACCEPTED);
+            match table {
+                Some(table) => {
+                    if let Some(held) = tables.get_mut(*table) {
+                        *held = held.without(*rights);
+                    }
+                }
+                None => {
+                    *everywhere = everywhere.without(*rights);
+                    tables.values_mut().for_each(|held| *held = held.without(*rights));
+                }
+            }
+            tables.retain(|_, held| !held.is_empty());
+        }
         Stmt::Note(id, text) => {
             state.notes.as_mut().expect(ACCEPTED).rows.insert(*id, text.clone());
         }
@@ -231,6 +289,15 @@ fn try_read_state(engine: &Engine) -> std::result::Result<State, Unread> {
         return Err(Unread::Wrong("one of two tables that were made in one transaction".into()));
     }
     let mut state = State { exists: true, ..State::default() };
+    for (name, role) in txn.catalog().roles.iter() {
+        if *name != role.name || role.secret != secret(name) {
+            return Err(Unread::Wrong(format!("a role {name:?} that is not as it was made: {role:?}")));
+        }
+        if let Some(gone) = role.tables.keys().find(|held| table(held).is_none()) {
+            return Err(Unread::Wrong(format!("role {name:?} with rights on {gone:?}, which is no table")));
+        }
+        state.roles.insert(name.clone(), (role.everywhere, role.tables.clone()));
+    }
     if table("items").is_some() {
         let mut rows = Model::new();
         for row in txn.query(&Query::table("items"), None)?.rows {
@@ -312,7 +379,7 @@ fn differ(got: &State, possible: &[State]) -> String {
     let brief = |state: &State| {
         let items = state.items.as_ref().map(|items| items.keys().copied().collect::<Vec<_>>());
         let notes = state.notes.as_ref().map(|notes| (notes.rows.keys().copied().collect::<Vec<_>>(), notes.ranked, notes.indexed));
-        format!("database: {}, items: {items:?}, notes: {notes:?}", state.exists)
+        format!("database: {}, items: {items:?}, notes: {notes:?}, roles: {:?}", state.exists, state.roles)
     };
     let possible: Vec<String> = possible.iter().map(brief).collect();
     format!("it holds [{}], and could hold [{}] (rows of the same keys may differ)", brief(got), possible.join("] or ["))
@@ -411,7 +478,18 @@ fn a_dump() -> Arc<(Vec<u8>, State)> {
     let db = engine.create_database("test").unwrap();
     let mut state = State { exists: true, ..State::default() };
     let mut txn = db.begin_write(WAIT, false).unwrap();
-    for stmt in [Stmt::Tables, Stmt::Put(101, item(1, "dumped", "gamma beta", &["t1"])), Stmt::Put(102, item(2, "dumped too", &"delta ".repeat(2_000), &[])), Stmt::Hit(1)] {
+    let dumped = [
+        Stmt::Tables,
+        Stmt::Put(101, item(1, "dumped", "gamma beta", &["t1"])),
+        Stmt::Put(102, item(2, "dumped too", &"delta ".repeat(2_000), &[])),
+        Stmt::Hit(1),
+        // Roles travel in a dump, and are restored with the rows or not
+        // at all.
+        Stmt::Role("auditor"),
+        Stmt::Grant("auditor", Some("items"), Rights::READ),
+        Stmt::Role("idle"),
+    ];
+    for stmt in dumped {
         run(&mut txn, &stmt).unwrap();
         apply(&mut state, &stmt);
     }
@@ -434,6 +512,8 @@ fn script() -> Vec<Step> {
         Step::Create,
         txn([Tables]),
         txn([Put(1, item(0, "one", "alpha beta", &["t1"])), Put(2, item(1, "two", "gamma", &["t1", "t2"])), Put(3, item(1, "three", "", &[]))]),
+        // Who may do what is committed as rows are: alone, and with rows.
+        txn([Role("reader"), Grant("reader", None, Rights::READ)]),
         // Nothing for the log.
         txn([Hit(1), Hit(2)]),
         txn([Put(4, item(2, "four", &large, &["t3"]))]),
@@ -442,25 +522,29 @@ fn script() -> Vec<Step> {
         Step::Beside(Beside::Write(900, item(0, "beside", &large, &["t1"]))),
         // Something for the log and something not.
         txn([Hit(1), Put(6, item(0, "six", "beta gamma", &["t2"]))]),
-        txn([Notes, Note(1, "first".into())]),
-        // Writers go on while the checkpoint writes its pages.
-        Step::Checkpoint { beside: vec![vec![Put(13, item(1, "thirteen", "gamma", &["t1"]))], vec![Hit(4)], vec![Remove(3), Note(4, "fourth".into())]], when: When::Pages },
+        txn([Notes, Note(1, "first".into()), Role("clerk"), Grant("clerk", Some("notes"), Rights::WRITE), Grant("clerk", Some("items"), Rights::READ | Rights::INSERT)]),
+        // Writers go on while the checkpoint writes its pages, and
+        // rights change.
+        Step::Checkpoint { beside: vec![vec![Put(13, item(1, "thirteen", "gamma", &["t1"]))], vec![Hit(4), Revoke("clerk", Some("items"), Rights::INSERT)], vec![Remove(3), Note(4, "fourth".into())]], when: When::Pages },
         txn([Change { id: 4, owner: 2, tags: vec!["t1".into()], body: Some("zeta ".repeat(2_000)) }, Remove(1)]),
         Step::Group { txns: vec![vec![Put(7, item(1, "seven", "gamma", &[]))], vec![Put(8, item(2, "eight", "epsilon", &["t1"])), Hit(3)], vec![Change { id: 7, owner: 0, tags: vec!["t1".into()], body: None }]], told: false },
-        Step::Txn { fork: false, stmts: vec![Put(99, item(0, "undone", "gamma", &["t1"]))], commit: false },
+        Step::Txn { fork: false, stmts: vec![Put(99, item(0, "undone", "gamma", &["t1"])), Grant("reader", None, Rights::ALL), Role("undone")], commit: false },
         Step::Beside(Beside::End),
         txn([Rank, Note(2, "second".into())]),
         txn([Index]),
+        // A revoke that only the log holds when the engine is killed.
+        Step::Group { txns: vec![vec![Revoke("reader", None, Rights::READ)], vec![Grant("reader", Some("notes"), Rights::READ | Rights::SCHEMA)]], told: false },
         txn([Put(9, item(3, "nine", &huge, &["t1"]))]),
         Step::Stop { clean: false },
         Step::Start,
         txn([Move(1)]),
-        fork([Remove(4), Remove(9)]),
+        fork([Remove(4), Remove(9), Grant("clerk", None, Rights::DELETE)]),
         // And while it switches the header, and while it removes the log.
         Step::Checkpoint { beside: vec![vec![Put(14, item(3, "fourteen", &large, &[]))]], when: When::Header },
         txn([Put(10, item(0, "ten", "gamma alpha", &["t1", "t3"]))]),
-        Step::Group { txns: vec![vec![Note(3, "third".into())], vec![Put(11, item(1, "eleven", "beta", &[]))]], told: true },
+        Step::Group { txns: vec![vec![Note(3, "third".into())], vec![Put(11, item(1, "eleven", "beta", &[])), Role("late")], vec![DropRole("reader")]], told: true },
         Step::Checkpoint { beside: vec![vec![Change { id: 10, owner: 1, tags: vec![], body: None }]], when: When::Removal },
+        // The table goes, and the rights held on it with it.
         txn([DropNotes]),
         Step::Stop { clean: true },
         Step::Start,
@@ -468,9 +552,10 @@ fn script() -> Vec<Step> {
         txn([Put(12, item(2, "twelve", "gamma", &["t1"]))]),
         Step::Drop,
         Step::Create,
-        txn([Tables, Put(15, item(0, "fifteen", "gamma", &[]))]),
+        // Roles of a database that a restore replaces go with it.
+        txn([Tables, Put(15, item(0, "fifteen", "gamma", &[])), Role("replaced"), Grant("replaced", None, Rights::ALL)]),
         Step::Restore(a_dump()),
-        txn([Put(16, item(3, "sixteen", "beta gamma", &["t1"]))]),
+        txn([Put(16, item(3, "sixteen", "beta gamma", &["t1"])), Revoke("auditor", None, Rights::READ), DropRole("idle")]),
         checkpoint(),
     ]
 }
@@ -484,6 +569,8 @@ fn generated(seed: u64, len: usize) -> Vec<Step> {
     let (mut next, mut next_note) = (1i64, 1i64);
     // 0: no table; 1: made; 2: ranked; 3: indexed.
     let mut notes = 0;
+    // Whether the role `drawn` is there.
+    let mut role = false;
     let mut beside = false;
     let writes = |rng: &mut Rng, live: &mut Vec<i64>, next: &mut i64, commit: bool| -> Vec<Stmt> {
         let mut stmts = Vec::new();
@@ -553,6 +640,20 @@ fn generated(seed: u64, len: usize) -> Vec<Step> {
                 steps.push(txn(stmts));
             }
             5 => steps.push(txn([Stmt::Hit(rng.below(5) as i64)])),
+            6 => {
+                let rights = Rights::from_bits(1 + rng.below(31) as u8).unwrap();
+                let table = [None, Some("items"), Some("hits")][rng.below(3) as usize];
+                let stmts = match (role, rng.below(4)) {
+                    (false, _) => vec![Stmt::Role("drawn"), Stmt::Grant("drawn", table, rights)],
+                    (true, 0) => vec![Stmt::DropRole("drawn")],
+                    (true, 1) => vec![Stmt::Grant("drawn", table, rights)],
+                    // Taken from every table: from one alone it is
+                    // refused where the role holds it on all.
+                    (true, _) => vec![Stmt::Revoke("drawn", None, rights)],
+                };
+                role = !matches!(stmts[0], Stmt::DropRole(_));
+                steps.push(Step::Txn { fork: rng.chance(3), stmts, commit: true });
+            }
             _ => {
                 let commit = !rng.chance(6);
                 let stmts = writes(&mut rng, &mut live, &mut next, commit);

@@ -9,6 +9,12 @@ database create <name>               create a database; its password from DATABA
 database drop <name>
 database password <name>             change a database's password
 database list
+database role create <database> <role>               make a role; its password from DATABASE_PASSWORD
+database role password <database> <role>             change a role's password
+database role drop <database> <role>
+database role grant <database> <role> <rights> [table]    rights: read,insert,update,delete,schema; write; all
+database role revoke <database> <role> <rights> [table]   with no table: on every table
+database role list <database>
 database dump [name...] > file       every database, or the named ones, to stdout
 database restore [--replace] < file  load a dump from stdin
 database check                       verify every database's files
@@ -117,6 +123,61 @@ docker compose exec -e DATABASE_PASSWORD=<password> database database create --i
 The protocol is not encrypted and a database's password crosses the
 network as it is. Keep the server on a private network and do not
 publish the port beyond loopback.
+
+## Roles
+
+A database's own password may do anything in it. Where that is more
+than a user of the database should have (a reporting job that should
+only read, a service that should only file events), give it a role: a
+name with a password of its own, and rights on tables.
+
+```sh
+DATABASE_PASSWORD=<password> database role create shop reporting
+database role grant shop reporting read                  # every table, those made later too
+DATABASE_PASSWORD=<password> database role create shop intake
+database role grant shop intake insert events            # one table
+database role list shop
+```
+
+The user then connects with `?role=`, and the role's password where the
+database's was:
+
+```text
+database://shop:<password>@database:5454?role=reporting
+```
+
+- **The rights** are `read`, `insert`, `update`, `delete` and `schema`;
+  `write` stands for the middle three and `all` for every one. A role
+  holds them on single tables, or on every table. What each statement
+  needs is listed in `PROTOCOL.md`, "Roles". The ones that surprise:
+  an update or a delete needs `read` as well, since it finds its rows by
+  what they hold; a row that points at another table needs `read` there,
+  since the check says whether the key exists; and a delete needs the
+  right to do what it sets off in the tables that point at its own.
+- **A revoke is in force when the command returns**, for every
+  connection, statements they keep prepared included. A role's
+  transaction that was reading is ended, and one that holds the write
+  lock delays the revoke until it ends.
+- **A right held on every table is taken from every table.** `revoke
+  shop reporting read orders` is refused while `reporting` holds `read`
+  on all: revoke it everywhere, then grant the tables it is to keep.
+- **Only the database's password and the administrator's change
+  roles.** A role cannot grant, checkpoint, check, see `stats` or dump,
+  whatever it holds.
+- **Dropping a table drops the rights on it.** A table made again
+  under the name starts with none.
+- **Roles are in the database's files**, not in `ACCESS`: a dump
+  carries them, a restore brings them back with their passwords, and
+  dropping the database drops them.
+- **A database with no roles is unchanged**, on disk and on the wire.
+
+A database that has roles is stored in a form that a build from before
+roles does not read: such a build refuses to start on the directory
+(`the stored catalog is of an unknown version`, or `a log record holds
+an unknown operation 10`), and refuses a dump of such a database (`a
+record of an unknown kind`), rather than serve it to its one password
+with the roles forgotten. To go back to such a build, drop the roles
+and stop the server in good order first.
 
 A rolling deploy runs two copies of an application against one database
 for a moment. Both work: the server takes any number of connections,
@@ -247,7 +308,7 @@ costs availability and not commits.
 
 ```text
 <data>/LOCK               held by the running server
-<data>/ACCESS             each database's salted password hash
+<data>/ACCESS             each database's salted password hash (roles are in the database's own files)
 <data>/<name>.db          the data, in 8 KiB pages
 <data>/<name>.wal-<n>     commits since the last checkpoint
 ```

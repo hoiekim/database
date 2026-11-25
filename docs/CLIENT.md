@@ -550,6 +550,69 @@ let entry: i64 = results[2].first().unwrap().get("id")?;
 - A batch holds queries, inserts, updates and deletes. A schema change
   goes in a `transaction` or `exclusive`.
 
+## Roles
+
+A client that connects with a database's own password may do anything
+in it. One that connects as a **role** may do what the role was granted:
+
+```rust
+let reporting = Client::connect_url("database://shop:<password>@database?role=reporting").await?;
+// or: config.role = Some("reporting".into()), with the role's password
+```
+
+Roles are made and granted by a client that is not one (the database's
+password, or the administrator's on that database):
+
+```rust
+let roles = db.roles();
+roles.create("reporting", "<password>").await?;
+roles.grant_everywhere("reporting", Rights::READ).await?;      // every table, those made later too
+roles.create("intake", "<password>").await?;
+roles.grant("intake", Rights::INSERT, "events").await?;         // one table
+roles.revoke("intake", Rights::INSERT, "events").await?;
+roles.revoke_everywhere("reporting", Rights::READ).await?;
+roles.set_password("intake", "<another>").await?;
+roles.drop("intake").await?;
+for held in roles.list().await? { /* held.role, held.table, held.rights */ }
+```
+
+| Right | Allows, on a table |
+|---|---|
+| `Rights::READ` | being told what its rows hold: a query, a join, a subquery, `returning`, the rows an update or a delete picks, whether a key that a row points at is there |
+| `Rights::INSERT` | adding rows. With this alone a role files rows it can neither read back nor change |
+| `Rights::UPDATE` | changing rows; it needs `READ` too, since the rows are found by a query |
+| `Rights::DELETE` | removing rows; it needs `READ` too. Apart from `UPDATE`, because a table that may be corrected is often one that may not be emptied |
+| `Rights::SCHEMA` | adding and dropping its columns and indexes, and dropping it. Held on every table, it is also the right to create tables |
+
+`Rights::WRITE` is the middle three, `Rights::ALL` every one, and
+rights combine with `|`. There is no right to grant rights.
+
+What to expect:
+
+- **A statement the role has no right to fails with
+  `ErrorCode::AccessDenied`**, and the message says what was missing:
+  `role "intake" may not read table "events"`. It says the same of a
+  table that does not exist. In a transaction it counts as any failed
+  statement does.
+- **Every table a statement comes to is asked about**, not only the
+  one it names: a joined table and a subquery's need `READ`; an upsert
+  that updates needs `INSERT`, `UPDATE` and `READ`; a row with a
+  foreign key needs `READ` on the table it points at; a delete needs,
+  in each table that points at its own, `DELETE` where rows go with it,
+  `UPDATE` where their pointers are cleared, `READ` where they forbid
+  it. `PROTOCOL.md`, "Roles", has the whole list.
+- **A revoke binds at once.** When `revoke` returns, no statement
+  that begins on any connection runs by the right, a prepared one
+  included. A role's reading or optimistic transaction that was open is
+  ended: its next statement fails with `AccessDenied`, and the
+  transaction is begun again.
+- **`describe` shows a role the tables it holds a right on.** A role
+  takes named locks only if it holds some right beyond `READ`, and no
+  administrative request is answered to it.
+
+The TypeScript and Python clients connect as a role in the same way
+(`role` in their configuration, `?role=`); they do not have `roles()`.
+
 ## Named locks
 
 ```rust

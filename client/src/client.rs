@@ -8,6 +8,7 @@ use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::expr::Expr;
 use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Request, Response, TxnKind, EXPLAIN_COLUMNS};
 use database_protocol::query::{Delete, Insert, Query, Update};
+use database_protocol::rights::Rights;
 use database_protocol::schema::{ColumnDef, IndexDef, TableDef};
 use database_protocol::value::{Timestamp, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -584,6 +585,13 @@ impl Client {
     pub fn admin(&self) -> Admin<'_> {
         Admin { client: self }
     }
+
+    /// The roles of this client's database: who else may connect to it,
+    /// and what they may do. For a client that connected with the
+    /// database's own password or the administrator's, not as a role.
+    pub fn roles(&self) -> Roles<'_> {
+        Roles { client: self }
+    }
 }
 
 impl Db for Client {
@@ -735,6 +743,104 @@ impl LockGuard {
             conn.held = false;
         }
         ok(result?)
+    }
+}
+
+/// What a role of the database may do: one entry of `Roles::list`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleRights {
+    pub role: String,
+    /// The table the rights are on; `None` for the rights the role holds
+    /// on every table, which every role is listed with, held or not.
+    pub table: Option<String>,
+    pub rights: Rights,
+}
+
+/// The roles of a database. See `Client::roles`.
+///
+/// A role is a name with a password of its own and rights on tables. A
+/// client connects as one by naming it (`Config::role`, `?role=` in the
+/// URL) with the role's password, and each of its statements is then
+/// refused unless the role holds the right for everything the statement
+/// would read or change.
+pub struct Roles<'a> {
+    client: &'a Client,
+}
+
+impl Roles<'_> {
+    async fn call(&self, request: AdminRequest) -> DbResult<Response> {
+        self.client.call(Request::Admin(request)).await
+    }
+
+    /// Makes a role, which may do nothing until it is granted rights.
+    pub async fn create(&self, name: &str, password: &str) -> DbResult<()> {
+        ok(self.call(AdminRequest::CreateRole { name: name.into(), password: password.into(), if_not_exists: false }).await?)
+    }
+
+    /// Makes a role unless there is one of that name, which is left as
+    /// it is, password and rights.
+    pub async fn create_if_not_exists(&self, name: &str, password: &str) -> DbResult<()> {
+        ok(self.call(AdminRequest::CreateRole { name: name.into(), password: password.into(), if_not_exists: true }).await?)
+    }
+
+    /// Removes a role and its rights. Its connections are refused from
+    /// their next statement on.
+    pub async fn drop(&self, name: &str) -> DbResult<()> {
+        ok(self.call(AdminRequest::DropRole { name: name.into(), if_exists: false }).await?)
+    }
+
+    pub async fn drop_if_exists(&self, name: &str) -> DbResult<()> {
+        ok(self.call(AdminRequest::DropRole { name: name.into(), if_exists: true }).await?)
+    }
+
+    /// Changes a role's password. Connections already open stay open.
+    pub async fn set_password(&self, name: &str, password: &str) -> DbResult<()> {
+        ok(self.call(AdminRequest::SetRolePassword { name: name.into(), password: password.into() }).await?)
+    }
+
+    /// Gives a role rights on one table.
+    pub async fn grant(&self, role: &str, rights: Rights, table: &str) -> DbResult<()> {
+        ok(self.call(AdminRequest::Grant { role: role.into(), table: Some(table.into()), rights }).await?)
+    }
+
+    /// Gives a role rights on every table of the database, those made
+    /// later included. `Rights::SCHEMA` so given is also the right to
+    /// create tables.
+    pub async fn grant_everywhere(&self, role: &str, rights: Rights) -> DbResult<()> {
+        ok(self.call(AdminRequest::Grant { role: role.into(), table: None, rights }).await?)
+    }
+
+    /// Takes rights on one table from a role. Fails, having changed
+    /// nothing, if the role holds one of them on every table: such a
+    /// right is taken with `revoke_everywhere`.
+    pub async fn revoke(&self, role: &str, rights: Rights, table: &str) -> DbResult<()> {
+        ok(self.call(AdminRequest::Revoke { role: role.into(), table: Some(table.into()), rights }).await?)
+    }
+
+    /// Takes rights from a role on every table, however they were
+    /// granted. When this returns, no statement that begins runs by them.
+    pub async fn revoke_everywhere(&self, role: &str, rights: Rights) -> DbResult<()> {
+        ok(self.call(AdminRequest::Revoke { role: role.into(), table: None, rights }).await?)
+    }
+
+    /// Every role and what it may do, by role and then by table.
+    pub async fn list(&self) -> DbResult<Vec<RoleRights>> {
+        let Response::Rows { set, .. } = self.call(AdminRequest::ListRoles).await? else { return Err(unexpected("list roles")) };
+        let mut listed = Vec::with_capacity(set.rows.len());
+        for row in set.rows {
+            let [Value::Text(role), table, Value::List(names)] = <[Value; 3]>::try_from(row).map_err(|_| unexpected("list roles"))? else { return Err(unexpected("list roles")) };
+            let table = match table {
+                Value::Text(table) => Some(table),
+                _ => None,
+            };
+            let mut rights = Rights::NONE;
+            for name in &names {
+                let Value::Text(name) = name else { return Err(unexpected("list roles")) };
+                rights = rights | Rights::parse(name)?;
+            }
+            listed.push(RoleRights { role, table, rights });
+        }
+        Ok(listed)
     }
 }
 

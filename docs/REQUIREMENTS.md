@@ -134,3 +134,15 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-O5 | A fixed memory budget well under what a Postgres of the same job needs, and little CPU when idle | One page cache with a byte limit; no background work when nothing changes |
 | R-O6 | An application on the server's own host reaches it without the network stack | A Unix domain socket beside the TCP port: `DATABASE_SOCKET`, `?socket=` |
 | R-O7 | A slow statement can be seen and understood: how many index entries and rows a query read against how many it returned, on request and, for statements over a threshold, in the server's log (what `EXPLAIN ANALYZE` and `log_min_duration_statement` are used for) | `Db::explain`; `DATABASE_SLOW_MS` |
+
+## G. Access
+
+| Id | Requirement | How |
+|---|---|---|
+| R-A1 | Several users of one database, each known by a name and a password of its own, from a client of any protocol version and in any of the three languages | A role, named in the greeting after the database: `shop/reader`, `?role=reader` |
+| R-A2 | A user is held to what it was allowed on each table: to read it, to insert into it, to update it, to delete from it, to change its schema. No statement reads or changes a table without the right, by whatever way it comes to the table: a join, a subquery, `returning`, an upsert, a foreign key's check, a delete that cascades, a batch, a prepared statement, a transaction of any kind, `explain`. A refusal does not say whether the table exists | `Rights`, held on a table or on every table; the engine asks at every table a statement comes to |
+| R-A3 | Who may do what is decided by the database's own password or the administrator's, and by no role, whatever it holds; a role is answered no administrative request | `Client::roles`: `create`, `grant`, `revoke`, `drop`; `database role` |
+| R-A4 | Once a revoke, or the dropping of a role, has been answered, no statement that begins runs by what it took: not one a connection kept prepared, not one in a transaction that was open, and no transaction commits a write past it | Rights are part of each version of the database; a role's open reading or optimistic transaction is ended when its role changes |
+| R-A5 | A user that may only read cannot hold up those who write | A named lock takes some right beyond reading |
+| R-A6 | Who may do what is as durable as the rows: there after a crash at any moment, whole or not at all; carried by a dump and restored with it; and gone with the table or the database it was about | Roles are stored in the catalog and changed through the log |
+| R-A7 | A database with one password and no roles is served as it always was, to clients of every version, and is stored as it always was | The database's password may do anything in it; a catalog without roles is the bytes it was |

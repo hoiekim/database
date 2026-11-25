@@ -200,6 +200,12 @@ class Urls(unittest.TestCase):
         self.assertEqual((admin.database, admin.password), ("", "adminpw"))
         c = Config.from_url("database://d:a%3Ab%40c@h?connect_timeout=2&lock_wait=0.25")
         self.assertEqual((c.password, c.connect_timeout, c.lock_wait), ("a:b@c", 2.0, 0.25))
+        self.assertIsNone(c.role)
+        # A role is a setting, and the password before the host is then
+        # the role's.
+        role = Config.from_url("database://shop:rolepw@db?role=reader")
+        self.assertEqual((role.database, role.role, role.password), ("shop", "reader", "rolepw"))
+        self.assertEqual(Config.from_url("database://rolepw@db/shop?role=night%20reader").role, "night reader")
         for bad in [
             "database://a:b@h/d?statement_timeout=-1",
             "database://a:b@h/d?lock_wait=NaN",
@@ -212,6 +218,10 @@ class Urls(unittest.TestCase):
             "database://a:b@h/d?what=1",
             "database://a:%zz@h/d",
             "database://a:b@h/d?name",
+            "database://a:b@h/d?role=",
+            "database://a:b@h/d?role",
+            # A role is a role of a database, and this URL names none.
+            "database://adminpw@h?role=reader",
         ]:
             with self.assertRaises(DbError, msg=bad) as caught:
                 Config.from_url(bad)

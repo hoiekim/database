@@ -11,6 +11,7 @@
 //! Database  name; a note the server keeps with it (its password's hash)
 //! Table     definition; for each numbering column, its name and next number
 //! Rows      table name, row count, each row's values in the definition's order
+//! Roles     the database's roles, each with its rights; absent if it has none
 //! Close     ends a database: its count of rows
 //! End       ends the dump: its count of databases
 //! ```
@@ -43,6 +44,7 @@ const TABLE: u8 = 2;
 const ROWS: u8 = 3;
 const CLOSE: u8 = 4;
 const END: u8 = 5;
+const ROLES: u8 = 6;
 /// Rows are written in records of about this many bytes.
 const BATCH_BYTES: usize = 1 << 20;
 /// No record is larger than this: the largest row, with room to spare.
@@ -133,6 +135,17 @@ fn dump_database(db: &Arc<Database>, note: &[u8], out: &mut dyn Write) -> Result
             cursor.next()?;
         }
         flush(&mut batch, &mut count, out)?;
+    }
+    // The roles come last, when every table they name is there. A
+    // database without any is dumped as it always was.
+    let roles = &txn.catalog().roles;
+    if !roles.is_empty() {
+        let mut w = Encoder::new();
+        w.varint(roles.len() as u64);
+        for role in roles.values() {
+            crate::catalog::put_role(&mut w, role);
+        }
+        record(out, ROLES, &w.buf)?;
     }
     let mut close = Encoder::new();
     close.varint(rows_total);
@@ -270,6 +283,20 @@ impl<'e> Restore<'e> {
                     let values = (0..width).map(|_| codec::get_value(&mut r)).collect::<std::result::Result<Vec<Value>, DbError>>().map_err(damaged)?;
                     loading.txn.raw()?.apply_insert(&table, &values)?;
                     loading.rows += 1;
+                }
+            }
+            ROLES => {
+                let loading = self.current.as_mut().ok_or_else(|| bad("roles outside any database"))?;
+                loading.create_tables()?;
+                for _ in 0..r.count().map_err(damaged)? {
+                    let role = crate::catalog::get_role(&mut r).map_err(damaged)?;
+                    crate::catalog::check_role_name(&role.name).map_err(|_| bad(format!("{:?} is not a role's name", role.name)))?;
+                    // A right on a table the dump does not hold would be
+                    // a right on whatever is given that name later.
+                    if let Some(table) = role.tables.keys().find(|table| !loading.columns.contains_key(*table)) {
+                        return Err(bad(format!("role {:?} has rights on a table {table:?} it never defined", role.name)));
+                    }
+                    loading.txn.raw()?.restore_role(role);
                 }
             }
             CLOSE => {

@@ -44,7 +44,7 @@ db.transaction(|tx| async move {
 ## What it does
 
 - **What an ordinary web application asks of Postgres**, written down as
-  75 requirements (`docs/REQUIREMENTS.md`), each covered by tests that
+  82 requirements (`docs/REQUIREMENTS.md`), each covered by tests that
   cite it. Tables with defaults, checks and foreign keys; unique,
   partial, expression and multi-valued indexes; joins, subqueries and
   aggregates; upserts and compare-and-swap; JSON; exact decimals; trees;
@@ -155,6 +155,7 @@ The tests, by what they prove:
 | `server/tests/requests.rs` | statements the server keeps and runs with new values; a transaction sent whole as a batch, with conditions; a transaction that begins with its first statement; the Unix socket |
 | `server/tests/explain.rs` | what a query read, by every way in, against what it returned; slow statements in the server's log |
 | `server/tests/durability.rs` | a server killed with `SIGKILL` under load, six times over, loses nothing acknowledged; memory stays bounded with data many times the cache |
+| `server/tests/roles.rs` | roles and their rights: for each right, every statement that needs it, sent every way a statement can be sent, is refused a role that lacks only that right, with nothing changed, and answered one that holds it; a revoke binds prepared statements and open transactions; who may grant; roles across a restart and a dump |
 | `server/tests/operations.rs` | dump under load, restore, a damaged dump refused, passwords, restarts |
 | `engine/tests/faults.rs` | a scripted workload, killed before every operation it makes on the disk, with the power cut each way that differs, and again inside the recoveries; the disk full from each operation on; each operation failing once, a sync by losing what it covered; a disk that lies about its syncs. Nothing acknowledged is lost, and what a lying disk lost is seen as far as checksums can see |
 | `engine/tests/recovery.rs` | a random workload on a simulated disk that loses power at any write, keeping, dropping or tearing each unsynced write, with transactions open beside the writer; after every cut the database equals a model of what was committed and no page is lost |

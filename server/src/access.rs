@@ -104,6 +104,27 @@ fn random_salt() -> [u8; 16] {
     salt
 }
 
+/// What a password is known by without being kept: a fresh salt and the
+/// hash of the two, 48 bytes. This is what a role's password is stored
+/// as, in its database.
+pub fn secret(password: &str) -> Vec<u8> {
+    let salt = random_salt();
+    [salt.as_slice(), hash(&salt, password).as_slice()].concat()
+}
+
+/// Whether `password` is the one a secret was made from. The same work
+/// whatever the secret is, a missing one included, so that the answer's
+/// timing does not tell which names exist.
+pub fn matches(secret: Option<&[u8]>, password: &str) -> bool {
+    match secret {
+        Some(secret) if secret.len() == 48 => same(&hash(&secret[..16], password), &secret[16..]),
+        _ => {
+            let _ = hash(&[0; 16], password);
+            false
+        }
+    }
+}
+
 /// The passwords' salts and hashes, by database.
 pub struct Access {
     path: PathBuf,
@@ -198,6 +219,15 @@ mod tests {
         assert_eq!(hex(&sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(hex(&sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
         assert_eq!(hex(&sha256(&[b'a'; 1000])), "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3");
+    }
+
+    #[test]
+    fn a_secret_knows_its_password_and_no_other() {
+        let made = secret("s3cret");
+        assert!(matches(Some(&made), "s3cret"));
+        assert!(!matches(Some(&made), "s3cret ") && !matches(Some(&made), ""));
+        assert!(!matches(None, "s3cret") && !matches(Some(&made[..47]), "s3cret") && !matches(Some(&[]), ""));
+        assert_ne!(secret("s3cret"), made, "each has a salt of its own");
     }
 
     #[test]

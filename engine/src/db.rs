@@ -59,7 +59,7 @@ use database_protocol::value::Value;
 
 use crate::btree::{self, Pages};
 use crate::cache::PageCache;
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, Role, Roles};
 use crate::error::{Error, Result};
 use crate::eval::{Cost, Ctx, Drawn, Read, Scope};
 use crate::exec;
@@ -488,7 +488,7 @@ impl Database {
         let published = self.published.lock().unwrap();
         let pinned = self.store.pin();
         debug_assert_eq!(pinned, published.version);
-        ReadTxn { db: self.clone(), snapshot: published.clone(), pinned, now: now_micros(), cost: Cost::default() }
+        ReadTxn { db: self.clone(), snapshot: published.clone(), pinned, now: now_micros(), cost: Cost::default(), role: None }
     }
 
     /// Starts a transaction that may write, waiting up to `wait` for the
@@ -691,7 +691,7 @@ impl Database {
         let mut rows_total = 0u64;
         for table in latest.catalog.tables.values() {
             let cost = Cost::default();
-            let ctx = Ctx { pages, catalog: &latest.catalog, now: 0, deadline: None, tape: None, params: &[], cost: &cost };
+            let ctx = Ctx { pages, catalog: &latest.catalog, now: 0, deadline: None, tape: None, params: &[], cost: &cost, role: None };
             // The rows, and the large values they name.
             let mut rows = 0u64;
             let mut blob_bytes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
@@ -818,6 +818,8 @@ pub struct ReadTxn {
     now: i64,
     /// What its queries have read since it was last asked.
     cost: Cost,
+    /// The role its queries run as: see `ReadTxn::set_role`.
+    role: Option<Arc<Role>>,
 }
 
 /// The pages one query has read, kept at hand for as long as it runs. A
@@ -862,7 +864,7 @@ impl Pages for Recent<'_> {
 
 impl ReadTxn {
     pub fn ctx(&self, deadline: Option<Instant>) -> Ctx<'_> {
-        Ctx { pages: &*self.db.store, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params: &[], cost: &self.cost }
+        Ctx { pages: &*self.db.store, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params: &[], cost: &self.cost, role: self.role.as_deref() }
     }
 
     /// What its queries have read since this was last asked: see `Read`.
@@ -879,7 +881,7 @@ impl ReadTxn {
         // A version's pages never change, so what the query has read
         // once it may read again from its own copy.
         let recent = Recent { store: &self.db.store, pages: Default::default() };
-        let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params, cost: &self.cost };
+        let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params, cost: &self.cost, role: self.role.as_deref() };
         exec::query(&ctx, q, &Scope::default())
     }
 
@@ -893,8 +895,23 @@ impl ReadTxn {
         }
     }
 
+    /// Has the queries from here on run as a role of the database, or
+    /// with `None` as its owner: a role's queries read only the tables
+    /// it may read. The rights are those of the version this transaction
+    /// reads.
+    pub fn set_role(&mut self, name: Option<&str>) {
+        self.role = name.map(|name| crate::catalog::role_in(&self.snapshot.catalog, name));
+    }
+
+    /// The role the queries run as.
+    pub fn role(&self) -> Option<&Arc<Role>> {
+        self.role.as_ref()
+    }
+
+    /// Every table's definition; for a role, of the tables it holds any
+    /// right on.
     pub fn describe(&self) -> Vec<TableDef> {
-        self.snapshot.catalog.defs_in_order()
+        described(&self.snapshot.catalog, self.role.as_deref())
     }
 
     pub fn catalog(&self) -> &Arc<Catalog> {
@@ -914,6 +931,16 @@ impl Drop for ReadTxn {
     fn drop(&mut self) {
         self.db.store.unpin(self.pinned);
     }
+}
+
+/// The definitions a connection is shown: all of them, or for a role
+/// those of the tables it holds some right on.
+fn described(catalog: &Catalog, role: Option<&Role>) -> Vec<TableDef> {
+    let mut defs = catalog.defs_in_order();
+    if let Some(role) = role {
+        defs.retain(|def| !role.rights_on(&def.name).is_empty());
+    }
+    defs
 }
 
 struct Savepoint {
@@ -1002,18 +1029,36 @@ impl WriteTxn {
     }
 
     pub fn ddl(&mut self, ddl: &Ddl, deadline: Option<Instant>) -> Result<()> {
-        self.run(deadline, |tx| match ddl {
-            Ddl::CreateTable { def, if_not_exists } => tx.create_table(def, *if_not_exists),
-            Ddl::DropTable { name, if_exists } => tx.drop_table(name, *if_exists),
-            Ddl::AddColumn { table, column, if_not_exists } => tx.add_column(table, column, *if_not_exists),
-            Ddl::DropColumn { table, column, if_exists } => tx.drop_column(table, column, *if_exists),
-            Ddl::CreateIndex { table, index, if_not_exists } => tx.create_index(table, index, *if_not_exists),
-            Ddl::DropIndex { table, index, if_exists } => tx.drop_index(table, index, *if_exists),
-        })
+        self.run(deadline, |tx| tx.ddl(ddl))
+    }
+
+    /// Has the statements from here on run as a role of the database, or
+    /// with `None` as its owner: see `Tx::set_role`.
+    pub fn set_role(&mut self, name: Option<&str>) {
+        if let Some(tx) = self.tx.as_mut() {
+            tx.set_role(name);
+        }
+    }
+
+    /// The role the statements run as.
+    pub fn role(&self) -> Option<&Arc<Role>> {
+        self.tx.as_ref().and_then(|tx| tx.role())
+    }
+
+    /// The roles of the database as this transaction has them.
+    pub fn roles(&self) -> Arc<Roles> {
+        self.tx.as_ref().map(|tx| tx.catalog.roles.clone()).unwrap_or_default()
+    }
+
+    /// Changes the database's roles: `change` is given the transaction
+    /// to call `create_role`, `grant` and the like on.
+    pub fn change_roles(&mut self, change: impl FnOnce(&mut Tx) -> Result<()>) -> Result<()> {
+        self.run(None, change)
     }
 
     pub fn describe(&mut self) -> Result<Vec<TableDef>> {
-        Ok(self.tx()?.catalog.defs_in_order())
+        let tx = self.tx()?;
+        Ok(described(&tx.catalog, tx.role().map(|role| &**role)))
     }
 
     pub fn now(&self) -> i64 {

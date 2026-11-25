@@ -36,6 +36,10 @@ pub struct Ctx<'a> {
     pub params: &'a [Value],
     /// Where the statement counts what it reads.
     pub cost: &'a Cost,
+    /// The role the statement runs as: every table it reads, by whatever
+    /// way it comes to it, must be one the role may read. `None` for the
+    /// database's owner and for the engine's own reading.
+    pub role: Option<&'a crate::catalog::Role>,
 }
 
 /// What statements have read since this was last asked: the figures a

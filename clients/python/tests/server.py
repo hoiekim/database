@@ -19,7 +19,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from database_client import Client, Config, DbError
 
@@ -53,9 +53,11 @@ class Server:
         self.log = open(os.path.join(self.dir, "server.log"), "ab")
         self._start()
 
+    def _environment(self) -> Dict[str, str]:
+        return dict(os.environ, DATABASE_ADMIN_PASSWORD=ADMIN_PASSWORD, DATABASE_DATA=os.path.join(self.dir, "data"), DATABASE_LISTEN=f"127.0.0.1:{self.port}")
+
     def _start(self) -> None:
-        environment = dict(os.environ, DATABASE_ADMIN_PASSWORD=ADMIN_PASSWORD, DATABASE_DATA=os.path.join(self.dir, "data"), DATABASE_LISTEN=f"127.0.0.1:{self.port}")
-        self.process = subprocess.Popen([str(self.path), "serve"], env=environment, stdout=self.log, stderr=self.log)
+        self.process = subprocess.Popen([str(self.path), "serve"], env=self._environment(), stdout=self.log, stderr=self.log)
         deadline = time.monotonic() + 60
         while True:
             try:
@@ -91,6 +93,15 @@ class Server:
         for name, value in settings.items():
             setattr(config, name, value)
         return Client.connect(config)
+
+    def role(self, *arguments: str, password: str = "") -> None:
+        """Runs ``database role <arguments>`` against this server: this
+        client greets with a protocol version that has no request to make
+        a role or grant it anything. ``password`` is the new role's, for
+        ``create``."""
+        done = subprocess.run([str(self.path), "role", *arguments], env=dict(self._environment(), DATABASE_PASSWORD=password), capture_output=True, text=True, timeout=60)
+        if done.returncode != 0:
+            raise RuntimeError(f"database role {' '.join(arguments)} failed: {done.stderr.strip()}")
 
     def _stop_process(self) -> None:
         if self.process.poll() is None:

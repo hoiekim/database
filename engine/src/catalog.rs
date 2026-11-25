@@ -11,6 +11,7 @@ use std::sync::Arc;
 use database_protocol::codec::{self, Reader, Writer};
 use database_protocol::error::{DbError, ErrorCode};
 use database_protocol::expr::{Expr, Func};
+use database_protocol::rights::Rights;
 use database_protocol::schema::*;
 use database_protocol::value::{Type, Value};
 
@@ -104,12 +105,136 @@ impl std::ops::Deref for Table {
     }
 }
 
+/// A role of the database: who may connect under its name, and what
+/// they may then do.
+///
+/// Roles are part of the catalog, so a version of the database is its
+/// tables and, with them, who may do what to them. A change of rights is
+/// then a commit like any other: logged, durable when it is answered,
+/// seen whole or not at all by a reader, and undone with its transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Role {
+    pub name: String,
+    /// What the server needs to know the role's password by. The engine
+    /// keeps it and does not read it.
+    pub secret: Vec<u8>,
+    /// The rights it holds on every table, those made later included.
+    pub everywhere: Rights,
+    /// The rights it holds on single tables besides. No entry is empty.
+    pub tables: BTreeMap<String, Rights>,
+}
+
+/// What each right of a set allows, as the words that go before a
+/// table's name.
+fn doing(rights: Rights) -> Vec<&'static str> {
+    [(Rights::READ, "read"), (Rights::INSERT, "insert into"), (Rights::UPDATE, "update"), (Rights::DELETE, "delete from"), (Rights::SCHEMA, "change the schema of")]
+        .into_iter()
+        .filter(|(right, _)| rights.contains(*right))
+        .map(|(_, words)| words)
+        .collect()
+}
+
+impl Role {
+    /// What the role may do to a table.
+    pub fn rights_on(&self, table: &str) -> Rights {
+        self.tables.get(table).map_or(self.everywhere, |rights| *rights | self.everywhere)
+    }
+
+    /// Fails unless the role holds every one of `rights` on `table`. Said
+    /// the same whether or not there is such a table: a role is not told
+    /// which names exist among those it has no right to.
+    pub fn need(&self, table: &str, rights: Rights) -> Result<()> {
+        let missing = rights.without(self.rights_on(table));
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Error::db(ErrorCode::AccessDenied, format!("role {:?} may not {} table {table:?}", self.name, doing(missing).join(" or "))))
+    }
+
+    /// Fails unless the role holds `rights` on every table: what a
+    /// statement about no one table needs.
+    pub fn need_everywhere(&self, rights: Rights, what: &str) -> Result<()> {
+        if self.everywhere.contains(rights) {
+            return Ok(());
+        }
+        Err(Error::db(ErrorCode::AccessDenied, format!("role {:?} may not {what}: that takes the right to {} every table", self.name, doing(rights.without(self.everywhere)).join(" and "))))
+    }
+
+    /// Whether the role may change anything at all.
+    pub fn changes_something(&self) -> bool {
+        let beyond_reading = Rights::ALL.without(Rights::READ);
+        self.everywhere.intersects(beyond_reading) || self.tables.values().any(|rights| rights.intersects(beyond_reading))
+    }
+}
+
+/// A role's name: what a database's may be, since the two are written
+/// side by side in a greeting.
+pub fn check_role_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if !ok {
+        return Err(invalid(format!("{name:?} is not a valid role name: use a-z, 0-9, _ and -, at most 64 of them")));
+    }
+    Ok(())
+}
+
+impl Role {
+    /// A role by this name that holds nothing: what a connection runs as
+    /// once its role has been dropped. Every table is then refused it.
+    pub fn without_rights(name: &str) -> Role {
+        Role { name: name.to_string(), secret: Vec::new(), everywhere: Rights::NONE, tables: BTreeMap::new() }
+    }
+}
+
+/// The role of that name in a catalog, or one that holds nothing.
+pub fn role_in(catalog: &Catalog, name: &str) -> Arc<Role> {
+    catalog.roles.get(name).cloned().unwrap_or_else(|| Arc::new(Role::without_rights(name)))
+}
+
+/// A database's roles, by name.
+pub type Roles = BTreeMap<String, Arc<Role>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
     /// By name. The names are shared, not copied, between the versions
     /// of the catalog, of which every writing transaction makes one.
     pub tables: BTreeMap<Arc<str>, Arc<Table>>,
     pub next_table_id: u32,
+    /// Shared between versions until one changes them, and each role
+    /// until it is changed: a role that is the same allocation in two
+    /// versions is the same role.
+    pub roles: Arc<Roles>,
+}
+
+/// The catalog as it has always been stored, and as it is stored with
+/// roles after its tables. A database without roles is stored as the
+/// first, byte for byte, so a build from before roles reads it; one with
+/// roles is the second, which such a build refuses rather than serve the
+/// database to its one password with the roles forgotten.
+const STORED_PLAIN: u8 = 1;
+const STORED_WITH_ROLES: u8 = 2;
+
+/// Writes a role as the catalog and the log store it.
+pub fn put_role(w: &mut Writer, role: &Role) {
+    w.str(&role.name);
+    w.bytes(&role.secret);
+    w.u8(role.everywhere.bits());
+    w.varint(role.tables.len() as u64);
+    for (table, rights) in &role.tables {
+        w.str(table);
+        w.u8(rights.bits());
+    }
+}
+
+pub fn get_role(r: &mut Reader) -> std::result::Result<Role, DbError> {
+    let name = r.str()?;
+    let secret = r.bytes()?.to_vec();
+    let everywhere = Rights::from_bits(r.u8()?)?;
+    let mut tables = BTreeMap::new();
+    for _ in 0..r.count()? {
+        let table = r.str()?;
+        tables.insert(table, Rights::from_bits(r.u8()?)?);
+    }
+    Ok(Role { name, secret, everywhere, tables })
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -416,7 +541,7 @@ impl Catalog {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        w.u8(1);
+        w.u8(if self.roles.is_empty() { STORED_PLAIN } else { STORED_WITH_ROLES });
         w.u32(self.next_table_id);
         w.varint(self.tables.len() as u64);
         for table in self.tables.values() {
@@ -455,19 +580,26 @@ impl Catalog {
             };
             codec::put_table(&mut w, &rest);
         }
+        if !self.roles.is_empty() {
+            w.varint(self.roles.len() as u64);
+            for role in self.roles.values() {
+                put_role(&mut w, role);
+            }
+        }
         w.buf
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Catalog> {
         if bytes.is_empty() {
-            return Ok(Catalog { tables: BTreeMap::new(), next_table_id: 1 });
+            return Ok(Catalog { tables: BTreeMap::new(), next_table_id: 1, roles: Arc::default() });
         }
         let bad = |e: DbError| Error::corrupt(format!("the stored catalog is damaged: {}", e.message));
         let mut r = Reader::new(bytes);
-        if r.u8().map_err(bad)? != 1 {
+        let stored = r.u8().map_err(bad)?;
+        if stored != STORED_PLAIN && stored != STORED_WITH_ROLES {
             return Err(Error::corrupt("the stored catalog is of an unknown version"));
         }
-        let mut catalog = Catalog { tables: BTreeMap::new(), next_table_id: r.u32().map_err(bad)? };
+        let mut catalog = Catalog { tables: BTreeMap::new(), next_table_id: r.u32().map_err(bad)?, roles: Arc::default() };
         for _ in 0..r.count().map_err(bad)? {
             let id = r.u32().map_err(bad)?;
             let name = r.str().map_err(bad)?;
@@ -506,6 +638,14 @@ impl Catalog {
             meta.volatile = rest.volatile;
             let table = Table { meta: Arc::new(meta), root, blobs, next_blob, rows, index_roots, serials };
             catalog.tables.insert(Arc::from(table.name.as_str()), Arc::new(table));
+        }
+        if stored == STORED_WITH_ROLES {
+            let mut roles = Roles::new();
+            for _ in 0..r.count().map_err(bad)? {
+                let role = get_role(&mut r).map_err(bad)?;
+                roles.insert(role.name.clone(), Arc::new(role));
+            }
+            catalog.roles = Arc::new(roles);
         }
         Ok(catalog)
     }
@@ -554,7 +694,7 @@ mod tests {
 
     #[test]
     fn a_catalog_survives_being_stored() {
-        let mut catalog = Catalog { tables: BTreeMap::new(), next_table_id: 3 };
+        let mut catalog = Catalog { tables: BTreeMap::new(), next_table_id: 3, roles: Arc::default() };
         let mut users = Table::create(&users(), 1, &catalog).unwrap();
         users.root = 17;
         users.rows = 5;
@@ -580,6 +720,38 @@ mod tests {
         assert!(back.table("posts").unwrap().volatile);
         assert_eq!(back.defs_in_order().iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["users", "posts"]);
         assert_eq!(back.children_of("users").len(), 1);
+
+        // Without roles it is stored as it was before there were any;
+        // with them, they come back as they were, and the stored form
+        // says so in its first byte, which an older build refuses.
+        let plain = catalog.encode();
+        assert_eq!(plain[0], 1);
+        let reader = Role { name: "reader".into(), secret: vec![7; 48], everywhere: Rights::READ, tables: BTreeMap::from([("posts".to_string(), Rights::INSERT | Rights::DELETE)]) };
+        let nobody = Role { name: "nobody".into(), secret: Vec::new(), everywhere: Rights::NONE, tables: BTreeMap::new() };
+        catalog.roles = Arc::new(BTreeMap::from([("reader".to_string(), Arc::new(reader.clone())), ("nobody".to_string(), Arc::new(nobody.clone()))]));
+        let stored = catalog.encode();
+        assert_eq!((stored[0], &stored[1..plain.len()]), (2, &plain[1..]));
+        let back = Catalog::decode(&stored).unwrap();
+        assert_eq!(back.roles.values().map(|role| (**role).clone()).collect::<Vec<_>>(), [nobody, reader]);
+        assert_eq!(back.tables.len(), 2);
+    }
+
+    #[test]
+    fn a_role_holds_what_it_was_granted_on_a_table_or_on_all() {
+        let role = Role { name: "clerk".into(), secret: Vec::new(), everywhere: Rights::READ, tables: BTreeMap::from([("orders".to_string(), Rights::INSERT)]) };
+        assert_eq!(role.rights_on("orders"), Rights::READ | Rights::INSERT);
+        assert_eq!(role.rights_on("anything"), Rights::READ);
+        assert!(role.need("orders", Rights::READ | Rights::INSERT).is_ok());
+        let refused = role.need("orders", Rights::READ | Rights::UPDATE | Rights::DELETE).unwrap_err().into_db();
+        assert_eq!(refused.code, ErrorCode::AccessDenied);
+        assert_eq!(refused.message, "role \"clerk\" may not update or delete from table \"orders\"");
+        assert!(role.need_everywhere(Rights::READ, "look").is_ok() && role.need_everywhere(Rights::SCHEMA, "create a table").is_err());
+        assert!(role.changes_something());
+        assert!(!Role { tables: BTreeMap::new(), ..role }.changes_something());
+        for bad in ["", "Reader", "a/b", "a b", &"x".repeat(65)] {
+            assert!(check_role_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_role_name("report-reader_2").is_ok());
     }
 
     #[test]

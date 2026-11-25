@@ -24,6 +24,10 @@ _IDLE_CHECK_SECONDS = 20.0
 #: is taken in pieces.
 _LONGEST_WAIT = 86_400.0
 
+#: What stands between a database's name and a role's in the greeting:
+#: ``shop/reader``.
+_ROLE_SEPARATOR = "/"
+
 
 def _lost(what: object) -> DbError:
     return DbError(ErrorCode.CONNECTION, f"connection to the database lost: {what}")
@@ -65,14 +69,20 @@ class Config:
     lock_wait: float = 30.0
     #: Sent to the server in the greeting.
     name: str = ""
-
+    #: The role of the database to connect as, if any: ``password`` is
+    #: then the role's, and the client may do what the role was granted
+    #: and nothing else. ``None`` connects with the database's own
+    #: password, which may do anything in it.
+    role: Optional[str] = None
     @staticmethod
     def from_url(url: str) -> "Config":
         """Reads ``database://<database>:<password>@<host>[:<port>][/<database>]``
         with optional ``?pool=8&connect_timeout=10&statement_timeout=60&lock_wait=30&name=app``
-        (times in seconds). The database may be named before the password
-        or as the path; an administrator's URL names none
-        (``database://<password>@<host>``). Percent-encoding is decoded in
+        (times in seconds), and ``&role=reader`` to connect as a role of
+        the database, with the role's password in the password's place.
+        The database may be named before the password or as the path; an
+        administrator's URL names none (``database://<password>@<host>``),
+        and so can name no role. Percent-encoding is decoded in
         the database, the password and the settings."""
 
         def bad(why: str) -> DbError:
@@ -127,9 +137,19 @@ class Config:
                 config.lock_wait = seconds()
             elif key == "name":
                 config.name = value
+            elif key == "role":
+                if not value or not config.database:
+                    raise bad("role must be the name of a role, of a database the URL names")
+                config.role = value
             else:
                 raise bad("an unknown setting")
         return config
+
+
+def _greeting_database(config: Config) -> str:
+    """What the greeting names: the database, and the role after it if
+    the connection is a role's."""
+    return config.database if config.role is None else f"{config.database}{_ROLE_SEPARATOR}{config.role}"
 
 
 class Conn:
@@ -157,7 +177,7 @@ class Conn:
             # Requests are small and each waits for its answer: never
             # delay one to batch it with the next.
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            hello = codec.request(codec.HELLO, codec.PROTOCOL_VERSION, config.database, config.password, config.name)
+            hello = codec.request(codec.HELLO, codec.PROTOCOL_VERSION, _greeting_database(config), config.password, config.name)
             answer = self._exchange(hello, time.monotonic() + config.connect_timeout)
             if answer.kind != codec.R_HELLO:
                 raise _lost("unexpected answer to the greeting")
