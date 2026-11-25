@@ -268,6 +268,84 @@ async fn a_renewed_certificate_is_served_without_a_restart() -> DbResult<()> {
     Ok(())
 }
 
+/// The processor time this process has used, in seconds.
+#[cfg(target_os = "linux")]
+fn cpu_seconds() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let fields: Vec<&str> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
+    // utime and stime, in ticks of a hundredth of a second.
+    (fields[11].parse::<f64>().unwrap() + fields[12].parse::<f64>().unwrap()) / 100.0
+}
+
+// R-O9: a connection that has not sent enough to tell what it is costs
+// the server no processor time while it waits, is closed when its time
+// to greet is over, and keeps no other connection waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_sends_too_little_to_tell_what_it_is_waits_idle_and_is_closed() -> DbResult<()> {
+    let server = tls_server(true).await;
+    let started = std::time::Instant::now();
+    // Each of these is the start of a handshake, or of a greeting, cut
+    // short: one byte, two, and one byte before the peer stops sending.
+    let mut held = Vec::new();
+    for n in 0..300 {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+        stream.write_all(if n % 3 == 1 { &[0x16, 0x03] } else { &[0x16] }).await.unwrap();
+        if n % 3 == 2 {
+            stream.shutdown().await.unwrap();
+        }
+        held.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    #[cfg(target_os = "linux")]
+    {
+        let before = cpu_seconds();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let used = cpu_seconds() - before;
+        assert!(used < 0.5, "three hundred silent connections cost {used} s of processor time in 3 s");
+    }
+    // Others are served meanwhile, in the clear and under TLS.
+    Client::connect(config(&server)).await?.ping().await?;
+    connect(&server, Tls::authority(fixture("ca.pem"))).await?.ping().await?;
+    // And each is closed when the ten seconds a connection has to say
+    // what it is are over: the server sends nothing and ends it.
+    for mut stream in held {
+        let mut byte = [0u8; 1];
+        let ended = tokio::time::timeout_at((started + Duration::from_secs(20)).into(), stream.read(&mut byte)).await;
+        assert!(matches!(ended, Ok(Ok(0)) | Ok(Err(_))), "a silent connection was still open, or was answered: {ended:?}");
+    }
+    assert!(started.elapsed() >= Duration::from_secs(9), "they were closed before their time");
+    Ok(())
+}
+
+// R-O9: a greeting in the clear whose length begins with the byte a
+// handshake begins with is a greeting all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_greeting_whose_first_byte_is_a_handshakes_is_served_as_a_greeting() -> DbResult<()> {
+    for plain in [true, false] {
+        let server = tls_server(plain).await;
+        // Frames of 278 and of 534 bytes: their lengths begin 16 01 and 16 02.
+        for len in [0x116usize, 0x216] {
+            let hello = |client: String| encode_request(&Request::Hello { version: PROTOCOL_VERSION, database: "test".into(), password: PASSWORD.into(), client }, 0);
+            let pad = len - hello(String::new()).len();
+            // A name of 128 bytes and more takes a byte more to say how long it is.
+            let frame = [pad, pad - 1].into_iter().map(|n| hello("x".repeat(n))).find(|frame| frame.len() == len).expect("a greeting of that length");
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+            stream.write_all(&(frame.len() as u32).to_le_bytes()).await.unwrap();
+            stream.write_all(&frame).await.unwrap();
+            let mut len = [0u8; 4];
+            stream.read_exact(&mut len).await.unwrap();
+            let mut answer = vec![0u8; u32::from_le_bytes(len) as usize];
+            stream.read_exact(&mut answer).await.unwrap();
+            match decode_response(&answer).unwrap() {
+                Response::Hello { .. } if plain => {}
+                Response::Error(e) if !plain && e.code == ErrorCode::AccessDenied && e.message.contains("TLS") => {}
+                other => panic!("a greeting of {} bytes, in the clear allowed: {plain}, was answered {other:?}", frame.len()),
+            }
+        }
+    }
+    Ok(())
+}
+
 // R-O9: a server asked for TLS that cannot serve it does not start.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_does_not_start_on_a_certificate_it_cannot_use() {

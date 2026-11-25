@@ -1,8 +1,8 @@
 //! TLS on the TCP listener: the certificate the server shows, and which
 //! of the connections that arrive are held to it.
 //!
-//! A connection says in its first three bytes whether it begins a TLS
-//! handshake or a greeting in the clear, so one port serves both where
+//! A connection says in its first three bytes, and mostly in its first,
+//! whether it begins a TLS handshake or a greeting in the clear, so one port serves both where
 //! both are allowed, and a client in the clear on a server that requires
 //! TLS can be told why it is refused, in a frame it can read.
 //!
@@ -14,12 +14,15 @@
 //! the server goes on with the certificate it has and says so in its log.
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use rustls::crypto::ring;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 /// The certificate a server shows, and whether it insists on TLS.
@@ -132,22 +135,77 @@ impl Tls {
 /// handshake record (22) of version 3.x. In the clear they are the low
 /// bytes of a greeting's length, which is under 16,384, so the third is
 /// zero; in a handshake record it is the minor version, which is not.
-pub(crate) fn is_handshake(first: [u8; 3]) -> bool {
+fn is_handshake(first: [u8; 3]) -> bool {
     first[0] == 0x16 && first[1] == 0x03 && first[2] != 0
 }
 
-/// A connection's first three bytes, left where they are for whoever
-/// reads the connection next. `None` if it closed before sending them.
-pub(crate) async fn first_bytes(stream: &TcpStream) -> Option<[u8; 3]> {
+/// What a connection over TCP begins as.
+pub(crate) enum Begins {
+    /// A greeting in the clear, of which nothing has been read.
+    Plain(TcpStream),
+    /// A greeting in the clear, whose first three bytes have been read
+    /// and are read again from this.
+    PlainRead(Replayed),
+    /// A TLS handshake, likewise.
+    Handshake(Replayed),
+}
+
+/// Waits for a connection's first bytes and says what it begins.
+/// `None` if it closed before it had sent enough to tell.
+///
+/// Nothing here asks again and again whether more bytes have come: a
+/// connection that sends one byte and goes quiet would otherwise keep a
+/// thread busy for as long as it is given. The first byte is looked at
+/// where it lies, which waits until there is one. Any byte but the one
+/// a handshake begins with is a greeting's, and the connection is handed
+/// on untouched. Otherwise the three bytes are read, which waits for all
+/// of them, and whoever serves the connection reads them again first.
+pub(crate) async fn begins(mut stream: TcpStream) -> Option<Begins> {
     let mut first = [0u8; 3];
-    loop {
-        match stream.peek(&mut first).await {
-            Ok(3) => return Some(first),
-            Ok(0) | Err(_) => return None,
-            // Fewer have arrived than are needed, which a client that
-            // sends its first frame whole does not do: look again.
-            Ok(_) => tokio::time::sleep(Duration::from_millis(1)).await,
+    match stream.peek(&mut first[..1]).await {
+        Ok(1) => {}
+        _ => return None,
+    }
+    if first[0] != 0x16 {
+        return Some(Begins::Plain(stream));
+    }
+    stream.read_exact(&mut first).await.ok()?;
+    let replayed = Replayed { first, given: 0, stream };
+    Some(if is_handshake(first) { Begins::Handshake(replayed) } else { Begins::PlainRead(replayed) })
+}
+
+/// A connection whose first three bytes were read to see what it
+/// carries: they are read again by whoever is given it.
+pub(crate) struct Replayed {
+    first: [u8; 3],
+    given: usize,
+    stream: TcpStream,
+}
+
+impl AsyncRead for Replayed {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.given < this.first.len() && buf.remaining() > 0 {
+            let n = (this.first.len() - this.given).min(buf.remaining());
+            buf.put_slice(&this.first[this.given..this.given + n]);
+            this.given += n;
+            return Poll::Ready(Ok(()));
         }
+        Pin::new(&mut this.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Replayed {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 }
 

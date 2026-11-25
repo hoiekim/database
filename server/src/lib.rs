@@ -184,19 +184,26 @@ fn connect_tls(state: &Arc<State>, stopping: &watch::Receiver<bool>, tls: &Arc<t
     // task that makes it: the listener goes on accepting.
     tokio::spawn(async move {
         let _serving = serving;
-        let Ok(Some(first)) = tokio::time::timeout(HANDSHAKE_PATIENCE, tls::first_bytes(&stream)).await else { return };
-        if tls::is_handshake(first) {
-            let Ok(Ok(stream)) = tokio::time::timeout(HANDSHAKE_PATIENCE, tls.acceptor().accept(stream)).await else { return };
-            let (reader, writer) = tokio::io::split(stream);
-            session::serve(reader, writer, state, id, stopping, None).await;
-        } else {
-            // In the clear. Where that is not served, the greeting is
-            // still read, so that the refusal is the answer to it: a
-            // frame the client reads, where a closed connection would
-            // tell it nothing.
-            let refusal = (!tls.plain_allowed()).then(tls_required);
-            let (reader, writer) = stream.into_split();
-            session::serve(reader, writer, state, id, stopping, refusal).await;
+        // In the clear where that is not served, the greeting is still
+        // read, so that the refusal is the answer to it: a frame the
+        // client reads, where a closed connection would tell it nothing.
+        let refusal = (!tls.plain_allowed()).then(tls_required);
+        match tokio::time::timeout(HANDSHAKE_PATIENCE, tls::begins(stream)).await {
+            Ok(Some(tls::Begins::Handshake(stream))) => {
+                let Ok(Ok(stream)) = tokio::time::timeout(HANDSHAKE_PATIENCE, tls.acceptor().accept(stream)).await else { return };
+                let (reader, writer) = tokio::io::split(stream);
+                session::serve(reader, writer, state, id, stopping, None).await;
+            }
+            Ok(Some(tls::Begins::Plain(stream))) => {
+                let (reader, writer) = stream.into_split();
+                session::serve(reader, writer, state, id, stopping, refusal).await;
+            }
+            Ok(Some(tls::Begins::PlainRead(stream))) => {
+                let (reader, writer) = tokio::io::split(stream);
+                session::serve(reader, writer, state, id, stopping, refusal).await;
+            }
+            // It closed, or it has had its time.
+            Ok(None) | Err(_) => {}
         }
     });
 }

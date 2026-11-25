@@ -570,7 +570,12 @@ The choices, and why:
   port, and one that requires TLS can read a greeting that came in the
   clear and answer it with the reason, where a failed handshake would
   show an old client only a closed connection. It reads the greeting
-  and does not look inside: no password is compared.
+  and does not look inside: no password is compared. The server never
+  asks twice whether more bytes have come: it waits for the first, and
+  only if that is `16` reads the other two, to be read again by whoever
+  then serves the connection. A connection that sends less than it
+  takes to tell costs a waiting task until its ten seconds are over,
+  and no processor time.
 - **Required unless told otherwise.** With a certificate, TCP in the
   clear is refused. `DATABASE_TLS=optional` serves both, for the days
   in which clients are moved over. A server with no certificate is as
