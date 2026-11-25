@@ -69,6 +69,10 @@ const LINK_LEN: usize = 9;
 /// change begins with, so a build that knows nothing of stamps refuses
 /// the record rather than read a time as a change.
 const STAMP: u8 = 0xF1;
+/// The first byte of a seal: the record that ends a log file's copy in
+/// the archive, with a time no commit in the file was made after and
+/// none in a later file before. A file in the data directory has none.
+const SEAL: u8 = 0xF2;
 /// What a stamp adds to a record: that byte and the time.
 pub const STAMP_LEN: usize = 9;
 /// Where a file's first record begins.
@@ -422,6 +426,9 @@ pub struct Replayed {
     /// if it says nothing, for having no records of its own or because
     /// that file had none.
     pub after: u64,
+    /// The time the file's seal gives, for a copy that has one: 0 if
+    /// it has none.
+    pub sealed: i64,
 }
 
 /// One transaction's record, as a reader of the log is given it.
@@ -455,7 +462,7 @@ pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation
 /// of one reads as the file it was copied from.
 pub fn replay_file(file: &dyn File, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(Commit) -> Result<()>) -> Result<Replayed> {
     let len = file.len()?;
-    let nothing = |end| Replayed { end, at: 0, after: 0 };
+    let nothing = |end| Replayed { end, at: 0, after: 0, sealed: 0 };
     let mut head = vec![0u8; HEADER_LEN as usize];
     if len < HEADER_LEN {
         return Ok(nothing(End::Torn));
@@ -469,8 +476,10 @@ pub fn replay_file(file: &dyn File, uuid: &[u8; 16], generation: u64, on_record:
     }
     let mut offset = HEADER_LEN;
     let mut after = 0;
+    // Where the records end, and the seal after them if there is one.
+    let (mut at, mut sealed) = (HEADER_LEN, 0);
     loop {
-        let ended = |end| Replayed { end, at: offset, after };
+        let ended = |end| Replayed { end, at, after, sealed };
         if offset == len {
             return Ok(ended(End::Clean));
         }
@@ -495,6 +504,11 @@ pub fn replay_file(file: &dyn File, uuid: &[u8; 16], generation: u64, on_record:
             return Ok(ended(End::Torn));
         }
         let end = offset + 8 + u64::from(size);
+        if bytes[0] == SEAL && bytes.len() == STAMP_LEN {
+            sealed = i64::from_le_bytes(bytes[1..].try_into().unwrap());
+            offset = end;
+            continue;
+        }
         if offset == HEADER_LEN && bytes.len() == LINK_LEN && bytes[0] == LINK {
             after = u64::from_le_bytes(bytes[1..].try_into().unwrap());
         } else if bytes[0] == STAMP && bytes.len() >= STAMP_LEN {
@@ -504,7 +518,20 @@ pub fn replay_file(file: &dyn File, uuid: &[u8; 16], generation: u64, on_record:
             on_record(Commit { end, time: None, changes: &bytes })?;
         }
         offset = end;
+        at = end;
     }
+}
+
+/// A seal to follow the records of a copy of log file `generation` that
+/// end at `at`: see `SEAL`.
+pub fn seal(generation: u64, at: u64, time: i64) -> Vec<u8> {
+    let mut record = [SEAL; STAMP_LEN];
+    record[1..].copy_from_slice(&time.to_le_bytes());
+    let mut out = Vec::with_capacity(8 + STAMP_LEN);
+    out.extend_from_slice(&(STAMP_LEN as u32).to_le_bytes());
+    out.extend_from_slice(&record_crc(generation, at, &record).to_le_bytes());
+    out.extend_from_slice(&record);
+    out
 }
 
 /// A log file's first bytes, for whoever writes a copy of one.
@@ -615,29 +642,29 @@ mod tests {
         }
         let ended = HEADER_LEN + 3 * 108;
         assert_eq!(wal.size(), ended);
-        assert_eq!(read(&vfs, 2), (Replayed { end: End::Clean, at: ended, after: 0 }, 3));
+        assert_eq!(read(&vfs, 2), (Replayed { end: End::Clean, at: ended, after: 0, sealed: 0 }, 3));
         // A file that has no record yet says nothing either, and is as
         // files were before there were links.
         wal.rotate().unwrap();
         assert_eq!(vfs.file_len(&wal_path(Path::new("/d"), "t", 3)), HEADER_LEN);
-        assert_eq!(read(&vfs, 3), (Replayed { end: End::Clean, at: HEADER_LEN, after: 0 }, 0));
+        assert_eq!(read(&vfs, 3), (Replayed { end: End::Clean, at: HEADER_LEN, after: 0, sealed: 0 }, 0));
         // Its first record brings the link with it. The link is not a
         // transaction's record, and later records bring none.
         wal.append(4, &[4; 50]).unwrap();
         wal.append(5, &[5; 50]).unwrap();
         wal.sync_to(5).unwrap();
         let linked = HEADER_LEN + 8 + LINK_LEN as u64;
-        assert_eq!(read(&vfs, 3), (Replayed { end: End::Clean, at: linked + 2 * 58, after: ended }, 2));
+        assert_eq!(read(&vfs, 3), (Replayed { end: End::Clean, at: linked + 2 * 58, after: ended, sealed: 0 }, 2));
         // The same for a file begun when a database is opened.
         let wal = Wal::create_after(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 7, 5, true, 500).unwrap();
         assert_eq!(wal.size(), HEADER_LEN);
         wal.rotate().unwrap();
-        assert_eq!(read(&vfs, 7), (Replayed { end: End::Clean, at: HEADER_LEN, after: 0 }, 0));
+        assert_eq!(read(&vfs, 7), (Replayed { end: End::Clean, at: HEADER_LEN, after: 0, sealed: 0 }, 0));
         wal.append(6, &[6; 10]).unwrap();
-        assert_eq!(read(&vfs, 8), (Replayed { end: End::Clean, at: HEADER_LEN + 18, after: 0 }, 1));
+        assert_eq!(read(&vfs, 8), (Replayed { end: End::Clean, at: HEADER_LEN + 18, after: 0, sealed: 0 }, 1));
         let wal = Wal::create_after(Arc::new(vfs.clone()), Path::new("/d"), "t", UUID, 9, 6, true, 500).unwrap();
         wal.append(7, &[7; 10]).unwrap();
-        assert_eq!(read(&vfs, 9), (Replayed { end: End::Clean, at: linked + 18, after: 500 }, 1));
+        assert_eq!(read(&vfs, 9), (Replayed { end: End::Clean, at: linked + 18, after: 500, sealed: 0 }, 1));
     }
 
     #[test]

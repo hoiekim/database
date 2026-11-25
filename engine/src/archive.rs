@@ -42,7 +42,12 @@
 //!
 //! **A log file's copy** is its header and its records: the room the file
 //! was grown by is left out, and so is a tail a crash tore, which was
-//! never acknowledged. The copy reads as the file does (`wal::replay_file`).
+//! never acknowledged. After them comes a **seal**: a time, taken when
+//! the next file was begun, that no commit in this file was made after
+//! and none in a later file before. The archive ends with a seal, and so
+//! knows up to what time it is the whole of what was committed, which
+//! its last commit's time alone would not say. The copy reads as the
+//! file does (`wal::replay_file`).
 //!
 //! Restoring is recovery (`Database::open`) on a base and copies of the
 //! log files after it, the last cut after the commit the moment names:
@@ -201,7 +206,18 @@ impl Archive {
     /// is not one yet.
     pub fn list(&self, history: &str) -> Result<Listing> {
         let mut listing = Listing::default();
-        for file in self.vfs.list(&self.history_dir(history))? {
+        let files = match self.vfs.list(&self.history_dir(history)) {
+            Ok(files) => files,
+            // No directory of that name in an archive that can be read
+            // is a history with nothing in it yet. An archive that
+            // cannot be read says nothing of what it holds.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.vfs.list_dirs(&self.dir)?;
+                Vec::new()
+            }
+            Err(e) => return Err(e.into()),
+        };
+        for file in files {
             if let Some(generation) = file.strip_prefix("base-").and_then(|g| g.parse().ok()) {
                 listing.bases.push(generation);
             } else if let Some(generation) = file.strip_prefix("wal-").and_then(|g| g.parse().ok()) {
@@ -242,16 +258,25 @@ impl Archive {
     /// Copies a log file of the data directory into the history: its
     /// header and the records that check. What follows them is room the
     /// file was grown by, or the tail of a crash.
-    pub fn put_log(&self, history: &str, uuid: &[u8; 16], generation: u64, local: &dyn File) -> Result<()> {
+    ///
+    /// The copy ends with a seal: `sealed` is a time no commit in the
+    /// file was made after and none in a later file before. It is how
+    /// the archive knows, of a time after its last commit, that nothing
+    /// was committed between the two.
+    pub fn put_log(&self, history: &str, uuid: &[u8; 16], generation: u64, local: &dyn File, sealed: i64) -> Result<()> {
         let read = wal::replay_file(local, uuid, generation, &mut |_| Ok(()))?;
         self.put(history, &log_file(generation), &mut |out| {
-            if read.at == 0 {
+            let mut at = read.at;
+            if at == 0 {
                 // It holds nothing of this data file's. The copy says as
                 // much, and keeps the place in the sequence.
+                at = wal::FIRST_RECORD;
                 out.write_at(&wal::file_header(generation, uuid), 0)?;
-                return Ok(());
+            } else {
+                copy(local, out, at, &mut |_| {})?;
             }
-            copy(local, out, read.at, &mut |_| {})
+            out.write_at(&wal::seal(generation, at, sealed), at)?;
+            Ok(())
         })
     }
 
@@ -272,6 +297,12 @@ impl Archive {
             out.write_at(&base.trailer(), len)?;
             Ok(())
         })
+    }
+
+    /// Whether the history has a base under this number, as far as the
+    /// directory shows.
+    pub fn has_base(&self, history: &str, generation: u64) -> bool {
+        self.vfs.exists(&self.history_dir(history).join(base_file(generation)))
     }
 
     fn open(&self, history: &str, name: &str) -> Result<Arc<dyn File>> {
@@ -375,7 +406,7 @@ impl Archive {
                 }
                 Ok(())
             })?;
-            if read.end == End::Torn || read.at == 0 {
+            if read.end == End::Torn || read.at == 0 || read.sealed == 0 {
                 return Err(not_whole(format!("log file {generation} is damaged after byte {}", read.at)));
             }
             if let (Some(ended), true) = (before, read.after > 0) {
@@ -455,10 +486,12 @@ pub struct Progress {
     /// The file this server knew the archive to lack next, kept while
     /// the archive is read again.
     pub known: Option<u64>,
+    /// The newest base the archive was seen to hold.
+    pub base: Option<u64>,
 }
 
 impl Default for Progress {
     fn default() -> Self {
-        Progress { chain: Chain::Unknown, logs_written: 0, bases_written: 0, kept: 0, error: None, known: None }
+        Progress { chain: Chain::Unknown, logs_written: 0, bases_written: 0, kept: 0, error: None, known: None, base: None }
     }
 }

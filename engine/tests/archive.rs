@@ -247,14 +247,20 @@ fn a_restore_to_a_time_holds_the_commits_made_up_to_it_and_no_other() {
             verify(&restore(&engine, Moment::Time(time - 1), "then"), model_at(times[i - 1].0));
         }
     }
-    // The very last time is the end of the archive, and so is any later:
-    // those are refused, since nothing says the archive is the whole of
-    // what was committed by then.
-    let last = times.last().unwrap().1;
-    verify(&restore(&engine, Moment::Time(last - 1), "then"), model_at(times.iter().rev().find(|(_, time)| *time < last).unwrap().0));
-    let refused = engine.recover_database("test", Moment::Time(last + 1_000_000), "later", false).unwrap_err();
-    assert!(refused.to_string().contains("cannot say what was committed"), "{refused}");
+    // A time after the last commit and before the last log file was
+    // closed is the end of the archive: nothing was committed between.
+    let last = times.last().unwrap();
+    verify(&restore(&engine, Moment::Time(last.1), "then"), model_at(last.0));
+    // A time after that is refused: the archive does not say what was
+    // committed by then, and the database may have gone on.
+    let refused = engine.recover_database("test", Moment::Time(last.1 + 3_600_000_000), "later", false).unwrap_err();
+    assert!(refused.to_string().contains("is the whole of what was committed up to"), "{refused}");
     assert!(engine.database("later").is_err());
+    // After a checkpoint it does say, up to the checkpoint.
+    let closed = database_protocol::time::now_micros();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    engine.database("test").unwrap().checkpoint().unwrap();
+    verify(&restore(&engine, Moment::Time(closed), "then"), model_at(last.0));
 }
 
 fn refusal(engine: &Engine, to: Moment, target: &str, replace: bool) -> String {
@@ -316,7 +322,8 @@ fn a_restore_the_archive_cannot_make_whole_is_refused_and_changes_nothing() {
     // A log file with a bit flipped: nothing after the flip, from a base
     // before it.
     let damaged = vfs.snapshot();
-    let hit = made.iter().find(|made| made.position.0 == last && made.position.1 > 300).expect("a commit well into the last log file");
+    let hit = made.iter().rev().find(|made| made.position.1 > 300).expect("a commit well into a log file");
+    let last = hit.position.0;
     damaged.corrupt(&dir.join(format!("wal-{last:010}")), 100);
     {
         let engine = start(&damaged);
@@ -713,4 +720,26 @@ fn an_archive_begun_on_a_database_with_rows_begins_with_a_base_of_them() {
     // is asked for.
     let (generation, offset) = made.last().unwrap().position;
     assert!(report.contains(&position_text(generation, offset)), "{report}");
+}
+
+// R-O8
+#[test]
+fn an_archive_emptied_under_a_running_server_begins_again_with_a_base() {
+    let vfs = MemVfs::new();
+    let engine = start(&vfs);
+    let db = create(&engine);
+    let (mut model, mut made) = (Model::new(), Vec::new());
+    workload(&db, 80, 8, &mut model, &mut made, &mut || {});
+    db.checkpoint().unwrap();
+    let history = history(&vfs);
+    for file in vfs.list(&Path::new(ARCHIVE).join(&history)).unwrap() {
+        vfs.remove(&Path::new(ARCHIVE).join(&history).join(file)).unwrap();
+    }
+    // Log files alone would apply to nothing. The next checkpoint sees
+    // the base gone and writes one, and what follows is whole again.
+    workload(&db, 81, 8, &mut model, &mut made, &mut || {});
+    db.checkpoint().unwrap();
+    verify_archive(&engine, &[made.last().unwrap()], &model);
+    let refused = refusal(&engine, moment(&made[0]), "before", false);
+    assert!(refused.contains("was taken after it"), "{refused}");
 }

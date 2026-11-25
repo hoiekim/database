@@ -706,26 +706,44 @@ impl Database {
     /// Writes everything committed into the data file and drops the log
     /// that held it, or with an archive hands it there. Writers are held
     /// only while the new log file is started.
+    ///
+    /// With an archive, a checkpoint that was asked for closes the log
+    /// file even if it holds nothing, so that the archive is then known
+    /// to be whole up to this moment.
     pub fn checkpoint(self: &Arc<Self>) -> Result<()> {
         let _one = self.checkpointing.lock().unwrap();
-        self.checkpoint_held(false).map(|_| ())
+        self.checkpoint_held(false, true).map(|_| ())
+    }
+
+    /// `checkpoint`, as the engine makes one when it is due: with
+    /// nothing committed since the last, the log file is left open.
+    pub fn checkpoint_when_due(self: &Arc<Self>) -> Result<()> {
+        let _one = self.checkpointing.lock().unwrap();
+        self.checkpoint_held(false, false).map(|_| ())
     }
 
     /// `checkpoint`, by whoever holds `checkpointing`. With `base`, a
-    /// base is written to the archive whether or not it lacks one.
-    /// Returns what the archive refused, if it refused something.
-    fn checkpoint_held(self: &Arc<Self>, base: bool) -> Result<Option<String>> {
+    /// base is written to the archive whether or not it lacks one; with
+    /// `close`, the log file is closed and handed to the archive though
+    /// nothing was committed to it. Returns what the archive refused,
+    /// if it refused something.
+    fn checkpoint_held(self: &Arc<Self>, base: bool, close: bool) -> Result<Option<String>> {
         self.check_failed()?;
         let guard = self.lock_writes(Duration::from_secs(3600))?;
         let latest = self.latest.lock().unwrap().clone();
         if latest.version == self.store.meta().version {
-            drop(guard);
             // Nothing to write. With an archive there may still be log
-            // files to hand it: the ones it refused before.
-            return match self.archiving {
-                Some(_) => self.fatal(self.settle_logs(self.wal.generation(), base)),
-                None => Ok(None),
-            };
+            // files to hand it: the ones it refused before, and this
+            // one, empty, for the time its seal will say.
+            if self.archiving.is_none() {
+                return Ok(None);
+            }
+            if close {
+                self.fatal(self.wal.rotate())?;
+                self.moment.store(self.wal.moment(), Ordering::Relaxed);
+            }
+            drop(guard);
+            return self.fatal(self.settle_logs(self.wal.generation(), base));
         }
         let generation = self.fatal(self.wal.rotate())?;
         let moment = self.wal.moment();
@@ -771,6 +789,13 @@ impl Database {
         let said = |e: Error| e.to_string();
         let mut locals: Vec<u64> = wal::list_logs(&*self.vfs, &self.dir, &self.name)?.into_iter().filter(|g| *g < generation).collect();
         progress.kept = locals.len();
+        if progress.base.is_some_and(|base| !archive.has_base(history, base)) {
+            // The base the log files follow is not where it was: the
+            // archive was emptied, or is not there at all just now.
+            // Reading it again tells which.
+            progress.chain = Chain::Unknown;
+            progress.known = None;
+        }
         if progress.chain == Chain::Unknown {
             // What the archive holds decides what it still needs. Until
             // it can be read, nothing is removed.
@@ -778,7 +803,10 @@ impl Database {
                 // No further than this server has itself seen the
                 // archive take: a directory may show a file whose sync
                 // failed, and a power cut would take that one back.
-                Ok(listing) => progress.chain = listing.next().map_or(Chain::Broken, |next| Chain::Next(progress.known.take().map_or(next, |known| known.min(next)))),
+                Ok(listing) => {
+                    progress.base = listing.bases.last().copied();
+                    progress.chain = listing.next().map_or(Chain::Broken, |next| Chain::Next(progress.known.take().map_or(next, |known| known.min(next))));
+                }
                 Err(e) => return Ok(Some(said(e))),
             }
         }
@@ -799,6 +827,7 @@ impl Database {
             let put = archive.put_base(history, generation, self.moment.load(Ordering::Relaxed), len, &|buf, at| self.store.read_file(buf, at));
             if put.is_ok() {
                 progress.bases_written += 1;
+                progress.base = Some(generation);
             }
             put.map_err(said)
         };
@@ -808,12 +837,20 @@ impl Database {
             // are from before it.
             match put_base(progress) {
                 Ok(()) => progress.chain = Chain::Next(generation),
+                // Every log file stays until the archive takes a base,
+                // and the archive is read again before the next try: it
+                // may then hold what it did before it could not be
+                // reached, and the files kept meanwhile continue that.
                 Err(why) => {
-                    refused = Some(why);
-                    progress.chain = Chain::Broken;
+                    progress.chain = Chain::Unknown;
+                    return Ok(Some(why));
                 }
             }
         }
+        // Every file before `generation` was full before the moment the
+        // data file's checkpoint was made, or the start found: no commit
+        // in one of them is later than that.
+        let sealed = self.moment.load(Ordering::Relaxed);
         let mut removed = false;
         while let Some(&local) = locals.first() {
             match progress.chain {
@@ -823,7 +860,7 @@ impl Database {
                 // Copied already, or from before the base.
                 Chain::Next(next) if local < next => {}
                 Chain::Next(next) if local == next => {
-                    let copied = self.vfs.open(&wal::wal_path(&self.dir, &self.name, local), false).map_err(Error::Io).and_then(|file| archive.put_log(history, &uuid, local, &*file));
+                    let copied = self.vfs.open(&wal::wal_path(&self.dir, &self.name, local), false).map_err(Error::Io).and_then(|file| archive.put_log(history, &uuid, local, &*file, sealed));
                     if let Err(e) = copied {
                         refused = Some(said(e));
                         break;
@@ -871,7 +908,7 @@ impl Database {
             }
             progress.chain = Chain::Unknown;
         }
-        if let Some(why) = self.checkpoint_held(true)? {
+        if let Some(why) = self.checkpoint_held(true, true)? {
             return Err(Error::db(ErrorCode::Io, format!("the archive did not take the base of {}: {why}", archiving.history)));
         }
         Ok(self.wal.generation())
@@ -882,7 +919,7 @@ impl Database {
     /// with it the only other copy of its last commits.
     pub fn checkpoint_archived(self: &Arc<Self>) -> Result<()> {
         let _one = self.checkpointing.lock().unwrap();
-        match (self.checkpoint_held(false)?, &self.archiving) {
+        match (self.checkpoint_held(false, true)?, &self.archiving) {
             (Some(why), Some(archiving)) => Err(Error::db(ErrorCode::Io, format!("the archive has not taken the log of {} ({why}), and removing database {:?} would remove the only copy of its last commits: make the archive writable, or start the server without it", archiving.history, self.name))),
             _ => Ok(()),
         }

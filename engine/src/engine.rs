@@ -140,7 +140,9 @@ impl Engine {
     pub fn open_with(vfs: Arc<dyn Vfs>, dir: &Path, mut options: EngineOptions, lock: Option<std::fs::File>) -> Result<Engine> {
         vfs.create_dir_all(dir)?;
         if let Some(archive) = &options.archive {
-            vfs.create_dir_all(archive)?;
+            // An archive that is not there now is no reason not to
+            // start: the log is kept in the data directory until it is.
+            let _ = vfs.create_dir_all(archive);
             options.db.archive = Some(Arc::new(Archive::new(vfs.clone(), archive)));
         }
         let paused = options.merging_paused;
@@ -197,7 +199,7 @@ impl Engine {
                 if db.checkpoint_due() {
                     // A failure marks the database failed; the next
                     // request reports it.
-                    let _ = db.checkpoint();
+                    let _ = db.checkpoint_when_due();
                 }
             }
         })?;
@@ -366,9 +368,8 @@ impl Engine {
     /// database is a new history, under a new uuid.
     ///
     /// Refused, with nothing changed: a moment before the oldest base; a
-    /// time after the last commit the archive holds, since the archive
-    /// cannot say what was committed between the two (ask for
-    /// `Moment::End`); a position the archive does not reach; a base or
+    /// time after the one up to which the archive is known to be whole,
+    /// which is when its last log file was closed; a position the archive does not reach; a base or
     /// a log file on the way that is missing, damaged, or does not end
     /// where the next says it ended.
     pub fn recover_database(&self, from: &str, to: Moment, target: &str, replace: bool) -> Result<String> {
@@ -448,6 +449,9 @@ impl Engine {
         drop(file);
 
         let mut restored = Restored { base: base.generation, commits: 0, last: None };
+        // The time up to which the files read so far are known to be
+        // all that was committed: the base's, then each file's seal.
+        let mut whole_until = base.time;
         // Where the file before ended, if it held records.
         let mut before: Option<u64> = None;
         let mut generation = base.generation;
@@ -463,7 +467,10 @@ impl Engine {
                 };
                 match to {
                     Moment::End => break,
-                    Moment::Time(_) => return Err(refused(format!("{ends}, and cannot say what was committed between then and the time asked for; a checkpoint of the running database brings its archive up to the moment, and the end of the archive is restored by asking for that"))),
+                    // Nothing was committed between the last commit
+                    // and the last seal, and the time is no later.
+                    Moment::Time(time) if time <= whole_until => break,
+                    Moment::Time(_) => return Err(refused(format!("{ends}, and is the whole of what was committed up to {}, which is before the time asked for; a checkpoint of the running database brings its archive up to the moment it is made", archive::time_text(whole_until)))),
                     Moment::Position { .. } => return Err(refused(format!("{ends}, before the position asked for"))),
                 }
             }
@@ -487,7 +494,8 @@ impl Engine {
                 }
                 Ok(())
             })?;
-            if !passed && (read.end == wal::End::Torn || read.at == 0) {
+            whole_until = whole_until.max(read.sealed);
+            if !passed && (read.end == wal::End::Torn || read.at == 0 || read.sealed == 0) {
                 return Err(refused(format!("log file {generation} in the archive is damaged after byte {}", read.at)));
             }
             if before.is_some_and(|ended| read.after > 0 && ended != read.after) {
