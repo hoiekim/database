@@ -14,8 +14,10 @@
     user_id = db.insert(Insert.into("users").set("username", "ann").returning(["id"])).one()["id"]
     ann = db.query_opt(Query.table("users").index("users_username_key", KeyRange.eq(["ann"])))
 
-There is no SQL and no planner: a query says which key or index to read
-and in what range, and the server does exactly that. ``docs/CLIENT.md`` in
+There is no SQL: a query says which key or index to read and in what
+range, and the server does exactly that. A query that says neither is
+given a range by the server where its filter is one, and answers the
+same either way. ``docs/CLIENT.md`` in
 the repository describes the vocabulary (for the Rust client, which this
 one follows name for name); ``docs/PROTOCOL.md`` is the wire protocol.
 """

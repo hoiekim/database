@@ -6,8 +6,10 @@ run a Postgres far larger than they need.
 It has no SQL. An application talks to it through a typed client: a
 table, a query and a write are values the application builds, and a
 query names the index it reads. That is what keeps it small: there is no
-parser, no planner and no optimizer, and the server does exactly what it
-is asked. The client below is the Rust one; `clients/` has the same
+parser and no optimizer, and the server does exactly what it is asked.
+A query that names no index is the one thing chosen for: the server
+reads a range of a key off its filter, by a few fixed rules, where that
+is sure to answer what reading the whole table would. The client below is the Rust one; `clients/` has the same
 vocabulary for TypeScript and for Python, and `docs/PROTOCOL.md` is the
 wire protocol, for writing one in any other language.
 
@@ -66,8 +68,10 @@ db.transaction(|tx| async move {
 
 ## What it does not
 
-SQL, a planner, stored functions, views, replication, TLS, parallel
-writers, regular expressions, collations. `docs/CLIENT.md` ends with the
+SQL, a cost-based planner (a query that names no index gets one by
+rule, with no statistics; nothing is reordered), stored functions,
+views, replication, TLS, parallel writers, regular expressions,
+collations. `docs/CLIENT.md` ends with the
 full list and what to do instead.
 
 ## Compared with Postgres
@@ -142,6 +146,7 @@ docs/       REQUIREMENTS.md   what the database has to do
 cargo build --release          # target/release/database
 cargo test                     # everything: minutes to build, seconds to run
 CRASH_SEEDS=2000 cargo test -p database-engine --test recovery   # a longer hunt
+PLAN_SEEDS=2000 cargo test --release -p database-engine --test planner   # the same for the choice of a way in
 FAULT_SCRIPTS=20 cargo test -p database-engine --test faults     # and another
 ```
 
@@ -153,7 +158,9 @@ The tests, by what they prove:
 | `server/tests/acid.rs` | atomicity, isolation, once-only races, savepoints, lock and statement timeouts |
 | `server/tests/optimistic.rs` | transactions that run beside other writers: committed as they stand, run again, or in conflict; what they were told is what is stored |
 | `server/tests/requests.rs` | statements the server keeps and runs with new values; a transaction sent whole as a batch, with conditions; a transaction that begins with its first statement; the Unix socket |
-| `server/tests/explain.rs` | what a query read, by every way in, against what it returned; slow statements in the server's log |
+| `server/tests/explain.rs` | what a query read, by every way in, against what it returned, and which way in it took, named or chosen; slow statements in the server's log |
+| `engine/tests/planner.rs` | a query that names no way in answers the same whether the server chooses one or reads the whole table: generated tables, indexes and statements, each run both ways and compared, rows, order and errors, and for updates and deletes what they leave; then each rule of the choice on its edges |
+| `server/tests/untuned.rs` | the benchmark's statements written without their way in read what the tuned ones read |
 | `server/tests/durability.rs` | a server killed with `SIGKILL` under load, six times over, loses nothing acknowledged; memory stays bounded with data many times the cache |
 | `server/tests/operations.rs` | dump under load, restore, a damaged dump refused, passwords, restarts |
 | `engine/tests/faults.rs` | a scripted workload, killed before every operation it makes on the disk, with the power cut each way that differs, and again inside the recoveries; the disk full from each operation on; each operation failing once, a sync by losing what it covered; a disk that lies about its syncs. Nothing acknowledged is lost, and what a lying disk lost is seen as far as checksums can see |

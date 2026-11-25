@@ -238,6 +238,57 @@ lookup's 37,800 instructions about 26,000 are the query itself; a sixth
 of all of them is the allocator, which is what "fewer allocations per
 row" under 1 is about. Encoding the rows is untouched.
 
+### Statements nobody tuned: a way in chosen by the server
+
+Every statement of the benchmark names its way in, and the table at the
+top measures those. A statement that names none used to read its whole
+table. The server now reads a range of a key for it where its filter
+gives one (`DESIGN.md`, "Choosing a way in"), and what it answers is
+what it answered. Below are the benchmark's own statements with their
+way in taken out: the session lookup as two filters and a join on an
+equality, the mailbox page as a filter, an `order_by` and a `limit`,
+the count as a filter. Each was run on a server that chooses nothing
+(`DATABASE_PLAN=off`, which is every server before this), on one that
+chooses, and as the benchmark tunes it. What was read is from `explain`
+and does not depend on the machine; the times are `explain`'s too, of a
+second run, on the benchmark's 20,000 sessions and 100,000 mails with
+bodies of 250 bytes (`server/tests/untuned.rs`, with
+`UNTUNED_MAILS=5000`).
+
+| Statement, no way in named | Read with nothing chosen | | Read now | | As tuned | |
+|---|---:|---:|---:|---:|---:|---:|
+| Session lookup with user | 42,000 rows | 11.5 ms | 1 entry, 2 rows | 8 µs | 1 entry, 2 rows | 4 µs |
+| Mailbox page: newest 50 | 100,000 rows | 67 ms | 50 entries, 50 rows | 84 µs | 50 entries, 50 rows | 77 µs |
+| Mailbox page: the 50 after a cursor | 100,000 rows | 56 ms | 50 entries, 50 rows | 120 µs | 50 entries, 50 rows | 77 µs |
+| Count unread of a user's 5,000 mails | 100,000 rows | 47 ms | 5,000 entries, 5,000 rows | 4.6 ms | 5,000 entries, 5,000 rows | 4.6 ms |
+| One mail by a filter on its id | 100,000 rows | 47 ms | 1 row | 3 µs | 1 row | 3 µs |
+
+The untuned statements read what the tuned ones read. The session
+lookup had read every session and, for each, every user; it is now a
+unique index's one entry and a lookup of the user by primary key. The
+page is the index `(user_id, date desc, mail_id)` read in its own order
+until fifty rows are found. What is left between "now" and "as tuned"
+is the look at the filter each time the statement runs, a few
+microseconds: nothing is kept between statements, so there is no plan
+to go stale.
+
+**It costs the tuned statements nothing.** A query that names its way
+in passes one test of its access path and is run as before. The
+instructions the server executes for the benchmark's session lookup,
+which names an index and a key, counted as in "What a request costs"
+(callgrind, one connection, the difference between 60,000 requests and
+20,000):
+
+| | instructions per request |
+|---|---:|
+| Before, measured twice | 33,554 and 33,544 |
+| With the choice in the server, three builds | 33,283, 33,401 and 33,623 |
+
+One build counts the same from run to run; the spread between builds
+is what moving code does to the compiler's inlining, and the figures
+from before lie inside it. The read path's own code is a few
+comparisons longer.
+
 ## Where it is ahead, and why
 
 - **Counting 5,000 rows of a user** (3.1×) and **updating a flag**

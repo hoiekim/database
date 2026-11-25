@@ -15,7 +15,9 @@ list forced.
 Nothing here is SQL. An application talks to the database through a
 typed Rust client, and where a SQL database did the work in a planner or
 a stored function, the application now states the access path or builds
-the expression itself. `docs/CLIENT.md` has the SQL-to-API equivalents.
+the expression itself. A query whose access path is left unstated is
+given one by the server where its filter allows (R-Q23); what is stated
+is what runs. `docs/CLIENT.md` has the SQL-to-API equivalents.
 
 The scenario suites in `server/tests/` exercise the list the way four
 kinds of application would: an identity service, a mail store, a document
@@ -87,6 +89,8 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-Q20 | Filters and sort orders built at run time from a user's choices: nested and/or to depth 10, up to ten sort keys with empty values last, a sort key looked up in another table, text read as a number or a time | Expressions are data: the application builds them; `try_cast`, `Func::ParseTimestamp`, `nulls_last`, a subquery as a sort key |
 | R-Q21 | Several reads that see one moment of the database | A reading transaction |
 | R-Q22 | Converting between types, failing loudly or giving NULL; a wrong-typed comparison is an error, not an empty result | `cast`, `try_cast`; comparing text with a number is `TypeMismatch` |
+| R-Q23 | A query that names no way in does not read the whole table where its filter is a range of a key: equality on the leading parts of the primary key or of an index, then a range on the next; the same for the query inside a join or a subquery. It answers exactly what it would have, reading every row: the same rows in the same order, or the same error. A way in that is named is read as named, and a query can ask for the whole table | The server chooses by rule when the statement runs (`engine/src/plan.rs`); `Query::whole`; `DATABASE_PLAN=off` |
+| R-Q24 | A sorted page of a table (`order_by`, `limit`) that names no way in is read from an index that is in that order, and the read stops when the page is full, where its rows come out exactly as the sort would leave them | The same choice; rows that tie must come in primary key order |
 
 ## D. Writes
 
@@ -105,6 +109,7 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-W11 | Constraint errors the caller can tell apart: unique (with the index's name), foreign key, not-null, check, out of range | `ErrorCode`, `DbError::constraint` |
 | R-W12 | Allocate the next number of a counter atomically, seeding it from the data the first time | An upsert whose inserted value is `scalar(max query)` |
 | R-W13 | Change a whole subtree in one step: trash it, restore what was trashed together, delete it returning what was removed, move it | `Update`/`Delete` over `descendants` |
+| R-W14 | An update or a delete by a filter that names no way in finds its rows as R-Q23 has a query find them, and changes exactly the rows it would have, to the same values, returning the same | Its rows are found by the same function as a query's, all of them before any is written |
 
 ## E. Transactions and concurrency
 
@@ -133,4 +138,4 @@ replication, explicit isolation levels, cursors, `COPY`.
 | R-O4 | A way to verify the files | `database check` |
 | R-O5 | A fixed memory budget well under what a Postgres of the same job needs, and little CPU when idle | One page cache with a byte limit; no background work when nothing changes |
 | R-O6 | An application on the server's own host reaches it without the network stack | A Unix domain socket beside the TCP port: `DATABASE_SOCKET`, `?socket=` |
-| R-O7 | A slow statement can be seen and understood: how many index entries and rows a query read against how many it returned, on request and, for statements over a threshold, in the server's log (what `EXPLAIN ANALYZE` and `log_min_duration_statement` are used for) | `Db::explain`; `DATABASE_SLOW_MS` |
+| R-O7 | A slow statement can be seen and understood: how many index entries and rows a query read against how many it returned, and by which way in, named by the query or chosen by the server; on request and, for statements over a threshold, in the server's log (what `EXPLAIN ANALYZE` and `log_min_duration_statement` are used for) | `Db::explain`; `DATABASE_SLOW_MS` |

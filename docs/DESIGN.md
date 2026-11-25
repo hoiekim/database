@@ -477,6 +477,8 @@ key, or an ordered index) fits by its leading key parts:
 - **Equality** on a key part: `part = value`, `part is not distinct
   from value`, `part is null`, and `part in (values)`, which gives a
   range per value. Parts are bound from the first on, without a gap.
+  Lists on several parts multiply; a part whose list would make more
+  than 256 ranges is left to the filter, with the parts after it.
 - **A range** on the part after those: `<`, `<=`, `>`, `>=`, from one
   side or both. A range never takes in the entries whose part is NULL,
   on a rising key or a descending one, since no comparison holds for

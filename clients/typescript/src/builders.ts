@@ -568,11 +568,13 @@ function andFilter(spec: ast.QuerySpec, condition: Arg): ast.QuerySpec {
 }
 
 /**
- * A read as the client states it. There is no planner: a query names
- * its way in (the primary key, one index, a tree walk or a full-text
- * search) and the range of keys to read; the server reads those rows in
- * key order and applies the rest in a fixed sequence: joins, `each`,
- * filter, grouping, sort, offset and limit, select.
+ * A read as the client states it. A query names its way in (the
+ * primary key, one index, a tree walk or a full-text search) and the
+ * range of keys to read; the server reads those rows in key order and
+ * applies the rest in a fixed sequence: joins, `each`, filter, grouping,
+ * sort, offset and limit, select. A query that names no way in
+ * (`Query.table` as it stands) is given a range by the server where its
+ * filter is one, and answers the same either way.
  */
 export class Query {
   constructor(readonly spec: ast.QuerySpec) {}
