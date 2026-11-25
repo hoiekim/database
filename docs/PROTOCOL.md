@@ -21,7 +21,7 @@ What a request *means* (what a query reads, when a transaction
 conflicts) is in `CLIENT.md`. This file says how each one is written and
 what the server answers.
 
-This document describes protocol version **5**. What a version after 2
+This document describes protocol version **6**. What a version after 2
 added is marked "from version N" where it is described; "Versions" lists
 it all in one place. The golden vectors are of version 2, and the
 clients in `clients/` greet with version 2.
@@ -108,7 +108,7 @@ Hello: version u32, database str, password str, client str
 
 - `version` is the protocol version the client speaks: the newest one
   whose messages it implements, both those it sends and those it reads
-  (see "Versions"). A server answers versions 2 to 5.
+  (see "Versions"). A server answers versions 2 to 6.
 - `database` is the database to use. It may be empty, with the
   administrator's password, for a connection that only administers.
 - `password` is that database's password, or the administrator's, which
@@ -878,6 +878,9 @@ database's own password is answered `AccessDenied`.
 | 9 | RestoreBegin | `replace bool` | `Ok` |
 | 10 | RestoreChunk | `bytes` | `Ok` |
 | 11 | RestoreEnd | | `Ok` |
+| 12 | Base | `databases list(str)` | `Text`: a line for each base written. From version 6 |
+| 13 | Archive | `history str, commits bool` | `Text`: a report. From version 6 |
+| 14 | Recover | `from str, to Moment, target str, replace bool, password str` | `Text`: what was restored. From version 6 |
 
 `Checkpoint`, `Check` and `Stats` are about the connection's own
 database, or about every database on an administering connection.
@@ -897,6 +900,39 @@ a time), then `RestoreEnd`, each answered `Ok`. Nothing is changed until
 the three, or a connection that closes first, leaves the server as it
 was. With `replace`, a database in the dump replaces one of the same
 name; without it, such a database is `AlreadyExists`.
+
+**The archive.** A server may keep its log beyond its checkpoints, in a
+directory of its own (`OPERATIONS.md`, "Restoring to a moment"); these
+three requests are about that archive, and a server without one answers
+each with `InvalidRequest`. What the archive's files hold is not part
+of this protocol.
+
+`Base` writes a copy of each named database's data file to the archive,
+or of every database's when none is named. `Archive` reads the archive
+and reports what it holds of the histories `history` names: a
+database's name, the name of one history as a report gives it, or the
+empty string for all of them. It answers `Corrupt` if one of them is
+not whole, and `NotFound` if a name that was given names none. With
+`commits` the report has a line for each commit: its position as
+`generation:offset`, its time, and its size.
+
+`Recover` makes the database `target` what the history `from` held at a
+moment. A `Moment` is a `u8` tag and its fields:
+
+| Tag | Moment | Fields | The commits it holds |
+|---:|---|---|---|
+| 0 | End | | every one the archive has |
+| 1 | Time | `micros zigzag` | those made at or before that many microseconds since 1970-01-01T00:00:00Z |
+| 2 | Position | `generation varint, offset varint` | those up to the one `Archive` lists at that position |
+
+`target` must not exist unless `replace` is set (`AlreadyExists`). A
+database that is replaced keeps its password and `password` is not
+read; one that is new takes `password`, and an empty one is
+`InvalidRequest`. A moment the archive cannot give exactly is
+`InvalidRequest`, and a base that is damaged is `Corrupt`; either
+leaves the server as it was. Connections
+to a database that was replaced are answered `Unavailable` from then
+on, as after a restore of a dump.
 
 ## Broken connections
 
@@ -947,9 +983,10 @@ takes nothing away:
 | 3 | Requests `Prepared` (19), `BeginWith` (20) and `Batch` (21); the expression `Param` (22); the error codes `NotPrepared` (23) and `Unmet` (24) |
 | 4 | The request `Explain` (22) |
 | 5 | A column's last byte is `flags`, which may be followed by `keep_start` (see "Definitions") |
+| 6 | The admin requests `Base` (12), `Archive` (13) and `Recover` (14) |
 
-**What the server does today.** It speaks versions 2 to 5. It answers a
-`Hello` that names a version in that range with its own, 5, and refuses
+**What the server does today.** It speaks versions 2 to 6. It answers a
+`Hello` that names a version in that range with its own, 6, and refuses
 any other with `ProtocolMismatch`, then closes the connection. It
 answers every request it can decode in the same way whatever version
 the client greeted with, with one difference: to a client that greeted
@@ -961,8 +998,9 @@ those after it:
 - A client sends the newest version whose messages it implements, both
   those it sends and those it reads. One that implements only version 2
   sends 2, whatever versions exist by then; one that sends `Prepared`
-  sends at least 3, one that sends `Explain` at least 4, and one that
-  reads `keep_start` 5.
+  sends at least 3, one that sends `Explain` at least 4, one that
+  reads `keep_start` 5, and one that sends `Base`, `Archive` or
+  `Recover` 6.
 - A server answers `ProtocolMismatch` to a version it does not speak,
   in its answer to `Hello`, and to nothing later. A server may speak
   several versions; a client must not assume which, and must be ready
@@ -985,6 +1023,9 @@ such a client never meets the bit; the setting changes where a server
 stores values, not what any request answers. The server takes a column
 with `keep_start` in `CreateTable` or `AddColumn` from a client of any
 version.
+
+**Version 6** adds three admin requests and changes nothing a client
+of an earlier version sends or reads.
 
 **What a client does with what it does not know:**
 

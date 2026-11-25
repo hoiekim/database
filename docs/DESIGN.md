@@ -210,12 +210,19 @@ the disk fails"). A file that never gets a record has no link.
 Tables marked `volatile` (Postgres' `UNLOGGED`) are not logged; they are
 emptied on recovery. Their commits need no fsync.
 
+A log that is kept in an archive (see "The archive") **stamps** its
+records: each begins with a byte no change begins with and the time of
+its commit, never earlier than the record before it says, whatever the
+clock does meanwhile. A log that is not kept has no stamps and is
+written as it was before there were any.
+
 ### Checkpoints and recovery (`store.rs`, `db.rs`)
 
 A checkpoint makes the data file current: under the write lock it takes
 the set of dirty pages and starts a new log file (a moment's work); then,
 with writers running again, it writes those pages, syncs, writes the
-other meta page, syncs, and deletes the old log. One runs when the log
+other meta page, syncs, and deletes the old log, or, where the log is
+kept, copies it to the archive first (see "The archive"). One runs when the log
 passes 8 MiB or dirty pages pass their limit, and at a clean stop.
 
 Opening a database: read both meta pages and take the newer valid one;
@@ -330,6 +337,99 @@ only the log holds, kills the engine and makes reads fail: of the log,
 of the data file, of each meta page alone. Each time the engine must
 refuse to start, with an I/O error and with the files still there, and
 once the disk reads again every commit is back.
+
+### The archive (`archive.rs`)
+
+The log is what was done to the database, in order; the data file is
+only where that had got to at the last checkpoint. Keeping the log is
+therefore keeping every state the database was ever in, and that is all
+restoring to a moment needs. Three things are kept, in a directory the
+operator names, one subdirectory for each **history** (a database's
+name and its data file's uuid):
+
+- **Log files**, each copied before the checkpoint that passed it
+  removes it. A copy is the file's header and the records that check,
+  followed by a **seal**: a time, read when the next file was begun,
+  that no commit in the file was made after and none in a later file
+  before. The seals are how the archive knows up to what time it is
+  everything that was committed, which the time of its last commit
+  would not say.
+- **Bases.** The log is logical, so it applies to one thing only: the
+  data file it was logged against, as it stood where the log begins. A
+  base is that file as of a checkpoint, with a trailer that says which
+  log file continues from it, a time no commit in it was made after,
+  and a CRC of its bytes. It is copied while the server runs, with
+  that database's checkpoints held off and nothing else: a checkpoint's
+  pages are never written again before the next checkpoint, so the
+  bytes read are that checkpoint whatever transactions write meanwhile
+  to pages it does not name.
+- Nothing else. There is no index of the archive and no state beside
+  it: what a history holds is what its directory lists.
+
+**The rule the archive is written by: a log file leaves the data
+directory only when its copy is whole in the archive.** A copy is
+written under another name, synced, renamed, and its directory synced,
+and only then is the original removed. If any of that fails the
+original stays, and the next checkpoint begins the copy again from it.
+Every acknowledged commit is therefore in the archive or in a log file
+of the data directory, at every instant, including the instants of a
+crash; and an archive that cannot be written costs room in the data
+directory and nothing else. A copy whose directory sync failed is taken
+back out of the directory, as well as that can be done, and the
+database keeps its own count of what the archive has taken and believes
+a listing no further than that: a directory may show a file that a
+power cut would take back.
+
+**A base is written only where the log files lead to it or begin with
+it.** The newest base in a history is then always one that every log
+file there is before, or follows without a gap, so that a server that
+starts needs only the directory's listing to know which file the
+archive lacks next. A base that was asked for is written after the log
+files before it, not before them: written first, a crash between the
+two would leave a base that the files still in the data directory seem
+to precede, and they would be removed as covered. (`archive.rs` in
+`engine/tests` found this by killing the engine at every step.)
+Where nothing in the archive leads to the log the database now has (its
+first start with an archive, an archive that was emptied, a server run
+without one for a while), a base is written first and the archive
+begins again from it.
+
+**Restoring is recovery.** `Engine::recover_database` copies a base
+into the data directory under a temporary name, and after it copies of
+the archived log files, the last one cut after the commit the moment
+names: after the last commit stamped no later than a time, or the one
+whose record ends at a position. Then it opens that as a database.
+Opening replays the log over the checkpoint with the code that replays
+after a crash, checks each file against the next one's link in the same
+way, and ends with a checkpoint. The file is then given a new uuid
+(`Store::rebrand`: the same checkpoint written once more, under the
+new identity, to the other copy of the header) and renamed into place as
+a loaded dump is. So a restore has no way of applying a log that
+recovery does not have, and what is left by a restore that is killed is
+swept by the next start like any database that was being built.
+
+The new uuid is what keeps two futures of one past apart. After a
+restore to a moment, the database's next log file has the number of one
+the old history may also have, with other commits in it. Under one
+identity the archive would hold two files of one name, or a chain that
+changes history half way. Under two, each history is whole by itself,
+and the old one can be restored from again.
+
+What a restore refuses is what it could not make exact: a base it
+cannot check, a file that is missing or damaged or does not end where
+the next says it did, and a time after the last seal, where the archive
+cannot know what the database went on to commit.
+
+`engine/tests/archive.rs` holds this to the disk's faults as
+`faults.rs` holds the engine: the data directory and the archive on one
+simulated disk, the engine killed before each operation it makes on
+either and the power cut three ways, the archive unreachable, full, and
+failing at each of its operations once, and a restore killed before
+each of its own. After each, the database holds what was acknowledged,
+the archive after one more checkpoint is whole, and it restores the
+table as it stood at commits made before the kill. `faults.rs` itself
+runs a second time with an archive on the failing disk
+(`faults_archived.rs`).
 
 ## Transactions (`db.rs`, `write.rs`)
 

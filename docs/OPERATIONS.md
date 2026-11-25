@@ -14,6 +14,10 @@ database restore [--replace] < file  load a dump from stdin
 database check                       verify every database's files
 database checkpoint
 database stats
+database base [name...]              write a base of each database to the archive
+database archive [name] [--commits]  verify the archive; with --commits, list every commit
+database recover <name> [--to <moment>] [--as <name>] [--replace]
+                                     restore a database from the archive as it stood at a moment
 ```
 
 ## The server
@@ -28,6 +32,8 @@ database stats
 | `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well (see "On the same host") |
 | `DATABASE_CACHE_MB` | `32` | memory for cached pages (see "Memory") |
 | `DATABASE_SLOW_MS` | (none) | log every statement that takes this many milliseconds or more (see "Checking") |
+| `DATABASE_ARCHIVE` | (none) | a directory to keep the log in beyond its checkpoints (see "Restoring to a moment") |
+| `DATABASE_ARCHIVE_SECONDS` | `60` | with an archive: the longest a commit waits before its log file is copied there; `0` leaves it to the ordinary checkpoints |
 
 It recovers every database in the data directory, then listens. On
 `SIGTERM` or `SIGINT` it stops taking connections, lets requests in
@@ -163,6 +169,177 @@ docker exec drill database check
 docker rm -f drill
 ```
 
+## Restoring to a moment
+
+A dump is the database at the moment the dump was taken. To have it
+back as it stood at any other moment (a minute before a table was
+emptied by mistake, the last commit before a disk died), the server
+keeps its log.
+
+```sh
+DATABASE_ARCHIVE=/archive database serve
+```
+
+`/archive` is a directory of the operator's choosing, best on another
+disk than the data, or a mount of storage elsewhere. With it set:
+
+- Each database's log files are **copied there before a checkpoint
+  removes them**, each whole and synced before the original goes.
+- Each database has a **base** there: a copy of its data file as of a
+  checkpoint. The server writes one when a database is created, and
+  when it finds an archive that holds none the log continues from (the
+  first start with `DATABASE_ARCHIVE`, an archive that was emptied).
+  `database base` writes another at any time, while the server runs: a
+  restore starts from the newest base before its moment, so a newer one
+  makes restores shorter, and lets what is older be removed.
+- Every commit's record carries the time it was made.
+
+A base and the log files after it, with none missing, give the database
+at every commit from the base on.
+
+```text
+/archive/shop.5f0c…e1/base-0000000012   the data file as log file 12 begins
+/archive/shop.5f0c…e1/wal-0000000012    log file 12
+/archive/shop.5f0c…e1/wal-0000000013
+```
+
+A directory is one **history**: a database's name and the identity of
+its data file. A database dropped and created again under its name is a
+new history, and so is a database that was restored: what is committed
+to it afterwards is not what was committed after that moment the first
+time, and the two are never mixed.
+
+### How far behind the archive is
+
+A log file reaches the archive at the checkpoint that closes it. The
+server checkpoints when the log passes 8 MiB, when a database has been
+quiet for five seconds after a write, and, with an archive, once the
+oldest commit not yet copied is `DATABASE_ARCHIVE_SECONDS` old (60 by
+default). So the archive is at most about that far behind, and what it
+lacks is in the data directory. `database checkpoint` brings it up to
+the moment the command is given. A server that loses its data disk
+loses the commits of that last interval from the archive too: closing
+that gap is what a standby is for.
+
+### Taking a database back
+
+```sh
+database archive shop --commits                  # what the archive holds, commit by commit
+database recover shop --to 2026-11-25T12:03:07Z --as shop_then
+database recover shop --to 14:8812 --as shop_then
+database recover shop --replace                  # the end of the archive, over the database itself
+```
+
+`--to` is a time, a commit's position, or `end` (the default):
+
+- **A time** (read as UTC unless it carries an offset): every commit
+  made at or before it. A commit acknowledged by then is in; a commit
+  first logged after it is not. A commit is stamped as it is logged,
+  just before it is acknowledged, so the few that were on their way to
+  the disk at that instant are in.
+- **A position**, `file:byte`, as `database archive --commits` prints
+  beside each commit's time and size: every commit up to that one.
+  This is the handle for "everything before that one statement".
+- **`end`**: every commit the archive holds.
+
+`--as` names the database to make; without it the database is restored
+under its own name. A database that exists is replaced only with
+`--replace`, and keeps its password; a new one takes its password from
+`DATABASE_PASSWORD`, as `create` does. `recover` names a database, or a
+history by its directory's name when the archive holds several of one
+name and the server has no database of that name now (a database that
+was dropped, then created again and dropped again).
+
+The restored database is built beside the others and takes its name
+only when it is whole: a restore that fails, or a server that dies half
+way, leaves everything as it was. It starts a history of its own, with
+a base of its own, and the history it was restored from stays in the
+archive, whole, to be restored from again.
+
+`recover` **refuses**, and changes nothing, when it could not give
+exactly what was asked for:
+
+- a moment before the oldest base in the archive;
+- a time later than the archive is known to be whole up to, which is
+  when its last log file was closed: run `database checkpoint` on the
+  running server first, or ask for `end`;
+- a position the archive does not reach;
+- a base that is damaged, or a log file on the way that is missing,
+  damaged, or does not end where the next one says it ended;
+- a database of the target's name that exists, without `--replace`;
+- a server started without `DATABASE_ARCHIVE`.
+
+### Checking the archive
+
+`database archive` reads every base and every log file of every history
+(or of the one named), verifies each base's checksum, each log record's
+checksum, and that each log file ends where the next says it ended, and
+prints what each history holds:
+
+```text
+shop.5f0c…e1: base 1, 16384 bytes, taken 2026-11-20T09:00:00.120000Z
+shop.5f0c…e1: base 212, 4472832 bytes, taken 2026-11-24T02:00:03.551000Z
+shop.5f0c…e1: whole: 2 bases, log files 1 to 367, 48211 commits, made from 2026-11-20T09:00:01.003211Z to 2026-11-25T12:07:44.918332Z, the last at 367:20931
+```
+
+It exits with an error at the first history that is not **whole**: one
+whose oldest base cannot be followed, file by file, to its newest log
+file. The message names the file. Any moment from a whole history's
+oldest base to its last commit can be restored. `database stats` says
+how the running server stands with the archive: the position of the
+newest commit, the files written, and whether the archive is refusing
+them. The proof that a backup restores is a restore: `recover --as
+drill`, `database check`, `database drop drill`.
+
+### When the archive cannot be written
+
+A full archive, a mount that is gone, a directory without permission:
+the server **keeps the log files in the data directory** and goes on.
+No commit is refused and none waits. Each checkpoint, and a retry every
+five seconds, offers the kept files again, in order; the server says so
+once in its log, and in `stats`:
+
+```text
+database: archive: shop.5f0c…e1 of database "shop" is not in the archive, and its log files are kept until it is: i/o error: No space left on device (os error 28)
+```
+
+So every acknowledged commit is always in one of the two places. What
+this costs is room on the data disk, without limit: an archive left
+broken fills it, and a full data disk stops commits as it always does
+("When the disk fails"). The two other things a server could do were
+not chosen. Refusing commits while the archive is away would make the
+archive a second thing that must be up for the database to be. Letting
+the log go unarchived would leave a hole no later base closes for the
+moments in it. The operator can choose that second one, knowingly:
+start the server without `DATABASE_ARCHIVE` and the kept files are
+removed; started with it again, each database begins with a new base,
+and `database archive` reports the gap until the files before that base
+are removed.
+
+While the archive refuses a database's log, that database cannot be
+dropped or restored over: its last commits would have no other copy.
+A server started while its archive is away starts, and keeps the log.
+
+### What to keep, and what it costs
+
+The server never removes anything from the archive. To let go of old
+moments, remove a history's files older than a base you keep: that
+base and every `wal-` file numbered from it on are all a restore needs.
+A history whose database is gone can be removed whole.
+
+The archive takes the room of the log, which with an archive is nine
+bytes longer for each commit (its time), and each base the size of its
+data file. A commit costs the server the reading of a clock
+and nine bytes of log; the copying is done at checkpoints, beside the
+writers, and is two syncs on the archive for each log file, not for
+each commit. A base is copied with checkpoints of that database held
+off, so its log grows meanwhile; commits go on. Measured figures are in
+`PERFORMANCE.md`. A server without `DATABASE_ARCHIVE` does none of
+this, and its log is byte for byte what it was.
+
+Several servers may keep their logs in one directory: a history is
+named by its data file's identity as well as by its database's name.
+
 ## Checking
 
 - `database ping`: the server answers. The container's health check.
@@ -250,6 +427,7 @@ costs availability and not commits.
 <data>/ACCESS             each database's salted password hash
 <data>/<name>.db          the data, in 8 KiB pages
 <data>/<name>.wal-<n>     commits since the last checkpoint
+<archive>/<name>.<id>/    with DATABASE_ARCHIVE: one history's bases and log files
 ```
 
 A copy of the directory taken while the server is **stopped** is a
@@ -267,6 +445,12 @@ good order (`SIGTERM`), so that its logs hold no commits. A log that
 holds commits may begin with a record that says where the log file
 before it ended. Builds from before that record do not know it, and
 refuse to start on such a log rather than read past it.
+
+With `DATABASE_ARCHIVE`, every record of the log begins with the time
+of its commit. Builds from before the archive do not know that record
+either, and refuse to start on a log that holds one: the same clean
+stop empties the logs. Nothing else in the data directory differs, and
+the archive directory is not read by a server started without it.
 
 A database with a column that keeps the start of its large values in
 its rows (`keep_start`, `CLIENT.md`) is stored in a form that a build
