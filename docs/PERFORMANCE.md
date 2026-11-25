@@ -323,12 +323,59 @@ a process starts, not by `mallopt`, so the server cannot enlarge them
 for itself. What was done takes away most of what threads contended
 for: a count makes a quarter of the allocations it made.
 
+*Done: columns found once, rows read into one buffer.* Profiled again
+(callgrind, as above, but through the benchmark itself: one
+connection, prepared statements, `BENCH_KEEP=1` data loaded natively,
+`BENCH_REPEAT` of 1 and 3, the difference over 16,000 pages), the page
+spent its instructions on things that do not depend on the data: each
+selected column was looked up by name twice for every row, the preview
+read the body's reference three times through the codec's reader and
+checked its 256 bytes as UTF-8 and as ASCII twice, each row was copied
+into an allocation of its own, the rows were gathered in a vector grown
+a step at a time, and moved into another one to be cut into responses
+that were one response. Now a query of one table works out once how
+each selected item is evaluated (`DESIGN.md`, "Executing requests"), a
+reference is read where it lies, a scan reads every row into one buffer,
+and a result smaller than one response is sent as it is.
+
+| Request | Before | After | | Allocations per request, before and after |
+|---|---:|---:|---:|---:|
+| Mailbox page | 730,200 | 539,500 | −26% | 334 to 224 |
+| Count over a user's 5,000 mails | 35.9 million | 35.0 million | −2% | 5,842 to 582 |
+| Full-text search | 1,415,800 | 1,389,700 | −2% | 358 to 352 |
+| Session lookup | 133,600 | 130,700 | −2% | 108 to 100 |
+| Flag update by key | 75,200 | 75,500 | | 58 to 58 |
+
+(These are counted through the benchmark's prepared statements, on the
+data the load leaves, and are not comparable with the tables above,
+which a probe of its own counted.)
+
+The allocator's contention after writes went with the allocations.
+With `strace -c -f` attached to the server only while the page ran on
+four connections (24,000 pages), after the two upsert workloads of
+eight connections: 1.1 to 1.6 `futex` calls per page before (three
+runs), 0.53 to 0.73 after (two runs), as on a server that has only read
+(0.46 to 0.50 before, 0.69 after, one or two runs each). With the
+stack of each call (`strace -k`, 8,000 pages after the upserts), 1,900
+of the 5,300 calls before were the allocator's locks, taken in growing
+the rows' vectors, in making values and in dropping them; after, 7 of
+3,200 were. The rest are the runtime's threads parking and waking.
+Raising the allocator's per-thread caches (`GLIBC_TUNABLES=
+glibc.malloc.tcache_count=32` to `128`) gave 0.54 to 0.70 calls per
+page after: within the noise of the default, so nothing was changed in
+how the allocator is set up. The server's CPU time per page on four
+connections after the upserts (`/proc/<pid>/stat`, a machine shared
+with other work, three runs each) was 121 to 168 µs before and 78 to
+111 µs after; on one connection 95 to 124 µs before and 75 to 80 µs
+after. Memory after a run of the reading workloads was 41.8 to 43.5 MB
+before and 41.8 to 42.4 MB after.
+
 What is left of the options:
 
 | Option | What it changes | Expected effect | Cost |
 |---|---|---|---|
-| **Read a row's bytes where they lie** in their page, instead of copying them out: the one allocation a row still costs | A count makes about one allocation per row; this would make it none | A few percent of a count; little for a page of fifty | Moderate: the row's lifetime runs through the executor, and the page must stay pinned while the row is read |
-| **An allocator with larger per-thread caches** | Threads contend for its locks less | Whatever is still lost after writes, which has to be timed again first | A dependency, where there are three; or `GLIBC_TUNABLES=glibc.malloc.tcache_count=...`, which only the container image can set |
+| **Read a row's bytes where they lie** in their page, instead of copying them into the scan's buffer | The copy of each row; no allocation is left to save | A few percent of a page | Moderate: the row's lifetime runs through the executor, and the page must stay pinned while the row is read |
+| **Encode the rows as they are read**, instead of making a value of each column, keeping them, encoding them and dropping them | Three of a page's four allocations per row, and the 46,000 instructions of dropping a page's values | Perhaps a sixth of a page | Large: the executor answers in values, which joins, sorting and the server's own callers all take |
 | **A preview column** kept by the application | No large value is read | A fifth, with nothing to build | None in the server; a column to maintain |
 
 ### 2. Unlogged upserts from many connections (0.80×)

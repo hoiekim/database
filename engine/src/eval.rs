@@ -17,7 +17,7 @@ use database_protocol::value::{compare_json, json_text, parse_uuid, Json, Type, 
 use crate::btree::Pages;
 use crate::catalog::{Catalog, Table};
 use crate::error::{Error, Result};
-use crate::row::Row;
+use crate::row::{BlobRef, Row};
 use crate::text;
 
 /// What an evaluation can reach beyond the rows in front of it.
@@ -291,16 +291,26 @@ fn column(ctx: &Ctx, scope: &Scope, table: Option<&str>, name: &str) -> Result<V
     }
 }
 
-/// The row and column a bare column expression names, so that functions
-/// on large values can read a part without the whole.
-fn column_ref<'s, 'a>(scope: &'s Scope<'a>, expr: &Expr) -> Option<(&'s Frame<'a>, &'a Row, usize)> {
+/// A column of a row that holds a large value: the row, the column, and
+/// the value's reference with the start the row keeps of it.
+type Stored<'a> = (&'a Row, usize, BlobRef, &'a [u8]);
+
+/// The large value a bare column expression names, so that functions on
+/// large values can read a part without the whole.
+fn column_ref<'s, 'a>(scope: &'s Scope<'a>, expr: &Expr) -> Option<(&'s Frame<'a>, Stored<'a>)> {
     let Expr::Column(table, name) = expr else { return None };
     if table.is_none() && (scope.item.is_some_and(|(n, _)| n == name) || scope.named.is_some_and(|(names, _)| names.contains(name))) {
         return None;
     }
     let (frame, i) = resolve(scope, table.as_deref(), name)?;
+    Some((frame, stored_at(frame, i)?))
+}
+
+/// Column `i` of the frame's row, if it holds a large value.
+fn stored_at<'a>(frame: &Frame<'a>, i: usize) -> Option<Stored<'a>> {
     let row = frame.row?;
-    (i < row.stored() && row.blob(i).is_some()).then_some((frame, row, i))
+    let (blob, kept) = row.reference(i)?;
+    Some((row, i, blob, kept))
 }
 
 /// A condition's value: true, false, or unknown for NULL.
@@ -830,8 +840,10 @@ fn substr(text: &str, start: i64, len: i64) -> String {
 /// The start a row keeps of a large text, if the text's first `n`
 /// characters are all in it. (It is never the whole text: the text left
 /// its row for want of room.)
-fn kept_chars(row: &Row, i: usize, n: u64) -> Option<&str> {
-    let (start, _) = row.kept_start(i)?;
+fn kept_chars(start: &[u8], n: u64) -> Option<&str> {
+    if start.is_empty() {
+        return None;
+    }
     let head = std::str::from_utf8(start).ok()?;
     let holds = if head.is_ascii() {
         head.len() as u64 >= n
@@ -841,11 +853,38 @@ fn kept_chars(row: &Row, i: usize, n: u64) -> Option<&str> {
     holds.then_some(head)
 }
 
+/// The first `n` characters of the start a row keeps of a large text,
+/// when they are plain ASCII: then they are its first `n` bytes, and
+/// nothing past them needs to be looked at. `None` sends the caller to
+/// `kept_chars`, which reads the start whole.
+fn kept_ascii(start: &[u8], n: u64) -> Option<&str> {
+    if start.is_empty() {
+        return None;
+    }
+    let head = start.get(..usize::try_from(n).ok()?)?;
+    head.is_ascii().then(|| std::str::from_utf8(head).ok()).flatten()
+}
+
 /// Functions that can answer from a large value's length or a part of
 /// it. `None` when the argument is not a large stored value.
 fn call_on_blob(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Option<Value>> {
-    let Some((frame, row, i)) = args.first().and_then(|arg| column_ref(scope, arg)) else { return Ok(None) };
-    let rest: Vec<Value> = args[1..].iter().map(|e| eval(ctx, scope, e)).collect::<Result<_>>()?;
+    let Some((frame, stored)) = args.first().and_then(|arg| column_ref(scope, arg)) else { return Ok(None) };
+    call_on_stored(ctx, scope, func, frame, stored, &args[1..])
+}
+
+/// `call_on_blob` for a large value of the frame's row, with the
+/// arguments after the first. At most two are used by any of these
+/// functions: more answer `None`, as fewer than asked for do.
+fn call_on_stored(ctx: &Ctx, scope: &Scope, func: Func, frame: &Frame, stored: Stored, args: &[Expr]) -> Result<Option<Value>> {
+    let (row, i, blob, kept) = stored;
+    if args.len() > 2 {
+        return Ok(None);
+    }
+    let mut given = [Value::Null, Value::Null];
+    for (slot, arg) in given.iter_mut().zip(args) {
+        *slot = eval(ctx, scope, arg)?;
+    }
+    let rest = &given[..args.len()];
     if rest.iter().any(Value::is_null) {
         return Ok(None);
     }
@@ -858,21 +897,24 @@ fn call_on_blob(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<O
             let from = start.max(1);
             row.byte_range(ctx.pages, blobs, i, (from - 1) as u64, (end - from).max(0) as u64)?.map(Value::Bytes)
         }
-        Func::Left if rest.len() == 1 && row.is_text(i) => {
+        Func::Left if rest.len() == 1 && blob.tag == database_protocol::codec::TAG_TEXT => {
             let n = int_arg(&rest[0], "left")?;
             if n < 0 {
                 return Ok(None);
             }
-            if let Some(head) = kept_chars(row, i, n as u64) {
+            if let Some(head) = kept_ascii(kept, n as u64) {
+                return Ok(Some(Value::Text(head.to_string())));
+            }
+            if let Some(head) = kept_chars(kept, n as u64) {
                 return Ok(Some(Value::Text(chars(head, 0, n as usize).to_string())));
             }
             // A character is at most four bytes.
             row.byte_range(ctx.pages, blobs, i, 0, (n as u64).saturating_mul(4))?.map(|bytes| Value::Text(first_chars(&bytes, n as usize)))
         }
-        Func::Substr if rest.len() == 2 && row.is_text(i) => {
+        Func::Substr if rest.len() == 2 && blob.tag == database_protocol::codec::TAG_TEXT => {
             let (start, len) = (int_arg(&rest[0], "substr")?, int_arg(&rest[1], "substr")?);
             let end = start.saturating_add(len.max(0)).max(1);
-            if let Some(head) = kept_chars(row, i, (end - 1) as u64) {
+            if let Some(head) = kept_chars(kept, (end - 1) as u64) {
                 return Ok(Some(Value::Text(substr(head, start, len))));
             }
             // Everything up to the last character wanted, at most.
@@ -886,6 +928,69 @@ fn call_on_blob(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<O
         }
         _ => None,
     })
+}
+
+/// A selected expression, with the column of the query's own table that
+/// it names found once for the whole query instead of once per row.
+pub enum Pick<'q> {
+    /// The column at this place in the table.
+    Column(usize),
+    /// A function of the column at this place that may answer from part
+    /// of a large value (`call_on_blob`), and the whole call.
+    OnColumn(Func, usize, &'q Expr),
+    /// Anything else, evaluated as it stands.
+    Expr(&'q Expr),
+}
+
+/// The column of `table`, read under `alias`, that `expr` names, if it
+/// names one of that table. Only for a scope in which the table's row is
+/// the one frame, with no item of `each` and no named values: there a
+/// name of the table's own is never hidden, and resolves to the table.
+fn own_column(table: &Table, alias: &str, expr: &Expr) -> Option<usize> {
+    let Expr::Column(qualifier, name) = expr else { return None };
+    if qualifier.as_deref().is_some_and(|q| q != alias) {
+        return None;
+    }
+    table.by_name.get(name).copied()
+}
+
+impl<'q> Pick<'q> {
+    /// How to evaluate `expr` for each row of `table` read under `alias`,
+    /// in a scope of that one frame (see `own_column`).
+    pub fn new(table: &Table, alias: &str, expr: &'q Expr) -> Pick<'q> {
+        if let Some(i) = own_column(table, alias, expr) {
+            return Pick::Column(i);
+        }
+        if let Expr::Call(func @ (Func::OctetLength | Func::SubstrBytes | Func::Left | Func::Substr), args) = expr {
+            if let Some(i) = args.first().and_then(|arg| own_column(table, alias, arg)) {
+                return Pick::OnColumn(*func, i, expr);
+            }
+        }
+        Pick::Expr(expr)
+    }
+
+    /// The value for the row of the scope's one frame. The same as `eval`
+    /// of the expression the pick was made from.
+    pub fn eval(&self, ctx: &Ctx, scope: &Scope) -> Result<Value> {
+        let frame = match self {
+            Pick::Expr(expr) => return eval(ctx, scope, expr),
+            _ => &scope.frames[0],
+        };
+        match *self {
+            Pick::Column(i) => frame_value(ctx, frame, i),
+            Pick::OnColumn(func, i, expr) => {
+                let Expr::Call(_, args) = expr else { return eval(ctx, scope, expr) };
+                match stored_at(frame, i) {
+                    Some(stored) => match call_on_stored(ctx, scope, func, frame, stored, &args[1..])? {
+                        Some(value) => Ok(value),
+                        None => call_with_values(ctx, scope, func, args),
+                    },
+                    None => eval(ctx, scope, expr),
+                }
+            }
+            Pick::Expr(expr) => eval(ctx, scope, expr),
+        }
+    }
 }
 
 fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
@@ -909,6 +1014,11 @@ fn call(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
         }
         _ => {}
     }
+    call_with_values(ctx, scope, func, args)
+}
+
+/// `call` once nothing is left but to evaluate every argument.
+fn call_with_values(ctx: &Ctx, scope: &Scope, func: Func, args: &[Expr]) -> Result<Value> {
     let a: Vec<Value> = args.iter().map(|e| eval(ctx, scope, e)).collect::<Result<_>>()?;
     let name = format!("{func:?}").to_lowercase();
     let arity = |ok: bool| if ok { Ok(()) } else { Err(invalid(format!("{name} was given {} arguments", a.len()))) };
@@ -1348,8 +1458,14 @@ mod tests {
                 let kept = row.kept_start(1).map_or(0, |(start, _)| start.len());
                 assert!(kept <= keep && kept + 4 > keep && text.is_char_boundary(kept), "{keep} asked, {kept} kept");
                 let held = text[..kept].chars().count() as u64;
+                let start = kept_of(&row, 1);
                 for n in (0..held + 3).chain([10_000, u64::MAX]) {
-                    match kept_chars(&row, 1, n) {
+                    // Where the first `n` characters are plain ASCII they
+                    // are taken as bytes, and are the same characters.
+                    if let Some(ascii) = kept_ascii(start, n) {
+                        assert_eq!(Some(ascii), kept_chars(start, n).map(|head| chars(head, 0, n as usize)), "{keep} kept, {n} asked");
+                    }
+                    match kept_chars(start, n) {
                         // All of the first `n` characters are there.
                         Some(head) => {
                             assert!(n <= held, "{keep} kept, {n} asked");
@@ -1371,6 +1487,82 @@ mod tests {
         let mut cols = vec![crate::row::encode_value(&Value::Text("short".into())), crate::row::encode_value(&Value::Text("y".repeat(9_000)))];
         crate::row::fit(&mut p, &mut cols, 1_500, &mut NO_PAGE.clone(), &mut 1, &|_| 0).unwrap();
         let row = Row::parse(crate::row::assemble(&cols)).unwrap();
-        assert!(kept_chars(&row, 0, 1).is_none() && kept_chars(&row, 1, 1).is_none() && kept_chars(&row, 2, 0).is_none());
+        for (i, n) in [(0, 1), (1, 1), (2, 0)] {
+            assert!(kept_chars(kept_of(&row, i), n).is_none() && kept_ascii(kept_of(&row, i), n).is_none());
+        }
+    }
+
+    #[test]
+    fn a_pick_gives_what_its_expression_gives() {
+        use crate::btree::tests::MemPages;
+        use crate::page::NO_PAGE;
+        use database_protocol::expr::{col, param, val};
+        use database_protocol::schema::{ColumnDef, TableDef};
+        let def = TableDef::new("notes").column(ColumnDef::new("id", Type::Int)).column(ColumnDef::new("body", Type::Text).keep_start(64)).column(ColumnDef::new("raw", Type::Bytes)).primary_key(["id"]);
+        let mut table = Table::create(&def, 1, &Catalog::default()).unwrap();
+        let mut p = MemPages::new();
+        let (mut blobs, mut next_blob) = (NO_PAGE, 1);
+        // Rows stored before the column `extra` was added; bodies in the
+        // row, out of it with a start kept, and out of it with none.
+        let bodies = [Value::Text("short".into()), Value::Text("x".repeat(3_000)), Value::Text(format!("ab{}", "é".repeat(2_000))), Value::Text("日本".repeat(900)), Value::Null];
+        let mut rows = Vec::new();
+        for (n, body) in bodies.iter().enumerate() {
+            let mut cols = vec![crate::row::encode_value(&Value::Int(n as i64)), crate::row::encode_value(body), crate::row::encode_value(&Value::Bytes(vec![7; 2_000]))];
+            let keep = |i: usize| if n == 3 { 0 } else { table.keep_start(i) };
+            crate::row::fit(&mut p, &mut cols, 1_200, &mut blobs, &mut next_blob, &keep).unwrap();
+            rows.push(Row::parse(crate::row::assemble(&cols)).unwrap());
+        }
+        table.blobs = blobs;
+        assert!(rows[0].reference(1).is_none() && !kept_of(&rows[1], 1).is_empty() && !kept_of(&rows[2], 1).is_empty());
+        assert!(rows[3].reference(1).is_some() && kept_of(&rows[3], 1).is_empty());
+        std::sync::Arc::make_mut(&mut table.meta).add_column(ColumnDef::new("extra", Type::Int), Value::Int(7)).unwrap();
+        let exprs = [
+            col("id"),
+            col("notes.body"),
+            col("other.body"),
+            col("extra"),
+            col("outside"),
+            col("missing"),
+            col("body").left(10),
+            col("body").left(64),
+            col("body").left(1_000),
+            col("body").left(0),
+            col("body").left(-2),
+            Expr::Call(Func::Left, vec![col("body"), val(Value::Null)]),
+            Expr::Call(Func::Left, vec![col("body"), param(0)]),
+            Expr::Call(Func::Left, vec![col("body")]),
+            col("notes.body").substr(2, 5),
+            col("body").substr_bytes(1, 3),
+            col("raw").substr_bytes(2, 4),
+            col("raw").left(3),
+            col("body").octet_length(),
+            col("extra").left(1),
+            col("body").lower(),
+        ];
+        let (catalog, cost) = (Catalog::default(), Cost::default());
+        let ctx = Ctx { pages: &p, catalog: &catalog, now: 0, deadline: None, tape: None, params: &[Value::Int(5)], cost: &cost };
+        let names = ["outside".to_string()];
+        let values = [Value::Int(1)];
+        let outer = Scope { named: Some((&names, &values)), ..Scope::default() };
+        for row in &rows {
+            let frames = [Frame { alias: "notes", table: &table, row: Some(row) }];
+            let scope = Scope { frames: &frames, outer: Some(&outer), ..Scope::default() };
+            for expr in &exprs {
+                let picked = Pick::new(&table, "notes", expr).eval(&ctx, &scope);
+                match (picked, eval(&ctx, &scope, expr)) {
+                    (Ok(a), Ok(b)) => assert_eq!(a, b, "{expr:?}"),
+                    (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{expr:?}"),
+                    (a, b) => panic!("{expr:?}: {a:?} picked, {b:?} evaluated"),
+                }
+            }
+        }
+        assert!(matches!(Pick::new(&table, "notes", &col("notes.extra")), Pick::Column(3)));
+        assert!(matches!(Pick::new(&table, "notes", &col("body").left(5)), Pick::OnColumn(Func::Left, 1, _)));
+        assert!(matches!(Pick::new(&table, "notes", &col("other.body")), Pick::Expr(_)));
+    }
+
+    /// The start a row keeps of column `i`: empty if it keeps none.
+    fn kept_of(row: &Row, i: usize) -> &[u8] {
+        row.reference(i).map_or(&[][..], |(_, start)| start)
     }
 }

@@ -198,14 +198,22 @@ fn encode_blob_ref(blob: BlobRef, start: &[u8]) -> Vec<u8> {
 
 /// A stored column as a reference and the start kept with it, which is
 /// empty if none is: `None` for a column that holds its value.
+///
+/// Read on the bytes where they lie, as `skip` reads them: a page of
+/// previews asks this of every row.
 fn blob_parts(col: &[u8]) -> Option<(BlobRef, &[u8])> {
     let tag = *col.first()?;
     if tag != TAG_BLOB && tag != TAG_BLOB_START {
         return None;
     }
-    let mut r = Reader::new(&col[1..]);
-    let blob = BlobRef { tag: r.u8().ok()?, id: r.varint().ok()?, len: r.varint().ok()? };
-    let start = if tag == TAG_BLOB_START { r.bytes().ok()? } else { &[] };
+    let mut pos = 2;
+    let blob = BlobRef { tag: *col.get(1)?, id: crate::page::get_varint(col, &mut pos)?, len: crate::page::get_varint(col, &mut pos)? };
+    let start = if tag == TAG_BLOB_START {
+        let (n, at) = count_at(col, pos)?;
+        col.get(at..at.checked_add(n)?)?
+    } else {
+        &[]
+    };
     Some((blob, start))
 }
 
@@ -415,6 +423,11 @@ impl Row {
         &self.raw
     }
 
+    /// The row's bytes, for the buffer they are in to be used again.
+    pub fn into_raw(self) -> Vec<u8> {
+        self.raw
+    }
+
     /// The bytes its columns take, without the count before them.
     pub fn columns_len(&self) -> usize {
         self.raw.len() - self.starts.at(0)
@@ -432,6 +445,13 @@ impl Row {
 
     pub fn blob(&self, i: usize) -> Option<BlobRef> {
         decode_blob_ref(self.raw_col(i)?)
+    }
+
+    /// The reference to a value that lives in the blob tree, with the
+    /// start the row keeps of it (empty if none): `blob` and `kept_start`
+    /// at once.
+    pub fn reference(&self, i: usize) -> Option<(BlobRef, &[u8])> {
+        blob_parts(self.raw_col(i)?)
     }
 
     /// The start the row keeps of a value that lives in the blob tree,
@@ -618,6 +638,19 @@ mod tests {
         Some(())
     }
 
+    /// A reference and the start kept with it, read by the codec's own
+    /// reader: what `blob_parts` must agree with.
+    fn blob_parts_by_reader(col: &[u8]) -> Option<(BlobRef, &[u8])> {
+        let tag = *col.first()?;
+        if tag != TAG_BLOB && tag != TAG_BLOB_START {
+            return None;
+        }
+        let mut r = Reader::new(&col[1..]);
+        let blob = BlobRef { tag: r.u8().ok()?, id: r.varint().ok()?, len: r.varint().ok()? };
+        let start = if tag == TAG_BLOB_START { r.bytes().ok()? } else { &[] };
+        Some((blob, start))
+    }
+
     /// Where a row's columns start and the last one ends, by the reader.
     fn starts_by_reader(raw: &[u8]) -> Option<Vec<usize>> {
         let mut r = Reader::new(raw);
@@ -678,6 +711,7 @@ mod tests {
             assert_eq!(row.stored(), values.len());
             for (i, want) in values.iter().enumerate() {
                 assert_eq!(row.raw_col(i), Some(&cols[i][..]));
+                assert_eq!(row.reference(i), blob_parts_by_reader(&cols[i]));
                 if !references.contains(&i) {
                     assert_eq!(row.value(&p, NO_PAGE, i).unwrap().as_ref(), Some(want), "column {i} of {values:?}");
                 }
@@ -712,6 +746,12 @@ mod tests {
                 for i in 0..row.stored() {
                     let col = &bad[starts[i]..starts[i + 1]];
                     assert_eq!(row.raw_col(i), Some(col));
+                    assert_eq!(blob_parts(col), blob_parts_by_reader(col), "{col:?}");
+                    // And a column's bytes damaged alone, as a reference
+                    // whose own parts are cut short or run long.
+                    for cut in 0..col.len() {
+                        assert_eq!(blob_parts(&col[..cut]), blob_parts_by_reader(&col[..cut]), "{col:?} cut at {cut}");
+                    }
                     if blob_parts(col).is_some() {
                         continue;
                     }

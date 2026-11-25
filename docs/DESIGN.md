@@ -390,6 +390,16 @@ list); the filter; grouping; ordering; offset and limit; the selected
 values. With no `order_by` the pipeline stops as soon as the limit is
 reached, which is what makes "the newest 50" cost 50 rows.
 
+A row read by a scan is lent to the rest of the pipeline, never given:
+what is kept of it is the values made from it. So a scan copies each
+row out of its page into one buffer, which it takes back for the next
+row. And where a query reads one table, with no join and no `each`, a
+name among the selected items can mean nothing but that table's
+column: each item is worked out once for the whole query (`Pick`), a
+column by its place, a function that can answer from part of a large
+value by the column it reads, and the rest evaluated as written, row
+by row.
+
 **What a statement read is counted as it reads**: an entry for each
 index entry a range or a tree walk gives and each hit of a search, a
 row for each row read from a table, by any path. The two counts are

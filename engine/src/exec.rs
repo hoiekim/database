@@ -20,7 +20,7 @@ use database_protocol::value::{Type, Value};
 use crate::btree::{self, Cursor};
 use crate::catalog::{Table, TableMeta};
 use crate::error::{Error, Result};
-use crate::eval::{self, eval, holds, AggValues, Ctx, Frame, Scope};
+use crate::eval::{self, eval, holds, AggValues, Ctx, Frame, Pick, Scope};
 use crate::keys;
 use crate::row::Row;
 
@@ -217,7 +217,35 @@ pub fn fetch(ctx: &Ctx, table: &Table, pk: &[u8]) -> Result<Option<Row>> {
 }
 
 fn fetch_indexed(ctx: &Ctx, table: &Table, pk: &[u8]) -> Result<Row> {
-    fetch(ctx, table, pk)?.ok_or_else(|| Error::corrupt(format!("an index of table {:?} points at a row that is not there", table.name)))
+    fetch_indexed_into(ctx, table, pk, Vec::new())
+}
+
+/// `fetch_indexed`, with the row's bytes copied into `buf`.
+fn fetch_indexed_into(ctx: &Ctx, table: &Table, pk: &[u8], mut buf: Vec<u8>) -> Result<Row> {
+    buf.clear();
+    if !btree::get_with(ctx.pages, table.root, pk, &mut |value| buf.extend_from_slice(value))? {
+        return Err(Error::corrupt(format!("an index of table {:?} points at a row that is not there", table.name)));
+    }
+    ctx.cost.row();
+    Row::parse(buf)
+}
+
+/// Hands each row of a scan to `on_hit` in one buffer, used again for
+/// the next row once `on_hit` is done with it: `on_hit` sees a row only
+/// by reference and keeps nothing of it but values made from it.
+#[derive(Default)]
+struct Spare(Vec<u8>);
+
+impl Spare {
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+
+    fn hand(&mut self, hit: Hit, on_hit: &mut dyn FnMut(&Hit) -> Result<bool>) -> Result<bool> {
+        let go = on_hit(&hit)?;
+        self.0 = hit.row.into_raw();
+        Ok(go)
+    }
 }
 
 /// Reads the rows an access path names, in its order.
@@ -225,11 +253,15 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
     match access {
         Access::Primary { ranges, reverse } => {
             let parts = pk_parts(table);
+            let mut spare = Spare::default();
             for range in ranges {
                 let Some((start, end)) = range_bytes(ctx, outer, range, parts)? else { continue };
                 let done = walk_range(ctx, table.root, start.as_deref(), end.as_deref(), *reverse, &mut |key, value| {
                     ctx.cost.row();
-                    on_hit(&Hit { pk: key, row: Row::parse(value.to_vec())?, depth: None, rank: None })
+                    let mut buf = spare.take();
+                    buf.clear();
+                    buf.extend_from_slice(value);
+                    spare.hand(Hit { pk: key, row: Row::parse(buf)?, depth: None, rank: None }, on_hit)
                 })?;
                 if !done {
                     return Ok(false);
@@ -246,6 +278,7 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
             // An index over the items of a list holds a row once per
             // item: give each row once.
             let mut seen = table.indexes[i].def.keys.iter().any(|k| k.each).then(HashSet::new);
+            let mut spare = Spare::default();
             for range in ranges {
                 let Some((start, end)) = range_bytes(ctx, outer, range, &parts)? else { continue };
                 let done = walk_range(ctx, table.index_roots[i], start.as_deref(), end.as_deref(), *reverse, &mut |key, value| {
@@ -256,7 +289,8 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
                             return Ok(true);
                         }
                     }
-                    on_hit(&Hit { pk, row: fetch_indexed(ctx, table, pk)?, depth: None, rank: None })
+                    let row = fetch_indexed_into(ctx, table, pk, spare.take())?;
+                    spare.hand(Hit { pk, row, depth: None, rank: None }, on_hit)
                 })?;
                 if !done {
                     return Ok(false);
@@ -577,7 +611,25 @@ fn outputs(q: &Query, table: &Table) -> (Vec<String>, Option<Vec<usize>>) {
     }
 }
 
-fn project(ctx: &Ctx, q: &Query, scope: &Scope, table: &Table, all: &Option<Vec<usize>>, hit: &Hit) -> Result<Vec<Value>> {
+/// How each selected item is evaluated, where the query reads one table
+/// and nothing but its row can be named by the items: its columns are
+/// then found once, not for every row. `None` where they cannot be.
+fn picks<'q>(q: &'q Query, table: &Table) -> Option<Vec<Pick<'q>>> {
+    if q.table.is_empty() || !q.joins.is_empty() || q.unnest.is_some() || q.select.is_empty() {
+        return None;
+    }
+    let alias = q.alias.as_deref().unwrap_or(&table.name);
+    Some(q.select.iter().map(|item| Pick::new(table, alias, &item.expr)).collect())
+}
+
+fn project(ctx: &Ctx, q: &Query, scope: &Scope, table: &Table, all: &Option<Vec<usize>>, picks: Option<&[Pick]>, hit: &Hit) -> Result<Vec<Value>> {
+    if let Some(picks) = picks {
+        let mut row = Vec::with_capacity(picks.len());
+        for pick in picks {
+            row.push(pick.eval(ctx, scope)?);
+        }
+        return Ok(row);
+    }
     match all {
         Some(cols) => {
             let frame = Frame { alias: "", table, row: Some(&hit.row) };
@@ -606,15 +658,17 @@ pub fn query(ctx: &Ctx, q: &Query, outer: &Scope) -> Result<RowSet> {
         return aggregate(ctx, q, outer);
     }
     let (columns, all) = outputs(q, &table);
+    let picks = picks(q, &table);
     let stopped = Cell::new(false);
     let wanted = q.limit.map(|limit| q.offset.saturating_add(limit));
     let mut total = 0u64;
     let mut distinct: Option<HashSet<Vec<u8>>> = q.distinct.then(HashSet::new);
 
     if q.order_by.is_empty() {
-        let mut rows = Vec::new();
+        // Room for the rows a limit asks for, within reason, at once.
+        let mut rows = Vec::with_capacity(q.limit.map_or(0, |limit| limit.min(1024) as usize));
         for_each_match(ctx, q, outer, &stopped, &mut |scope, hit| {
-            let row = project(ctx, q, scope, &table, &all, hit)?;
+            let row = project(ctx, q, scope, &table, &all, picks.as_deref(), hit)?;
             if let Some(seen) = &mut distinct {
                 if !seen.insert(row_key(&row)) {
                     return Ok(true);
@@ -637,7 +691,7 @@ pub fn query(ctx: &Ctx, q: &Query, outer: &Scope) -> Result<RowSet> {
     let mut rows: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     let sort = |rows: &mut Vec<(Vec<Value>, Vec<Value>)>| rows.sort_by(|a, b| order_cmp(&a.0, &b.0, &q.order_by));
     for_each_match(ctx, q, outer, &stopped, &mut |scope, hit| {
-        let row = project(ctx, q, scope, &table, &all, hit)?;
+        let row = project(ctx, q, scope, &table, &all, picks.as_deref(), hit)?;
         if let Some(seen) = &mut distinct {
             if !seen.insert(row_key(&row)) {
                 return Ok(true);
