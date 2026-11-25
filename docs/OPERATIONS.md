@@ -26,6 +26,8 @@ database stats
 | `DATABASE_DATA` | `./data` | where the files live |
 | `DATABASE_LISTEN` | `0.0.0.0:5454` | address to listen on |
 | `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well (see "On the same host") |
+| `DATABASE_TLS_CERT`, `DATABASE_TLS_KEY` | (none) | a certificate and its key, to serve TLS with on the TCP port (see "TLS") |
+| `DATABASE_TLS` | `required` | with a certificate: `required` refuses TCP connections in the clear, `optional` serves them too |
 | `DATABASE_CACHE_MB` | `32` | memory for cached pages (see "Memory") |
 | `DATABASE_SLOW_MS` | (none) | log every statement that takes this many milliseconds or more (see "Checking") |
 
@@ -42,7 +44,10 @@ rather than share the files.
 Every other command connects to the server on `DATABASE_HOST` (default
 `127.0.0.1`), the port of `DATABASE_LISTEN`, or through
 `DATABASE_SOCKET` if that is set, with `DATABASE_ADMIN_PASSWORD`. Run
-inside the server's container they need nothing else.
+inside the server's container they need nothing else: where the server
+has a certificate and no socket, they connect under TLS and take for the
+server whoever shows exactly the certificate of `DATABASE_TLS_CERT`,
+whatever name it is for.
 
 ## On the same host
 
@@ -67,6 +72,89 @@ socket's directory in both.
   that another server is listening on, or that holds something other
   than a socket, stops the server from starting.
 - The file is removed when the server stops.
+
+## TLS
+
+Between hosts, or on any network that others can listen on, give the
+server a certificate. It then serves TLS 1.3 on its TCP port and refuses
+connections in the clear:
+
+```sh
+DATABASE_TLS_CERT=/etc/database/tls.pem DATABASE_TLS_KEY=/etc/database/tls.key database serve
+```
+
+`DATABASE_TLS_CERT` is a PEM file: the server's certificate, followed by
+the certificates of any authorities between it and the one the clients
+trust. `DATABASE_TLS_KEY` is that certificate's private key, PEM,
+readable by the server's user and nobody else. Clients then name how
+they know the server, in their URL (`CLIENT.md`):
+
+```text
+database://shop:<password>@db.example.com?tls=on                   a certificate from a public authority
+database://shop:<password>@db.example.com?tls_ca=/etc/shop/ca.pem   one from an authority of your own
+```
+
+What the server does, and what it leaves to you:
+
+- **Clients in the clear are refused, and told why.** The answer to
+  their greeting is `AccessDenied`, "this server takes connections over
+  TCP only under TLS". The greeting, with its password, has crossed the
+  network by then: a refusal cannot take that back. Change a password
+  that travelled in the clear over a network you do not trust.
+- **Moving clients over.** `DATABASE_TLS=optional` serves both kinds
+  of connection on the one port. Start the server so, turn TLS on in
+  each client, then remove the setting. A server that never had the
+  setting loses its clients in the clear the moment it is given a
+  certificate, which is what the setting is for.
+- **Renewing.** Replace the two files; the server reads them again
+  within a second of the next connection, and says so in its log. Open
+  connections are not disturbed. Write each file beside the old one
+  and rename it into place, so that half a file is never read. While
+  only one of the two has been replaced, or if the new files cannot be
+  used, the server keeps the certificate it has and logs why:
+
+  ```text
+  database: the TLS certificate has changed and cannot be used, so the one before it is kept: ...
+  ```
+
+- **A server that cannot do as asked does not start**: one of the two
+  files without the other, a key that is not the certificate's, a
+  `DATABASE_TLS` with no certificate.
+- **The Unix domain socket is not encrypted**, with or without a
+  certificate: what goes through it does not leave the host.
+- **The server's own commands** (`database ping`, `dump`, ..) need no
+  setting of their own: with `DATABASE_TLS_CERT` in their environment,
+  as it is in the server's container, they connect under TLS and accept
+  that certificate and no other. The image's health check goes on
+  working.
+- **Clients are not asked for certificates.** A client proves itself
+  with its password, as before.
+- **Not checked by the server:** whether its certificate has expired,
+  or is for the name clients use. Clients check both (all but one that
+  was given the certificate itself, `tls_cert`), and a server with an
+  expired certificate is one no client connects to. Watch the date.
+
+An authority of your own and a certificate from it, with OpenSSL, for a
+server that clients reach as `database` and `db.example.com`:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+  -subj "/CN=database authority" -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign" -keyout ca.key -out ca.pem
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -subj "/CN=database" -keyout tls.key -out tls.csr
+printf "basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:database,DNS:db.example.com\n" > tls.ext
+openssl x509 -req -in tls.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 825 -extfile tls.ext -out tls.pem
+```
+
+`ca.pem` goes to the clients (`tls_ca=`), `tls.pem` and `tls.key` to the
+server, and `ca.key` somewhere neither can read. A certificate that is
+its own authority (`openssl req -x509` alone) is refused by the Rust
+client as a server's certificate when it says it is an authority, which
+is what that command makes: give the Rust client such a certificate
+with `tls_cert=`, or make the two as above.
+
+What TLS costs is measured in `PERFORMANCE.md`, "What TLS costs".
 
 ## In a container
 
@@ -114,9 +202,11 @@ Each application gets its own database and password, created once:
 docker compose exec -e DATABASE_PASSWORD=<password> database database create --if-not-exists shop
 ```
 
-The protocol is not encrypted and a database's password crosses the
-network as it is. Keep the server on a private network and do not
-publish the port beyond loopback.
+Without a certificate the protocol is not encrypted, and a database's
+password crosses the network as it is: keep such a server on a private
+network and do not publish the port beyond loopback. For anything else,
+see "TLS": mount the certificate and its key into the container and
+name them in `DATABASE_TLS_CERT` and `DATABASE_TLS_KEY`.
 
 A rolling deploy runs two copies of an application against one database
 for a moment. Both work: the server takes any number of connections,
@@ -295,7 +385,9 @@ The server's memory is the page cache plus a part in proportion to it:
 | Pages of a transaction in progress, per writer | up to 8 MB |
 | Requests and results in flight | requests over 64 KiB: 4 MB of them decoded at once, and each connection's next request as sent while it waits; results: their size |
 
-An idle server with nothing cached holds about 3 MB. Under the
+An idle server with nothing cached holds about 4 MB, and about 6 MB
+once it serves TLS; each open connection adds 22 kB, or 30 kB under TLS
+(`PERFORMANCE.md`, "What TLS costs"). Under the
 benchmark's load (`bench/`) it holds 45 to 50 MB once the load has
 passed, and at most 117 to 130 MB while four connections load megabyte
 statements into a table with a full-text index (150 to 171 MB before

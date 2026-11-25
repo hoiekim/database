@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -14,15 +14,19 @@ use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::Config;
+use crate::tls::Connector;
 
 fn lost(what: impl std::fmt::Display) -> DbError {
     DbError::new(ErrorCode::Connection, format!("connection to the database lost: {what}"))
 }
 
-/// What carries a connection: TCP, or a Unix domain socket to a server on
-/// the same host.
+/// What carries a connection: TCP, in the clear or under TLS, or a Unix
+/// domain socket to a server on the same host.
 enum Stream {
     Tcp(TcpStream),
+    /// In a box: the TLS state is some kilobytes, which the other kinds
+    /// of connection should not be sized for.
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
 }
@@ -31,6 +35,7 @@ impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            Stream::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(unix)]
             Stream::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
         }
@@ -41,6 +46,7 @@ impl AsyncWrite for Stream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Stream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            Stream::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(unix)]
             Stream::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
         }
@@ -49,6 +55,7 @@ impl AsyncWrite for Stream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            Stream::Tls(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(unix)]
             Stream::Unix(stream) => Pin::new(stream).poll_flush(cx),
         }
@@ -57,13 +64,14 @@ impl AsyncWrite for Stream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            Stream::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(unix)]
             Stream::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
 
-async fn connect(config: &Config) -> DbResult<Stream> {
+async fn connect(config: &Config, tls: Option<&Connector>) -> DbResult<Stream> {
     let unreachable = |e: std::io::Error| DbError::new(ErrorCode::Connection, format!("cannot reach the database at {}: {e}", config.address()));
     let timed_out = || DbError::new(ErrorCode::Connection, format!("timed out connecting to the database at {}", config.address()));
     match &config.socket {
@@ -80,7 +88,11 @@ async fn connect(config: &Config) -> DbResult<Stream> {
                 // Requests are small and each waits for its answer: never
                 // delay one to batch it with the next.
                 stream.set_nodelay(true).map_err(lost)?;
-                Ok(Stream::Tcp(stream))
+                let Some(tls) = tls else { return Ok(Stream::Tcp(stream)) };
+                match tokio::time::timeout(config.connect_timeout, tls.connect(stream, &config.address())).await {
+                    Ok(stream) => Ok(Stream::Tls(Box::new(stream?))),
+                    Err(_) => Err(timed_out()),
+                }
             }
             Err(_) => Err(timed_out()),
         },
@@ -133,8 +145,8 @@ pub(crate) struct Conn {
 }
 
 impl Conn {
-    async fn open(config: &Config) -> DbResult<Conn> {
-        let stream = connect(config).await?;
+    async fn open(config: &Config, tls: Option<&Connector>) -> DbResult<Conn> {
+        let stream = connect(config, tls).await?;
         let mut conn = Conn {
             stream: BufReader::with_capacity(READ_BUFFER, stream),
             broken: false,
@@ -172,7 +184,13 @@ impl Conn {
         frame[..4].copy_from_slice(&(len as u32).to_le_bytes());
         self.broken = true;
         self.unsent = false;
-        let sent = self.stream.get_mut().write_all(&frame).await.map_err(lost);
+        // Under TLS a write may leave the end of the frame in the
+        // connection's own buffer: the flush sends it.
+        let stream = self.stream.get_mut();
+        let sent = match stream.write_all(&frame).await {
+            Ok(()) => stream.flush().await.map_err(lost),
+            Err(e) => Err(lost(e)),
+        };
         if frame.capacity() <= KEPT_BUFFER {
             self.sending = frame;
         }
@@ -370,6 +388,9 @@ impl Conn {
 
 pub(crate) struct Pool {
     pub(crate) config: Config,
+    /// What connections are opened through when the client asks for TLS:
+    /// made when the first one is.
+    tls: OnceLock<Connector>,
     idle: Mutex<Vec<Conn>>,
     permits: Arc<Semaphore>,
     /// How often transactions have lately conflicted on their first run:
@@ -385,7 +406,7 @@ const CONFLICTS_MANY: u32 = 8;
 impl Pool {
     pub(crate) fn new(config: Config) -> Pool {
         let permits = Arc::new(Semaphore::new(config.pool_size.max(1)));
-        Pool { config, idle: Mutex::new(Vec::new()), permits, conflicts: AtomicU32::new(0) }
+        Pool { config, tls: OnceLock::new(), idle: Mutex::new(Vec::new()), permits, conflicts: AtomicU32::new(0) }
     }
 
     /// Notes how a transaction's first run beside other writers ended.
@@ -414,8 +435,20 @@ impl Pool {
             }
             return Ok(PooledConn { conn: Some(conn), pool: self.clone(), _permit: permit, held: false });
         }
-        let conn = Conn::open(&self.config).await?;
+        let conn = Conn::open(&self.config, self.connector()?).await?;
         Ok(PooledConn { conn: Some(conn), pool: self.clone(), _permit: permit, held: false })
+    }
+
+    fn connector(&self) -> DbResult<Option<&Connector>> {
+        let Some(tls) = &self.config.tls else { return Ok(None) };
+        if self.config.socket.is_some() {
+            return Err(DbError::invalid("a Unix domain socket is not encrypted: configure a socket or TLS, not both"));
+        }
+        if let Some(connector) = self.tls.get() {
+            return Ok(Some(connector));
+        }
+        let connector = Connector::new(&self.config, tls)?;
+        Ok(Some(self.tls.get_or_init(|| connector)))
     }
 
     /// Closes the idle connections. Ones in use close when released.

@@ -29,8 +29,8 @@ clients in `clients/` greet with version 2.
 ## The connection
 
 A client opens a TCP connection to the server (port 5454 unless
-configured otherwise). Nothing is encrypted and nothing is negotiated:
-the server is meant for a private network.
+configured otherwise), in the clear or under TLS (see "TLS" below).
+Nothing else is negotiated.
 
 Each side sends **frames**:
 
@@ -56,6 +56,38 @@ with one result for each of its statements (see "Batches").
 A request the server cannot decode is answered with an `Error` of code
 `InvalidRequest`, and the connection carries on. An `Error` is always an
 answer, never the end of the connection, except in the greeting.
+
+### TLS
+
+A server that was given a certificate serves TLS 1.3 on the same port.
+TLS is beneath the protocol: a client that uses it makes the TLS
+handshake as the first thing on the TCP connection, and then sends and
+reads the same frames, inside it. There is no request that asks for TLS
+and no upgrade of a connection that began in the clear.
+
+The server tells the two kinds of connection apart by the first three
+bytes: `16 03` and a third byte that is not zero begin a TLS handshake.
+A greeting in the clear cannot begin so, since the third byte of its
+frame's length is zero (a greeting is at most 16,384 bytes).
+
+- The server shows one certificate and asks the client for none. A
+  client must verify the certificate and the name it is for before it
+  sends its greeting: the greeting carries the password.
+- The server speaks TLS 1.3 only. A client that offers nothing newer
+  than 1.2 fails the handshake.
+- A server may require TLS. It then reads a greeting that came in the
+  clear, answers it with an `Error` of code `AccessDenied` whose message
+  names TLS, and closes the connection. It does this whatever the
+  greeting says, without looking at the password, which has crossed the
+  network in the clear all the same.
+- A client that starts a TLS handshake with a server that has no
+  certificate is taken for a frame larger than a greeting may be: the
+  server closes the connection without an answer.
+- TLS is for TCP. A client connected through the server's Unix domain
+  socket, where there is one, sends its frames as they are.
+
+Nothing about TLS depends on the protocol version, and nothing in the
+greeting says whether it is in use.
 
 ## How things are written
 
@@ -126,8 +158,9 @@ Hello: version u32, server str        the server's own version, 5, whatever the 
 or with an `Error` response, after which it closes the connection:
 `ProtocolMismatch` if the client's version is below 2 or above 5
 (see "Versions"), `AccessDenied` if the database does not exist or the
-password is wrong (the two are not told apart), `InvalidRequest` if the
-first frame was not a `Hello`.
+password is wrong (the two are not told apart), or if the greeting came
+in the clear to a server that requires TLS (see "TLS"), `InvalidRequest`
+if the first frame was not a `Hello`.
 
 ## Requests
 

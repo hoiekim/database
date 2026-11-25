@@ -1,7 +1,7 @@
 # The TypeScript client
 
 A client for the database server on Node's standard library alone
-(`node:net`): no runtime dependency. Node 20 or later; an ES module.
+(`node:net`, `node:tls`): no runtime dependency. Node 20 or later; an ES module.
 
 ```ts
 import { Client, ColumnDef, IndexDef, KeyRange, Query, TableDef, Type, Update, col, count } from "database-client";
@@ -123,6 +123,39 @@ object lists keys that look like array indices first, in numeric order:
 the stored order matters, read the column as text,
 `col("detail").cast(Type.Text)`, which gives the JSON as stored.
 
+## TLS
+
+Without a setting a connection is in the clear, the password included,
+which is right only on a network nobody else can listen on; a server
+started with a certificate refuses such a connection unless it was told
+`DATABASE_TLS=optional`. The settings go in the URL, or in the `tls` of
+a `Config`:
+
+```ts
+// The server's certificate must be signed by an authority in this file, and by no other.
+await Client.connect("database://shop:secret@database:5454?tls_ca=%2Fetc%2Fdatabase%2Fca.pem");
+// Reached by an address, or by a name the certificate does not carry.
+await Client.connect({ ...config("10.0.0.5", 5454, "shop", "secret"), tls: { ca: "/etc/database/ca.pem", name: "database.example.com" } });
+// Signed by a public authority.
+await Client.connect("database://shop:secret@database.example.com?tls=on");
+```
+
+| URL | `Config.tls` | |
+|---|---|---|
+| `tls=on` | `{}` | TLS, the server verified against the authorities Node trusts: its own list, with what `NODE_EXTRA_CA_CERTS` adds |
+| `tls_ca=<file>` | `{ ca }` | verified against the authorities in that PEM file, and no other |
+| `tls_name=<name>` | `{ name }` | the name or address the certificate must be for, where that is not the host |
+| `tls=off` | absent | in the clear: the default |
+
+`tls_ca` and `tls_name` turn TLS on by themselves, and `tls=off` beside
+either is an invalid URL. A client that asks for TLS always verifies the
+certificate and the name it is for: there is no setting that encrypts
+without verifying, and no falling back to a connection in the clear. A
+server that cannot be verified, or that serves no TLS, rejects with a
+`DbError` of code `Connection` before the password is sent. Only
+TLS 1.3 is spoken. The Rust client's `tls_cert`, which takes one exact
+certificate for the server's, is not here.
+
 ## Errors
 
 Everything the server refuses rejects with a `DbError`: `code` (an
@@ -163,4 +196,6 @@ npm test
 - `test/builders.test.ts`: the builders say what the Rust builders say.
 - `test/values.test.ts`: JavaScript values, URLs and rows, without a server.
 - `test/integration.test.ts`: every kind of request against a real
-  server. Skipped if no server binary is found; `DATABASE_BIN` names one.
+  server, in the clear and under TLS with the certificates of
+  `protocol/fixtures/tls`. Skipped if no server binary is found;
+  `DATABASE_BIN` names one.

@@ -74,7 +74,7 @@ export type { Arg } from "./builders.js";
 export { Admin, Client, Db, LockGuard, Row, Rows, Transaction } from "./client.js";
 export { MAX_FRAME, PROTOCOL_VERSION } from "./codec.js";
 export { DEFAULT_PORT, config, configFromUrl } from "./conn.js";
-export type { Config } from "./conn.js";
+export type { Config, Tls } from "./conn.js";
 export { DbError, ErrorCode, errorCodeName } from "./errors.js";
 export type { ErrorCodeName } from "./errors.js";
 export { CalendarDate, Decimal, Float, Json, Timestamp, Uuid, float, fromWire, json, toWire } from "./values.js";

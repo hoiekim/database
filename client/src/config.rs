@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use database_protocol::error::{DbError, DbResult};
 
+use crate::tls::{Tls, Trust};
+
 pub const DEFAULT_PORT: u16 = 5454;
 
 #[derive(Clone, Debug)]
@@ -16,6 +18,13 @@ pub struct Config {
     /// used: for a client on the server's own host, where it saves each
     /// request the trip through the network stack.
     pub socket: Option<PathBuf>,
+    /// Whether connections over TCP are encrypted, and how the server is
+    /// then known to be the server. `None` sends everything in the clear,
+    /// the password included, which is right only on a network nobody
+    /// else can listen on. A server may refuse such a connection (its
+    /// `DATABASE_TLS`). A Unix domain socket is never encrypted, so a
+    /// configuration with both this and `socket` is refused.
+    pub tls: Option<Tls>,
     /// Empty for a connection that only administers the server.
     pub database: String,
     pub password: String,
@@ -47,6 +56,7 @@ impl Config {
             host: host.to_string(),
             port,
             socket: None,
+            tls: None,
             database: database.to_string(),
             password: password.to_string(),
             pool_size: 8,
@@ -70,8 +80,14 @@ impl Config {
     /// with optional `?pool=8&connect_timeout=10&statement_timeout=60&lock_wait=30&name=app`
     /// (times in seconds), `&socket=/run/database/database.sock` to
     /// connect through the server's Unix domain socket instead of the
-    /// host and port, and `&optimistic_runs=1` (see the field). The
-    /// database may be named before the password or as the path; an
+    /// host and port, and `&optimistic_runs=1` (see the field). `&tls=on`
+    /// encrypts the connection and verifies the server against the
+    /// system's certificate authorities; `&tls_ca=<file>` against the
+    /// authorities in that file instead; `&tls_cert=<file>` by its being
+    /// exactly that certificate; `&tls_name=<name>` names what the
+    /// certificate must be for, where that is not the host. Each of the
+    /// last three turns TLS on by itself, and `&tls=off` is the default:
+    /// see `Config::tls`. The database may be named before the password or as the path; an
     /// administrator's URL names none. Percent-encoding is decoded in
     /// every part.
     pub fn from_url(url: &str) -> DbResult<Config> {
@@ -90,6 +106,7 @@ impl Config {
         }
         let database = if path.is_empty() { user } else { path };
         let mut config = Config::new(host, port, &decode(database)?, &decode(password)?);
+        let (mut on, mut trust, mut name) = (None, None, None);
         for pair in query.split('&').filter(|p| !p.is_empty()) {
             let (key, value) = pair.split_once('=').ok_or_else(|| bad("a setting without a value"))?;
             let value = decode(value)?;
@@ -107,8 +124,38 @@ impl Config {
                     config.socket = Some(PathBuf::from(value));
                 }
                 "name" => config.name = value,
+                "tls" => {
+                    on = Some(match value.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(bad("tls must be on or off")),
+                    })
+                }
+                "tls_ca" | "tls_cert" => {
+                    if value.is_empty() || trust.is_some() {
+                        return Err(bad("one of tls_ca and tls_cert, which must be a path"));
+                    }
+                    trust = Some(if key == "tls_ca" { Trust::Authority(PathBuf::from(value)) } else { Trust::Certificate(PathBuf::from(value)) });
+                }
+                "tls_name" => {
+                    if value.is_empty() {
+                        return Err(bad("tls_name must be a name"));
+                    }
+                    name = Some(value);
+                }
                 _ => return Err(bad("an unknown setting")),
             }
+        }
+        // A setting that says how to verify the server is not one to
+        // drop quietly: with `tls=off` beside it, the URL contradicts
+        // itself.
+        match (on, trust.is_some() || name.is_some()) {
+            (Some(false), true) => return Err(bad("tls=off beside a setting that only TLS uses")),
+            (Some(true), _) | (None, true) => config.tls = Some(Tls { trust: trust.unwrap_or(Trust::System), name }),
+            _ => {}
+        }
+        if config.tls.is_some() && config.socket.is_some() {
+            return Err(bad("a Unix domain socket is not encrypted: give socket or TLS, not both"));
         }
         Ok(config)
     }
@@ -151,6 +198,18 @@ mod tests {
         let local = Config::from_url("database://shop:pw@localhost?socket=%2Frun%2Fdatabase%2Fdatabase.sock&optimistic_runs=1").unwrap();
         assert_eq!(local.socket.as_deref(), Some(std::path::Path::new("/run/database/database.sock")));
         assert_eq!((local.optimistic_runs, local.address().as_str()), (1, "/run/database/database.sock"));
+
+        let plain = Config::from_url("database://shop:pw@db?tls=off").unwrap();
+        assert_eq!(plain.tls, None);
+        let system = Config::from_url("database://shop:pw@db?tls=on").unwrap();
+        assert_eq!(system.tls, Some(Tls::system()));
+        let authority = Config::from_url("database://shop:pw@10.0.0.5?tls_ca=%2Fetc%2Fdatabase%2Fca.pem&tls_name=db.example.com").unwrap();
+        assert_eq!(authority.tls, Some(Tls::authority("/etc/database/ca.pem").name("db.example.com")));
+        let exactly = Config::from_url("database://shop:pw@db?tls=on&tls_cert=server.pem").unwrap();
+        assert_eq!(exactly.tls, Some(Tls::certificate("server.pem")));
+        for bad in ["database://a:b@h/d?tls=yes", "database://a:b@h/d?tls=off&tls_ca=ca.pem", "database://a:b@h/d?tls=off&tls_name=db", "database://a:b@h/d?tls_ca=", "database://a:b@h/d?tls_ca=a&tls_cert=b", "database://a:b@h/d?tls_name=", "database://a:b@h/d?tls=on&socket=%2Frun%2Fdb.sock"] {
+            assert!(Config::from_url(bad).is_err(), "{bad}");
+        }
 
         for bad in ["database://a:b@h/d?statement_timeout=-1", "database://a:b@h/d?lock_wait=NaN", "database://a:b@h/d?connect_timeout=1e400", "postgres://a:b@h/d", "database://nohost", "database://a:b@:1/d", "database://a:b@h:x/d", "database://a:b@h/d?pool=0", "database://a:b@h/d?what=1", "database://a:%zz@h/d", "database://a:b@h/d?socket=", "database://a:b@h/d?optimistic_runs=two"] {
             assert!(Config::from_url(bad).is_err(), "{bad}");

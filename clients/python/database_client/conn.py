@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -45,6 +46,43 @@ def _decode(text: str) -> str:
 
 
 @dataclass
+class Tls:
+    """How a client that connects over TLS knows the server. A client that
+    asks for TLS always verifies whom it reached: there is no setting that
+    encrypts without verifying, and none that falls back to an open
+    connection, since either would let whoever sits between the two hosts
+    read the password."""
+
+    #: A file of PEM certificates: the authorities whose word is taken for
+    #: the server's certificate, and no other. ``None`` for the
+    #: authorities this system trusts.
+    ca: Optional[str] = None
+    #: The name the certificate must be for. ``None`` for the host the
+    #: client connects to; set when that is not a name the certificate
+    #: carries (an address, or a name that only resolves inside a
+    #: container network).
+    name: Optional[str] = None
+
+    def context(self) -> ssl.SSLContext:
+        """What a client's connections are verified against: made once
+        for the client, so the authorities are read once."""
+        try:
+            # This kind of context verifies the certificate and its name,
+            # and trusts no authority until it is given one.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            # The server speaks TLS 1.3 and nothing older.
+            context.minimum_version = ssl.TLSVersion.TLSv1_3
+            if self.ca is None:
+                context.load_default_certs()
+            else:
+                context.load_verify_locations(cafile=self.ca)
+        except (OSError, ValueError) as e:
+            where = "" if self.ca is None else f"{self.ca}: "
+            raise DbError(ErrorCode.CONNECTION, f"TLS cannot be set up: {where}{e}") from None
+        return context
+
+
+@dataclass
 class Config:
     """Where the server is and how to talk to it. Times are in seconds."""
 
@@ -65,15 +103,27 @@ class Config:
     lock_wait: float = 30.0
     #: Sent to the server in the greeting.
     name: str = ""
+    #: Whether connections are encrypted, and how the server is then
+    #: known to be the server. ``None`` sends everything in the clear, the
+    #: password included, which is right only on a network nobody else
+    #: can listen on. A server may refuse such a connection (its
+    #: ``DATABASE_TLS``).
+    tls: Optional[Tls] = None
 
     @staticmethod
     def from_url(url: str) -> "Config":
         """Reads ``database://<database>:<password>@<host>[:<port>][/<database>]``
         with optional ``?pool=8&connect_timeout=10&statement_timeout=60&lock_wait=30&name=app``
-        (times in seconds). The database may be named before the password
-        or as the path; an administrator's URL names none
-        (``database://<password>@<host>``). Percent-encoding is decoded in
-        the database, the password and the settings."""
+        (times in seconds). ``&tls=on`` encrypts the connection and
+        verifies the server against the system's certificate authorities;
+        ``&tls_ca=<file>`` against the authorities in that file instead;
+        ``&tls_name=<name>`` names what the certificate must be for, where
+        that is not the host. Each of the last two turns TLS on by itself,
+        and ``&tls=off`` is the default: see ``Config.tls``. The database
+        may be named before the password or as the path; an
+        administrator's URL names none (``database://<password>@<host>``).
+        Percent-encoding is decoded in the database, the password and the
+        settings."""
 
         def bad(why: str) -> DbError:
             return DbError(ErrorCode.INVALID_REQUEST, f"invalid database URL: {why}")
@@ -99,6 +149,8 @@ class Config:
         if not host:
             raise bad("no host")
         config = Config(host, port, _decode(path if path else user), _decode(password))
+        on: Optional[bool] = None
+        how = Tls()
         for pair in filter(None, query.split("&")):
             key, eq, raw = pair.partition("=")
             if not eq:
@@ -127,15 +179,58 @@ class Config:
                 config.lock_wait = seconds()
             elif key == "name":
                 config.name = value
+            elif key == "tls":
+                if value not in ("on", "off"):
+                    raise bad("tls must be on or off")
+                on = value == "on"
+            elif key == "tls_ca":
+                if not value:
+                    raise bad("tls_ca must be a path")
+                how.ca = value
+            elif key == "tls_name":
+                if not value:
+                    raise bad("tls_name must be a name")
+                how.name = value
             else:
                 raise bad("an unknown setting")
+        # A setting that says how to verify the server is not one to drop
+        # quietly: with ``tls=off`` beside it, the URL contradicts itself.
+        verifies = how.ca is not None or how.name is not None
+        if on is False and verifies:
+            raise bad("tls=off beside a setting that only TLS uses")
+        if on or verifies:
+            config.tls = how
         return config
+
+
+def _secure(sock: socket.socket, context: ssl.SSLContext, name: str, where: str) -> ssl.SSLSocket:
+    """The handshake, over a connection just opened. Returns once the
+    server's certificate and its name are verified; ``name`` is a name or
+    an address."""
+
+    def failed(why: object) -> DbError:
+        return DbError(ErrorCode.CONNECTION, f"the TLS handshake with the database at {where} failed: {why}")
+
+    try:
+        return context.wrap_socket(sock, server_hostname=name)
+    except socket.timeout:
+        raise failed("no answer in time") from None
+    except ssl.SSLCertVerificationError as e:
+        raise failed(e.verify_message or e) from None
+    except (ConnectionError, ssl.SSLEOFError) as e:
+        # A server that does not serve TLS takes the handshake for a
+        # frame too large to be a greeting, and closes.
+        raise failed(f"{e}: the server closed the connection, as one that does not serve TLS does") from None
+    except (OSError, ValueError) as e:
+        raise failed(e) from None
 
 
 class Conn:
     """One connection: a socket that carries one request at a time."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, context: Optional[ssl.SSLContext] = None) -> None:
+        """``context`` is what ``config.tls.context()`` made, for a caller
+        that opens more than one connection."""
         self.statement_timeout_ms = int(config.statement_timeout * 1000)
         # The server enforces the statement's deadline and answers with
         # an error; this outer limit only catches a server gone silent.
@@ -146,9 +241,13 @@ class Conn:
         self.broken = False
         self.last_used = time.monotonic()
         where = f"{config.host}:{config.port}"
+        host = config.host.strip("[]")
+        if config.tls is not None and context is None:
+            context = config.tls.context()
+        self.sock: socket.socket
         try:
             # A connect that has not succeeded within a day is not going to.
-            self.sock = socket.create_connection((config.host.strip("[]"), config.port), timeout=min(config.connect_timeout, _LONGEST_WAIT))
+            self.sock = socket.create_connection((host, config.port), timeout=min(config.connect_timeout, _LONGEST_WAIT))
         except socket.timeout:
             raise DbError(ErrorCode.CONNECTION, f"timed out connecting to the database at {where}") from None
         except OSError as e:
@@ -157,6 +256,10 @@ class Conn:
             # Requests are small and each waits for its answer: never
             # delay one to batch it with the next.
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if config.tls is not None and context is not None:
+                # Nothing is sent before the server is known to be the
+                # server: the greeting carries the password.
+                self.sock = _secure(self.sock, context, config.tls.name or host, where)
             hello = codec.request(codec.HELLO, codec.PROTOCOL_VERSION, config.database, config.password, config.name)
             answer = self._exchange(hello, time.monotonic() + config.connect_timeout)
             if answer.kind != codec.R_HELLO:
@@ -292,6 +395,7 @@ class Pool:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._idle: List[Conn] = []
+        self._context: Optional[ssl.SSLContext] = None
         # Reentrant: a forgotten lease is given back by its finalizer,
         # which the garbage collector may run on a thread that is inside
         # the pool already, holding this lock.
@@ -317,7 +421,9 @@ class Pool:
                     conn = self._idle.pop() if self._idle else None
                     generation = self._generation
                 if conn is None:
-                    return Lease(self, Conn(self.config), generation)
+                    if self.config.tls is not None and self._context is None:
+                        self._context = self.config.tls.context()
+                    return Lease(self, Conn(self.config, self._context), generation)
                 if time.monotonic() - conn.last_used > _IDLE_CHECK_SECONDS:
                     try:
                         conn.call(codec.request(codec.PING))

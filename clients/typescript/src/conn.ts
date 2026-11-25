@@ -1,6 +1,8 @@
 // Where the server is, one connection to it, and the pool that shares a few.
 
+import { readFileSync } from "node:fs";
 import * as net from "node:net";
+import * as tls from "node:tls";
 
 import type * as ast from "./ast.js";
 import { MAX_FRAME, PROTOCOL_VERSION, ProtocolError, decodeResponse, encodeRequest } from "./codec.js";
@@ -26,10 +28,40 @@ function lost(what: unknown): DbError {
   return new DbError(ErrorCode.Connection, `connection to the database lost: ${what instanceof Error ? what.message : String(what)}`);
 }
 
+/**
+ * How a client that connects over TLS knows the server. A client that
+ * asks for TLS always verifies whom it reached: there is no setting that
+ * encrypts without verifying, and none that falls back to an open
+ * connection, since either would let whoever sits between the two hosts
+ * read the password.
+ */
+export interface Tls {
+  /**
+   * A file of PEM certificates: the authorities whose word is taken for
+   * the server's certificate, and no other. Without it, the authorities
+   * Node trusts.
+   */
+  ca?: string;
+  /**
+   * The name the certificate must be for. Without it, the host the
+   * client connects to; set when that is not a name the certificate
+   * carries (an address, or a name that only resolves inside a container
+   * network).
+   */
+  name?: string;
+}
+
 /** Where the server is and how to talk to it. Times are in seconds. */
 export interface Config {
   host: string;
   port: number;
+  /**
+   * Whether connections are encrypted, and how the server is then known
+   * to be the server. Without it everything is sent in the clear, the
+   * password included, which is right only on a network nobody else can
+   * listen on. A server may refuse such a connection (its `DATABASE_TLS`).
+   */
+  tls?: Tls;
   /** Empty for a connection that only administers the server. */
   database: string;
   password: string;
@@ -64,10 +96,15 @@ function decode(text: string): string {
 /**
  * Reads `database://<database>:<password>@<host>[:<port>][/<database>]`
  * with optional `?pool=8&connect_timeout=10&statement_timeout=60&lock_wait=30&name=app`
- * (times in seconds). The database may be named before the password or
- * as the path; an administrator's URL names none
- * (`database://<password>@<host>`). Percent-encoding is decoded in the
- * database, the password and the settings.
+ * (times in seconds). `&tls=on` encrypts the connection and verifies the
+ * server against the authorities Node trusts; `&tls_ca=<file>` against
+ * the authorities in that file instead; `&tls_name=<name>` names what the
+ * certificate must be for, where that is not the host. Each of the last
+ * two turns TLS on by itself, and `&tls=off` is the default: see
+ * `Config.tls`. The database may be named before the password or as the
+ * path; an administrator's URL names none (`database://<password>@<host>`).
+ * Percent-encoding is decoded in the database, the password and the
+ * settings.
  */
 export function configFromUrl(url: string): Config {
   const prefix = "database://";
@@ -97,6 +134,8 @@ export function configFromUrl(url: string): Config {
   }
   if (host === "") throw bad("no host");
   const out = config(host, port, decode(path === "" ? user : path), decode(password));
+  let on: boolean | null = null;
+  const how: Tls = {};
   for (const pair of query.split("&")) {
     if (pair === "") continue;
     const eq = pair.indexOf("=");
@@ -125,11 +164,86 @@ export function configFromUrl(url: string): Config {
       case "name":
         out.name = value;
         break;
+      case "tls":
+        if (value !== "on" && value !== "off") throw bad("tls must be on or off");
+        on = value === "on";
+        break;
+      case "tls_ca":
+        if (value === "") throw bad("tls_ca must be a path");
+        how.ca = value;
+        break;
+      case "tls_name":
+        if (value === "") throw bad("tls_name must be a name");
+        how.name = value;
+        break;
       default:
         throw bad("an unknown setting");
     }
   }
+  // A setting that says how to verify the server is not one to drop
+  // quietly: with `tls=off` beside it, the URL contradicts itself.
+  const verifies = how.ca !== undefined || how.name !== undefined;
+  if (on === false && verifies) throw bad("tls=off beside a setting that only TLS uses");
+  if (on === true || verifies) out.tls = how;
   return out;
+}
+
+/**
+ * What a client's connections are verified against when it asks for TLS:
+ * made once for the client, so the authorities are read once. The server
+ * speaks TLS 1.3 and nothing older.
+ */
+export function tlsContext(how: Tls): tls.SecureContext {
+  const invalid = (what: string): DbError => new DbError(ErrorCode.Connection, `TLS cannot be set up: ${what}`);
+  try {
+    if (how.ca === undefined) return tls.createSecureContext({ minVersion: "TLSv1.3" });
+    const ca = readFileSync(how.ca);
+    // Node takes a file without a certificate for no authorities at all,
+    // and every handshake then fails without a word about the file.
+    if (!ca.includes("-----BEGIN CERTIFICATE-----")) throw invalid(`${how.ca} holds no certificate`);
+    // Authorities given here replace the ones Node trusts.
+    return tls.createSecureContext({ minVersion: "TLSv1.3", ca });
+  } catch (e) {
+    throw e instanceof DbError ? e : invalid(e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** The handshake, over a connection just opened. Resolves once the server's certificate and its name are verified. */
+function secure(socket: net.Socket, config: Config, how: Tls, context: tls.SecureContext): Promise<tls.TLSSocket> {
+  const where = `${config.host}:${config.port}`;
+  const name = how.name ?? config.host.replace(/^\[|\]$/g, "");
+  const failed = (why: string): DbError => new DbError(ErrorCode.Connection, `the TLS handshake with the database at ${where} failed: ${why}`);
+  return new Promise<tls.TLSSocket>((resolve, reject) => {
+    // The certificate is checked against `host`, a name or an address;
+    // only a name may be sent to the server as the one asked for.
+    const secured = tls.connect({ socket, secureContext: context, host: name, ...(net.isIP(name) ? {} : { servername: name }), rejectUnauthorized: true });
+    const settle = (): void => {
+      clearTimeout(timer);
+      secured.off("secureConnect", verified);
+      secured.off("error", refused);
+      secured.off("close", closed);
+    };
+    const fail = (why: string): void => {
+      settle();
+      // The socket may yet report an error of its own.
+      secured.on("error", () => {});
+      secured.destroy();
+      reject(failed(why));
+    };
+    const verified = (): void => {
+      settle();
+      resolve(secured);
+    };
+    // A server that does not serve TLS takes the handshake for a frame
+    // too large to be a greeting, and closes.
+    const hint = "the server closed the connection, as one that does not serve TLS does";
+    const refused = (e: NodeJS.ErrnoException): void => fail(e.code === "ECONNRESET" ? `${e.message}: ${hint}` : e.message);
+    const closed = (): void => fail(hint);
+    const timer = setTimeout(() => fail("no answer in time"), Math.min(config.connectTimeout * 1000, LONGEST_TIMER_MS));
+    secured.once("secureConnect", verified);
+    secured.once("error", refused);
+    secured.once("close", closed);
+  });
 }
 
 /** One connection: a socket that carries one request at a time. */
@@ -168,9 +282,11 @@ export class Conn {
     socket.on("close", () => this.fail(lost("the server closed the connection")));
   }
 
-  static async open(config: Config): Promise<Conn> {
+  /** `context` is what `tlsContext` made of `config.tls`, for a caller that opens more than one connection. */
+  static async open(config: Config, context?: tls.SecureContext): Promise<Conn> {
     const where = `${config.host}:${config.port}`;
-    const socket = await new Promise<net.Socket>((resolve, reject) => {
+    if (config.tls) context ??= tlsContext(config.tls);
+    const plain = await new Promise<net.Socket>((resolve, reject) => {
       const socket = net.connect({ host: config.host.replace(/^\[|\]$/g, ""), port: config.port });
       const timer = setTimeout(() => {
         socket.destroy();
@@ -188,7 +304,10 @@ export class Conn {
     });
     // Requests are small and each waits for its answer: never delay one
     // to batch it with the next.
-    socket.setNoDelay(true);
+    plain.setNoDelay(true);
+    // Nothing is sent before the server is known to be the server: the
+    // greeting carries the password.
+    const socket = config.tls ? await secure(plain, config, config.tls, context!) : plain;
     const conn = new Conn(socket, config);
     try {
       const hello: ast.Request = { kind: "hello", version: PROTOCOL_VERSION, database: config.database, password: config.password, client: config.name };
@@ -350,6 +469,7 @@ export class Pool {
   /** Counts the calls of `clear`: a connection leased before one is closed when it comes back. */
   private generation = 0;
   private readonly waiters: (() => void)[] = [];
+  private context: tls.SecureContext | undefined;
 
   constructor(readonly config: Config) {
     this.free = Math.max(1, config.poolSize);
@@ -363,7 +483,8 @@ export class Pool {
         const conn = this.idle.pop();
         if (!conn) {
           const generation = this.generation;
-          return new Lease(this, await Conn.open(this.config), generation);
+          if (this.config.tls) this.context ??= tlsContext(this.config.tls);
+          return new Lease(this, await Conn.open(this.config, this.context), generation);
         }
         // The server closed it while it waited (a restart, say).
         if (conn.broken) {

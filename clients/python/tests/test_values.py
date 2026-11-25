@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from database_client import Config, Date, DbError, ErrorCode, Json, Rows, Timestamp, ast, codec
+from database_client import Config, Date, DbError, ErrorCode, Json, Rows, Timestamp, Tls, ast, codec
 from database_client import conn as connection
 
 
@@ -154,7 +154,7 @@ class ValueMapping(unittest.TestCase):
 class FakeConn:
     """Stands in for a connection where only the pool's bookkeeping is tested."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, context: object = None) -> None:
         self.broken = False
         self.closed = False
 
@@ -200,6 +200,12 @@ class Urls(unittest.TestCase):
         self.assertEqual((admin.database, admin.password), ("", "adminpw"))
         c = Config.from_url("database://d:a%3Ab%40c@h?connect_timeout=2&lock_wait=0.25")
         self.assertEqual((c.password, c.connect_timeout, c.lock_wait), ("a:b@c", 2.0, 0.25))
+        self.assertIsNone(c.tls)
+        self.assertIsNone(Config.from_url("database://shop:pw@db?tls=off").tls)
+        self.assertEqual(Config.from_url("database://shop:pw@db?tls=on").tls, Tls())
+        authority = Config.from_url("database://shop:pw@10.0.0.5?tls_ca=%2Fetc%2Fdatabase%2Fca.pem&tls_name=db.example.com")
+        self.assertEqual(authority.tls, Tls(ca="/etc/database/ca.pem", name="db.example.com"))
+        self.assertEqual(Config.from_url("database://shop:pw@db?tls_name=db.example.com&tls=on").tls, Tls(name="db.example.com"))
         for bad in [
             "database://a:b@h/d?statement_timeout=-1",
             "database://a:b@h/d?lock_wait=NaN",
@@ -212,6 +218,13 @@ class Urls(unittest.TestCase):
             "database://a:b@h/d?what=1",
             "database://a:%zz@h/d",
             "database://a:b@h/d?name",
+            "database://a:b@h/d?tls=yes",
+            "database://a:b@h/d?tls=",
+            "database://a:b@h/d?tls=off&tls_ca=ca.pem",
+            "database://a:b@h/d?tls_name=db&tls=off",
+            "database://a:b@h/d?tls_ca=",
+            "database://a:b@h/d?tls_name=",
+            "database://a:b@h/d?tls_cert=server.pem",
         ]:
             with self.assertRaises(DbError, msg=bad) as caught:
                 Config.from_url(bad)

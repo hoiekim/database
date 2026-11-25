@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "The Python client for the database server"
 readme = "README.md"
 requires-python = ">=3.9"
-# The standard library only: sockets, struct, json, decimal, uuid.
+# The standard library only: sockets, ssl, struct, json, decimal, uuid.
 dependencies = []
 
 [tool.setuptools]

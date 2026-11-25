@@ -17,8 +17,8 @@ bench/      the same workloads against this and against Postgres
 ```
 
 An application holds a `Client`. A request is a Rust value (`Query`, `Insert`,
-`TableDef`, ..) encoded into one frame and sent over TCP, or over a Unix
-domain socket to a server on the same host. The server decodes it and
+`TableDef`, ..) encoded into one frame and sent over TCP, in the clear
+or under TLS, or over a Unix domain socket to a server on the same host. The server decodes it and
 calls the engine, which runs it against one database's files and returns
 rows.
 
@@ -555,9 +555,53 @@ the connection keeps of a step.
 
 A connection says which database it wants and proves it with that
 database's password (stored as a salted hash; the admin password comes
-from the environment and may do anything). The protocol is not
-encrypted: the server is meant for a private network, such as the one
-between an application's containers.
+from the environment and may do anything).
+
+**TLS is below the protocol** (`server/src/tls.rs`, `client/src/tls.rs`).
+Given a certificate and its key, the server serves TLS 1.3 on its TCP
+port; the frames inside are the same frames, and the session is written
+over any pair of byte streams, so nothing above the listener knows.
+The choices, and why:
+
+- **One port.** A connection's first three bytes say what it is: a TLS
+  handshake begins `16 03` and a third byte that is not zero, and a
+  greeting in the clear begins with its length, under 16,384, whose
+  third byte is zero. So a server that still takes both needs no second
+  port, and one that requires TLS can read a greeting that came in the
+  clear and answer it with the reason, where a failed handshake would
+  show an old client only a closed connection. It reads the greeting
+  and does not look inside: no password is compared. The server never
+  asks twice whether more bytes have come: it waits for the first, and
+  only if that is `16` reads the other two, to be read again by whoever
+  then serves the connection. A connection that sends less than it
+  takes to tell costs a waiting task until its ten seconds are over,
+  and no processor time.
+- **Required unless told otherwise.** With a certificate, TCP in the
+  clear is refused. `DATABASE_TLS=optional` serves both, for the days
+  in which clients are moved over. A server with no certificate is as
+  it always was.
+- **The files are read again when they change.** Their time and length
+  are looked at when a connection arrives, at most once a second, and
+  a change has them read again. A pair that cannot be used (unreadable,
+  or a certificate with the other's key, which is what half a renewal
+  looks like) leaves the server on the one it has, with a line in its
+  log. Connections already open keep the session they made.
+- **A client verifies, always.** By the system's authorities, by a
+  file of them, or by the certificate being the one in a file it
+  holds. That last way takes no authority's word and compares no name:
+  it is how the server's own commands know the server beside them, from
+  the file it was started with, whatever name that certificate is for.
+- **TLS 1.3 alone, rustls, `ring`.** rustls is the one dependency this
+  took; it is built without TLS 1.2, which no client here needs, and
+  with `ring` for its ciphers, the smaller of the two libraries it can
+  use. What that costs is in `PERFORMANCE.md`, "What TLS costs". The
+  plain listener and the Unix socket take none of the cost: their
+  connections never enter this code.
+
+The session's two halves of a TLS stream share it through a lock, which
+nothing contends for: a connection reads a request and then writes its
+answer. A response is flushed after it is written, since TLS may hold
+the end of a frame in its own buffer; on a socket the flush is nothing.
 
 Given a path, the server also listens on a **Unix domain socket**
 there. A connection is served the same whichever way it came (the

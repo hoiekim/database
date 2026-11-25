@@ -22,20 +22,24 @@
 //! | `DATABASE_DATA` | `./data` | where the files live |
 //! | `DATABASE_LISTEN` | `0.0.0.0:5454` | address to listen on |
 //! | `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well, for clients on the same host |
+//! | `DATABASE_TLS_CERT`, `DATABASE_TLS_KEY` | (none) | PEM files: a certificate and its key, to serve TLS with on the TCP port |
+//! | `DATABASE_TLS` | `required` | with a certificate: `required` refuses TCP connections in the clear, `optional` serves them too |
 //! | `DATABASE_CACHE_MB` | `32` | memory for cached pages |
 //! | `DATABASE_SLOW_MS` | (none) | log statements that take this many milliseconds or more, with what they read |
 //!
 //! The other commands connect to `DATABASE_HOST` (default `127.0.0.1`) on
 //! the port of `DATABASE_LISTEN`, or through `DATABASE_SOCKET` if that is
 //! set, with `DATABASE_ADMIN_PASSWORD`: run inside the server's container,
-//! they need nothing else.
+//! they need nothing else. Where `DATABASE_TLS_CERT` is set and no socket
+//! is, they connect under TLS and take for the server whoever presents
+//! exactly that certificate.
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use database_client::{Client, Config, DbError, DEFAULT_PORT};
-use database_server::{Server, ServerConfig};
+use database_client::{Client, Config, DbError, Tls, DEFAULT_PORT};
+use database_server::{Server, ServerConfig, TlsConfig};
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -54,6 +58,11 @@ async fn admin() -> Result<Client, String> {
     let host = env("DATABASE_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
     let mut config = Config::new(&host, listen_address()?.port(), "", &admin_password()?);
     config.socket = env("DATABASE_SOCKET").map(Into::into);
+    // The server beside this command shows the certificate of this file,
+    // whatever name it is for: the file itself is how it is known.
+    if config.socket.is_none() {
+        config.tls = env("DATABASE_TLS_CERT").map(Tls::certificate);
+    }
     config.name = "database-cli".to_string();
     config.pool_size = 1;
     // A dump or a restore of everything takes as long as it takes.
@@ -65,21 +74,44 @@ fn text(e: DbError) -> String {
     e.to_string()
 }
 
+/// The certificate to serve TLS with, from the environment. A setting
+/// that asks for TLS without the means for it stops the start: a server
+/// that came up in the clear instead would not be the one asked for.
+fn tls() -> Result<Option<TlsConfig>, String> {
+    let plain = match env("DATABASE_TLS").as_deref() {
+        None | Some("required") => false,
+        Some("optional") => true,
+        Some(other) => return Err(format!("DATABASE_TLS is required or optional, not {other}")),
+    };
+    match (env("DATABASE_TLS_CERT"), env("DATABASE_TLS_KEY")) {
+        (Some(certificate), Some(key)) => Ok(Some(TlsConfig { certificate: certificate.into(), key: key.into(), plain })),
+        (None, None) if env("DATABASE_TLS").is_none() => Ok(None),
+        (None, None) => Err("DATABASE_TLS is set, but there is no certificate: set DATABASE_TLS_CERT and DATABASE_TLS_KEY".to_string()),
+        _ => Err("DATABASE_TLS_CERT and DATABASE_TLS_KEY go together: one is set without the other".to_string()),
+    }
+}
+
 async fn serve() -> Result<(), String> {
     let mut config = ServerConfig::new(env("DATABASE_DATA").unwrap_or_else(|| "./data".to_string()), &admin_password()?);
     config.listen = listen_address()?;
     config.socket = env("DATABASE_SOCKET").map(Into::into);
+    config.tls = tls()?;
     if let Some(mb) = env("DATABASE_CACHE_MB") {
         config.cache_bytes = mb.parse::<usize>().map_err(|_| "DATABASE_CACHE_MB is not a number".to_string())? * 1024 * 1024;
     }
     if let Some(ms) = env("DATABASE_SLOW_MS") {
         config.slow_statement = Some(std::time::Duration::from_millis(ms.parse().map_err(|_| "DATABASE_SLOW_MS is not a number of milliseconds".to_string())?));
     }
-    let data_dir = config.data_dir.clone();
+    let (data_dir, tls) = (config.data_dir.clone(), config.tls.clone());
     let server = Server::start(config).await.map_err(|e| format!("cannot start: {e}"))?;
+    let over = match &tls {
+        Some(tls) if tls.plain => " (TLS, and in the clear)",
+        Some(_) => " (TLS only)",
+        None => "",
+    };
     match server.socket() {
-        Some(socket) => eprintln!("database: serving {} on {} and {}", data_dir.display(), server.addr(), socket.display()),
-        None => eprintln!("database: serving {} on {}", data_dir.display(), server.addr()),
+        Some(socket) => eprintln!("database: serving {} on {}{over} and {}", data_dir.display(), server.addr(), socket.display()),
+        None => eprintln!("database: serving {} on {}{over}", data_dir.display(), server.addr()),
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| e.to_string())?;
     tokio::select! {
