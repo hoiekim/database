@@ -576,6 +576,52 @@ more. `BENCH_SERVER_CPUS=16` there keeps the client off the server's
 cores. One writer per database is expected to cost more there on the
 workloads that write.
 
+## What keeping the log costs
+
+A server started with `DATABASE_ARCHIVE` copies each log file to the
+archive before a checkpoint removes it (`OPERATIONS.md`, "Restoring to
+a moment"). What that costs the server was counted on durable inserts
+from one connection, each its own commit, of a row like the
+benchmark's event: the instructions the server executes, under
+callgrind, as the difference between a run of 3,000 inserts and one of
+1,000, divided by 2,000; and its syncs, under `strace`, over 5,000.
+
+| Per durable insert | Before the archive existed | Without an archive | With one |
+|---|---:|---:|---:|
+| Instructions in the server | 47,820 | 47,900 | 49,220 |
+| Syncs of the log | 1 | 1 | 1 |
+| Bytes of log | 71 | 71 | 80 |
+
+| Over 5,000 inserts and a clean stop | | | |
+|---|---:|---:|---:|
+| `fdatasync` and `fsync` calls | 5,013 | 5,013 | 5,019 |
+| Memory held at the end | 6.3 MB | 6.3 MB | 6.2 MB |
+| Seconds | 3.7 | 3.6 | 3.7 |
+
+**Without an archive** the commit path has seven instructions it did
+not have: two tests of whether to stamp and one of whether the commit
+is the first since a checkpoint. The rest of the 80 is the compiler
+placing the same work differently in a rebuilt binary: the counts of
+functions this change does not touch, the runtime's among them, moved
+by more than that in both directions. The log is byte for byte what it
+was.
+
+**With one**, a commit reads the clock and writes nine bytes more,
+under the lock it already holds, and waits for the same one sync. The
+1,400 instructions are that and the checkpoint's work, which is the
+larger part by what each does, though the two were not counted apart:
+each log file is read back record by record and checked before it is
+copied, on the engine's own thread and not on a commit's way. The copy is two syncs
+on the archive for each log file (the file, and its directory), and as
+many for a base. The archive takes the room of the log, and a base the
+room of its data file; the server holds no more memory for it than a
+megabyte's buffer while a file is copied.
+
+A base is read from the data file as a checkpoint left it, while
+commits go on; no checkpoint of that database is made meanwhile, so its
+log and the pages waiting for a checkpoint grow for as long as the copy
+takes. That was not measured on a large database.
+
 ## Running it
 
 ```sh
