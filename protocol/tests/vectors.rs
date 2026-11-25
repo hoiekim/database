@@ -405,6 +405,8 @@ fn admin(a: &Admin) -> Json {
         Admin::RestoreBegin { replace } => json!({"kind": "restore_begin", "replace": replace}),
         Admin::RestoreChunk(bytes) => json!({"kind": "restore_chunk", "hex": hex(bytes)}),
         Admin::RestoreEnd => json!({"kind": "restore_end"}),
+        // Of versions after 2, which the vectors do not hold.
+        Admin::Base { .. } | Admin::Archive { .. } | Admin::Recover { .. } => unreachable!("not a request of version 2"),
     }
 }
 

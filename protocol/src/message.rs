@@ -19,8 +19,9 @@ use crate::value::Value;
 /// meaning changes, or when the client comes to send something an older
 /// server would not know (version 3: `Prepared`, `BeginWith`, `Batch`,
 /// `Expr::Param`; version 4: `Explain`; version 5: see
-/// `COLUMN_FLAGS_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 5;
+/// `COLUMN_FLAGS_VERSION`; version 6: `Admin::Base`, `Admin::Archive`,
+/// `Admin::Recover`).
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// From this version a column's last byte is a byte of flags, and a
 /// column may carry `keep_start` after it (`codec::put_column`). A
@@ -189,6 +190,35 @@ pub enum Admin {
     RestoreBegin { replace: bool },
     RestoreChunk(Vec<u8>),
     RestoreEnd,
+    /// Writes a base of the named databases, or of all when none is
+    /// named, to the server's archive of its log: the data file as of a
+    /// checkpoint, from which the log after it restores any later
+    /// moment. Answers with a line for each.
+    Base { databases: Vec<String> },
+    /// Reads the archive and reports what it holds of the histories
+    /// `history` names: a database's name, the name of one history, or
+    /// nothing for all. An error if one of them is not whole. With
+    /// `commits`, the report lists every commit: where its record ends
+    /// in the log, and when it was made.
+    Archive { history: String, commits: bool },
+    /// Makes the database `target` what the history `from` held at the
+    /// moment `to`, from the archive. `target` must not exist unless
+    /// `replace` is given. `password` is the database's if it has none
+    /// yet; a database that is replaced keeps its own.
+    Recover { from: String, to: Moment, target: String, replace: bool, password: String },
+}
+
+/// A moment of a database's history: what `Admin::Recover` restores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Moment {
+    /// Every commit the archive holds.
+    End,
+    /// Every commit made at or before this time, in microseconds since
+    /// the epoch.
+    Time(i64),
+    /// Every commit up to the one whose record ends here: byte `offset`
+    /// of log file `generation`. `Admin::Archive` lists these.
+    Position { generation: u64, offset: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -504,6 +534,34 @@ fn put_admin(w: &mut Writer, admin: &Admin) {
             w.bytes(bytes);
         }
         Admin::RestoreEnd => w.u8(11),
+        Admin::Base { databases } => {
+            w.u8(12);
+            w.strs(databases);
+        }
+        Admin::Archive { history, commits } => {
+            w.u8(13);
+            w.str(history);
+            w.bool(*commits);
+        }
+        Admin::Recover { from, to, target, replace, password } => {
+            w.u8(14);
+            w.str(from);
+            match to {
+                Moment::End => w.u8(0),
+                Moment::Time(micros) => {
+                    w.u8(1);
+                    w.zigzag(*micros);
+                }
+                Moment::Position { generation, offset } => {
+                    w.u8(2);
+                    w.varint(*generation);
+                    w.varint(*offset);
+                }
+            }
+            w.str(target);
+            w.bool(*replace);
+            w.str(password);
+        }
     }
 }
 
@@ -520,6 +578,18 @@ fn get_admin(r: &mut Reader) -> DbResult<Admin> {
         9 => Admin::RestoreBegin { replace: r.bool()? },
         10 => Admin::RestoreChunk(r.bytes()?.to_vec()),
         11 => Admin::RestoreEnd,
+        12 => Admin::Base { databases: r.strs()? },
+        13 => Admin::Archive { history: r.str()?, commits: r.bool()? },
+        14 => {
+            let from = r.str()?;
+            let to = match r.u8()? {
+                0 => Moment::End,
+                1 => Moment::Time(r.zigzag()?),
+                2 => Moment::Position { generation: r.varint()?, offset: r.varint()? },
+                _ => return Err(DbError::new(ErrorCode::InvalidRequest, "unknown moment")),
+            };
+            Admin::Recover { from, to, target: r.str()?, replace: r.bool()?, password: r.str()? }
+        }
         _ => return Err(DbError::new(ErrorCode::InvalidRequest, "unknown admin request")),
     })
 }
@@ -794,6 +864,11 @@ mod tests {
             Request::Admin(Admin::RestoreBegin { replace: true }),
             Request::Admin(Admin::RestoreChunk(vec![1, 2, 3])),
             Request::Admin(Admin::RestoreEnd),
+            Request::Admin(Admin::Base { databases: vec!["shop".into()] }),
+            Request::Admin(Admin::Archive { history: "shop".into(), commits: true }),
+            Request::Admin(Admin::Recover { from: "shop".into(), to: Moment::End, target: "shop".into(), replace: true, password: String::new() }),
+            Request::Admin(Admin::Recover { from: "shop".into(), to: Moment::Time(-1_700_000_000_000_000), target: "then".into(), replace: false, password: "pw".into() }),
+            Request::Admin(Admin::Recover { from: "shop".into(), to: Moment::Position { generation: 12, offset: 4096 }, target: "then".into(), replace: false, password: "pw".into() }),
             Request::Prepared { id: 7, statement: Some(Arc::new(Request::Query(Query::table("t").key([param(0)]).filter(col("a").lt(param(1)))))), params: vec![Value::Int(1), Value::Text("x".into())] },
             Request::Prepared { id: u64::MAX, statement: None, params: Vec::new() },
             Request::BeginWith { kind: TxnKind::Optimistic, lock_wait_ms: 30_000, statement: Box::new(Request::Query(sample_query())) },

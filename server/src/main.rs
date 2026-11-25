@@ -12,6 +12,11 @@
 //! database check                       verify every database's files
 //! database checkpoint
 //! database stats
+//! database base [name...]              write a base of each database to the archive
+//! database archive [name] [--commits]  verify the archive; with --commits, list every commit
+//! database recover <name> [--to <moment>] [--as <name>] [--replace]
+//!                                      restore a database from the archive as it stood at a moment:
+//!                                      a time, a commit's position, or `end`
 //! ```
 //!
 //! `serve` reads its settings from the environment:
@@ -24,6 +29,8 @@
 //! | `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well, for clients on the same host |
 //! | `DATABASE_CACHE_MB` | `32` | memory for cached pages |
 //! | `DATABASE_SLOW_MS` | (none) | log statements that take this many milliseconds or more, with what they read |
+//! | `DATABASE_ARCHIVE` | (none) | a directory to keep the log in beyond its checkpoints, for restoring to a moment |
+//! | `DATABASE_ARCHIVE_SECONDS` | `60` | with an archive: the longest a commit waits before its log file is copied there |
 //!
 //! The other commands connect to `DATABASE_HOST` (default `127.0.0.1`) on
 //! the port of `DATABASE_LISTEN`, or through `DATABASE_SOCKET` if that is
@@ -34,7 +41,7 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use database_client::{Client, Config, DbError, DEFAULT_PORT};
+use database_client::{Client, Config, DbError, Moment, DEFAULT_PORT};
 use database_server::{Server, ServerConfig};
 
 fn env(name: &str) -> Option<String> {
@@ -75,6 +82,10 @@ async fn serve() -> Result<(), String> {
     if let Some(ms) = env("DATABASE_SLOW_MS") {
         config.slow_statement = Some(std::time::Duration::from_millis(ms.parse().map_err(|_| "DATABASE_SLOW_MS is not a number of milliseconds".to_string())?));
     }
+    config.archive = env("DATABASE_ARCHIVE").map(Into::into);
+    if let Some(seconds) = env("DATABASE_ARCHIVE_SECONDS") {
+        config.archive_every = std::time::Duration::from_secs(seconds.parse().map_err(|_| "DATABASE_ARCHIVE_SECONDS is not a number of seconds".to_string())?);
+    }
     let data_dir = config.data_dir.clone();
     let server = Server::start(config).await.map_err(|e| format!("cannot start: {e}"))?;
     match server.socket() {
@@ -110,6 +121,19 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// A moment as `recover --to` is given it: `end`, a commit's position
+/// as `archive --commits` lists it (`12:4096`), or a time, which is read
+/// as UTC unless it says otherwise.
+fn moment(text: &str) -> Result<Moment, String> {
+    if text == "end" {
+        return Ok(Moment::End);
+    }
+    if let Some((generation, offset)) = text.split_once(':').and_then(|(generation, offset)| Some((generation.parse().ok()?, offset.parse().ok()?))) {
+        return Ok(Moment::Position { generation, offset });
+    }
+    database_protocol::time::parse_timestamp(text, 0).map(Moment::Time).ok_or_else(|| format!("{text:?} is not a moment: give a time (2026-01-31T12:00:00Z), a commit's position (12:4096) or `end`"))
 }
 
 fn one_name(args: &[String], usage: &str) -> Result<String, String> {
@@ -185,7 +209,36 @@ async fn run(command: &str, mut args: Vec<String>) -> Result<(), String> {
             print!("{}", admin().await?.admin().stats().await.map_err(text)?);
             Ok(())
         }
-        _ => Err("usage: database serve | ping | create <name> | drop <name> | password <name> | list | dump [name...] | restore [--replace] | check | checkpoint | stats".to_string()),
+        "base" => {
+            let names: Vec<&str> = args.iter().map(String::as_str).collect();
+            print!("{}", admin().await?.admin().base(&names).await.map_err(text)?);
+            Ok(())
+        }
+        "archive" => {
+            let commits = take_flag(&mut args, "--commits");
+            let history = match &args[..] {
+                [] => String::new(),
+                [history] => history.clone(),
+                _ => return Err("usage: database archive [name] [--commits]".to_string()),
+            };
+            print!("{}", admin().await?.admin().archive(&history, commits).await.map_err(text)?);
+            Ok(())
+        }
+        "recover" => {
+            let usage = "recover <name> [--to <time> | <position> | end] [--as <name>] [--replace]";
+            let replace = take_flag(&mut args, "--replace");
+            let to = moment(&take_option(&mut args, "--to").unwrap_or_else(|| "end".to_string()))?;
+            let target = take_option(&mut args, "--as");
+            let from = one_name(&args, usage)?;
+            // Restored under its own name, a database is the history's
+            // name without the uuid that tells histories apart.
+            let target = target.unwrap_or_else(|| from.split('.').next().unwrap_or_default().to_string());
+            // Needed only where the database has no password yet.
+            let password = env("DATABASE_PASSWORD").unwrap_or_default();
+            print!("{}", admin().await?.admin().recover(&from, to, &target, replace, &password).await.map_err(text)?);
+            Ok(())
+        }
+        _ => Err("usage: database serve | ping | create <name> | drop <name> | password <name> | list | dump [name...] | restore [--replace] | check | checkpoint | stats | base [name...] | archive [name] [--commits] | recover <name> [--to <moment>] [--as <name>] [--replace]".to_string()),
     }
 }
 

@@ -338,6 +338,33 @@ impl Store {
         Ok((Store::assemble(file, cache, id, meta.clone(), free, chain_pages, limits), meta, catalog))
     }
 
+    /// Gives a data file that nothing has open another uuid: a new
+    /// history, which no log file of the old one is taken for (see
+    /// `archive.rs`). The checkpoint is otherwise as it was, written as
+    /// the next one is, to the other copy of the header: a crash leaves
+    /// the file with one uuid or the other.
+    pub fn rebrand(file: &dyn File, uuid: [u8; 16]) -> Result<()> {
+        let mut best: Option<Meta> = None;
+        for slot in 0..2u64 {
+            let mut page = vec![0u8; PAGE_SIZE];
+            match read_exact_at(file, &mut page, slot * PAGE_SIZE as u64) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+                Err(e) => return Err(Error::Io(e)),
+            }
+            if let Some(meta) = Meta::decode(&page) {
+                if best.as_ref().is_none_or(|b| meta.counter > b.counter) {
+                    best = Some(meta);
+                }
+            }
+        }
+        let meta = best.ok_or_else(|| Error::corrupt("neither copy of the data file's header is valid"))?;
+        let meta = Meta { counter: meta.counter + 1, uuid, ..meta };
+        file.write_at(&meta.encode(), (meta.counter % 2) * PAGE_SIZE as u64)?;
+        file.sync()?;
+        Ok(())
+    }
+
     fn assemble(file: Arc<dyn File>, cache: Arc<PageCache>, id: u32, meta: Meta, free: Vec<PageId>, chain_pages: Vec<PageId>, limits: Limits) -> Store {
         Store {
             id,
@@ -369,6 +396,11 @@ impl Store {
 
     pub fn meta(&self) -> Meta {
         self.alloc.lock().unwrap().meta.clone()
+    }
+
+    /// Reads the data file's bytes as they lie, for a copy of it.
+    pub fn read_file(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        read_exact_at(&*self.file, buf, offset)
     }
 
     fn check_failed(&self) -> Result<()> {

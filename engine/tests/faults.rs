@@ -23,6 +23,11 @@
 //!
 //! `FAULT_SCRIPTS=20` adds that many generated workloads to the fixed
 //! one, and looks closer at each.
+//!
+//! `faults_archived.rs` runs all of this a second time with the engine
+//! keeping its log in an archive on the same disk: every checkpoint then
+//! copies its log files there before it removes them, and every fault
+//! falls on those operations as well.
 
 mod common;
 
@@ -54,6 +59,10 @@ fn quiet() -> EngineOptions {
     let mut options = options();
     options.db.limits = Limits { max_dirty: 6, max_private: 6 };
     options.db.checkpoint_bytes = u64::MAX;
+    // `faults_archived.rs` is this file again, as a module of that name.
+    if module_path!().contains("archived") {
+        options.archive = Some("/archive".into());
+    }
     options
 }
 

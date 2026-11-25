@@ -36,6 +36,12 @@
 //! is grown ahead of its records, by zeros, in steps that double to a
 //! megabyte, and a record is then written over room the file already
 //! has. A record is never empty, so the zeros end the log for a reader.
+//!
+//! A log that is kept beyond its checkpoint (see `archive.rs`) is asked
+//! what the database held at a moment, which the changes alone do not
+//! say. Such a log **stamps** its records: each begins with a byte no
+//! change begins with, and the time of the commit after it. A log that
+//! is not kept writes its records as it always did.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -58,6 +64,15 @@ const GROW_MOST: u64 = 1024 * 1024;
 const LINK: u8 = 0xF0;
 /// A link: that byte, and where the records of the file before ended.
 const LINK_LEN: usize = 9;
+/// The first byte of a stamped record: a commit's time, in microseconds
+/// since the epoch, and then its changes. Like a link's, it is a byte no
+/// change begins with, so a build that knows nothing of stamps refuses
+/// the record rather than read a time as a change.
+const STAMP: u8 = 0xF1;
+/// What a stamp adds to a record: that byte and the time.
+pub const STAMP_LEN: usize = 9;
+/// Where a file's first record begins.
+pub const FIRST_RECORD: u64 = HEADER_LEN;
 
 pub fn wal_path(dir: &Path, name: &str, generation: u64) -> PathBuf {
     dir.join(format!("{name}.wal-{generation:010}"))
@@ -79,9 +94,15 @@ fn header(generation: u64, uuid: &[u8; 16]) -> Vec<u8> {
 }
 
 fn record_crc(generation: u64, offset: u64, bytes: &[u8]) -> u32 {
+    stamped_crc(generation, offset, &[], bytes)
+}
+
+/// The CRC of a record that is `stamp` and then `bytes`.
+fn stamped_crc(generation: u64, offset: u64, stamp: &[u8], bytes: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&generation.to_le_bytes());
     hasher.update(&offset.to_le_bytes());
+    hasher.update(stamp);
     hasher.update(bytes);
     hasher.finalize()
 }
@@ -103,6 +124,9 @@ struct Tail {
     appended: u64,
     /// The newest version that has a record at all.
     last_record: u64,
+    /// The time the newest stamp gave, which the next will not be
+    /// before: a clock set back does not put a later commit earlier.
+    stamped: i64,
 }
 
 struct Synced {
@@ -123,6 +147,8 @@ pub struct Wal {
     /// When false, `sync_to` returns at once: commits are then only as
     /// durable as the operating system makes them.
     pub sync: bool,
+    /// Whether each record says when its commit was made.
+    stamp: bool,
 }
 
 fn failed() -> Error {
@@ -147,11 +173,38 @@ impl Wal {
             dir: dir.to_path_buf(),
             name: name.to_string(),
             uuid,
-            tail: Mutex::new(Tail { file, generation, link: previous, offset: HEADER_LEN, allocated: HEADER_LEN, grow: 0, appended: version, last_record: version }),
+            tail: Mutex::new(Tail { file, generation, link: previous, offset: HEADER_LEN, allocated: HEADER_LEN, grow: 0, appended: version, last_record: version, stamped: 0 }),
             synced: Mutex::new(Synced { version, syncing: false, failed: false }),
             wake: Condvar::new(),
             sync,
+            stamp: false,
         })
+    }
+
+    /// Has every record from now on say when its commit was made, none
+    /// earlier than `floor`: the newest time the log already holds.
+    pub fn stamping(mut self, floor: i64) -> Wal {
+        self.stamp = true;
+        self.tail.get_mut().unwrap().stamped = floor;
+        self
+    }
+
+    /// A time no commit made so far is stamped after, and none made from
+    /// now on before. The caller holds the write lock, so that no commit
+    /// is being made. 0 for a log that does not stamp.
+    pub fn moment(&self) -> i64 {
+        if !self.stamp {
+            return 0;
+        }
+        let mut tail = self.tail.lock().unwrap();
+        tail.stamped = tail.stamped.max(database_protocol::time::now_micros());
+        tail.stamped
+    }
+
+    /// Where the newest record ends: the file and the byte.
+    pub fn position(&self) -> (u64, u64) {
+        let tail = self.tail.lock().unwrap();
+        (tail.generation, tail.offset)
     }
 
     fn start_file(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation: u64) -> Result<Arc<dyn File>> {
@@ -181,17 +234,18 @@ impl Wal {
         debug_assert!(!bytes.is_empty(), "an empty record would read as the end of the log");
         // What a reader would take for damage must not be written: the
         // commit fails here, whole, instead of being lost at recovery.
-        if bytes.len() > MAX_RECORD as usize {
+        let stamp_len = if self.stamp { STAMP_LEN } else { 0 };
+        if bytes.len() + stamp_len > MAX_RECORD as usize {
             return Err(Error::db(
                 database_protocol::error::ErrorCode::OutOfRange,
-                format!("the transaction's changes take {} bytes of log, and one transaction may take {MAX_RECORD}: commit it in parts", bytes.len()),
+                format!("the transaction's changes take {} bytes of log, and one transaction may take {MAX_RECORD}: commit it in parts", bytes.len() + stamp_len),
             ));
         }
         if self.synced.lock().unwrap().failed {
             return Err(failed());
         }
         let mut tail = self.tail.lock().unwrap();
-        let mut frame = Vec::with_capacity(bytes.len() + 16 + LINK_LEN);
+        let mut frame = Vec::with_capacity(bytes.len() + 16 + LINK_LEN + stamp_len);
         if tail.link > 0 {
             // The file's first record: the link goes before it, in the
             // same write.
@@ -201,9 +255,14 @@ impl Wal {
             frame.extend_from_slice(&record_crc(tail.generation, tail.offset, &link).to_le_bytes());
             frame.extend_from_slice(&link);
         }
+        let mut stamp = [STAMP; STAMP_LEN];
+        let stamped = if self.stamp { tail.stamped.max(database_protocol::time::now_micros()) } else { tail.stamped };
+        stamp[1..].copy_from_slice(&stamped.to_le_bytes());
+        let stamp = &stamp[..stamp_len];
         let at = tail.offset + frame.len() as u64;
-        frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&record_crc(tail.generation, at, bytes).to_le_bytes());
+        frame.extend_from_slice(&((bytes.len() + stamp_len) as u32).to_le_bytes());
+        frame.extend_from_slice(&stamped_crc(tail.generation, at, stamp, bytes).to_le_bytes());
+        frame.extend_from_slice(stamp);
         frame.extend_from_slice(bytes);
         let end = tail.offset + frame.len() as u64;
         let mut written = tail.file.write_at(&frame, tail.offset);
@@ -223,6 +282,7 @@ impl Wal {
         tail.link = 0;
         tail.appended = version;
         tail.last_record = version;
+        tail.stamped = stamped;
         Ok(())
     }
 
@@ -364,6 +424,18 @@ pub struct Replayed {
     pub after: u64,
 }
 
+/// One transaction's record, as a reader of the log is given it.
+#[derive(Clone, Copy, Debug)]
+pub struct Commit<'a> {
+    /// Where the record ends in its file: with the file's generation,
+    /// the commit's position in the log.
+    pub end: u64,
+    /// When the commit was made, if the log was stamping.
+    pub time: Option<i64>,
+    /// What the transaction changed: see `write.rs`.
+    pub changes: &'a [u8],
+}
+
 /// Reads one log file, calling `on_record` with each transaction's record
 /// that checks, in order, and stops at the first that does not, saying
 /// how and where. A file whose header is missing or torn holds nothing
@@ -374,15 +446,21 @@ pub struct Replayed {
 /// and do not check. A read that fails is neither: the records may all
 /// be there, so it is returned as the error it is, and the caller must
 /// not go on to delete the file.
-pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<Replayed> {
+pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(Commit) -> Result<()>) -> Result<Replayed> {
     let file = vfs.open(&wal_path(dir, name, generation), false)?;
+    replay_file(&*file, uuid, generation, on_record)
+}
+
+/// `replay`, of a log file under whatever name it was opened by: a copy
+/// of one reads as the file it was copied from.
+pub fn replay_file(file: &dyn File, uuid: &[u8; 16], generation: u64, on_record: &mut dyn FnMut(Commit) -> Result<()>) -> Result<Replayed> {
     let len = file.len()?;
     let nothing = |end| Replayed { end, at: 0, after: 0 };
     let mut head = vec![0u8; HEADER_LEN as usize];
     if len < HEADER_LEN {
         return Ok(nothing(End::Torn));
     }
-    read_exact_at(&*file, &mut head, 0)?;
+    read_exact_at(file, &mut head, 0)?;
     if head != header(generation, uuid) {
         // Whole, but another data file's: left from a database that had
         // this name before. Anything else in a header's place is damage.
@@ -400,7 +478,7 @@ pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation
         if offset + 8 > len {
             return Ok(ended(End::Torn));
         }
-        read_exact_at(&*file, &mut prefix, offset)?;
+        read_exact_at(file, &mut prefix, offset)?;
         let size = u32::from_le_bytes(prefix[..4].try_into().unwrap());
         let crc = u32::from_le_bytes(prefix[4..].try_into().unwrap());
         // No record is empty: a length of zero is the room a file was
@@ -412,17 +490,26 @@ pub fn replay(vfs: &dyn Vfs, dir: &Path, name: &str, uuid: &[u8; 16], generation
             return Ok(ended(End::Torn));
         }
         let mut bytes = vec![0u8; size as usize];
-        read_exact_at(&*file, &mut bytes, offset + 8)?;
+        read_exact_at(file, &mut bytes, offset + 8)?;
         if record_crc(generation, offset, &bytes) != crc {
             return Ok(ended(End::Torn));
         }
+        let end = offset + 8 + u64::from(size);
         if offset == HEADER_LEN && bytes.len() == LINK_LEN && bytes[0] == LINK {
             after = u64::from_le_bytes(bytes[1..].try_into().unwrap());
+        } else if bytes[0] == STAMP && bytes.len() >= STAMP_LEN {
+            let time = i64::from_le_bytes(bytes[1..STAMP_LEN].try_into().unwrap());
+            on_record(Commit { end, time: Some(time), changes: &bytes[STAMP_LEN..] })?;
         } else {
-            on_record(&bytes)?;
+            on_record(Commit { end, time: None, changes: &bytes })?;
         }
-        offset += 8 + u64::from(size);
+        offset = end;
     }
+}
+
+/// A log file's first bytes, for whoever writes a copy of one.
+pub fn file_header(generation: u64, uuid: &[u8; 16]) -> Vec<u8> {
+    header(generation, uuid)
 }
 
 #[cfg(test)]
@@ -435,7 +522,7 @@ mod tests {
     fn records(vfs: &MemVfs, generation: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         replay(vfs, Path::new("/d"), "t", &UUID, generation, &mut |r| {
-            out.push(r.to_vec());
+            out.push(r.changes.to_vec());
             Ok(())
         })
         .unwrap();

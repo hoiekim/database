@@ -34,6 +34,14 @@
 //! log's records in order, checkpoint. A torn record at the log's end was
 //! never acknowledged and is ignored.
 //!
+//! **The archive.** With one configured (`archive.rs`), a checkpoint does
+//! not remove the log files it has passed: it copies each to the archive
+//! first, and removes it once the copy is whole there. A copy that fails
+//! leaves the file where it is, to be tried again by the next
+//! checkpoint, so that every acknowledged commit is in the archive or in
+//! a log file of the data directory. Nothing of this is on a commit's
+//! way but the time its record is stamped with.
+//!
 //! **Merges beside the writers.** A full-text index is kept in segments
 //! that are merged as they gather (`fts.rs`), and merging reads nothing
 //! that changes. So it is done beside the writers, as a fork's work is:
@@ -46,7 +54,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,6 +65,7 @@ use database_protocol::schema::TableDef;
 use database_protocol::time::now_micros;
 use database_protocol::value::Value;
 
+use crate::archive::{self, Archive, Chain, Progress};
 use crate::btree::{self, Pages};
 use crate::cache::PageCache;
 use crate::catalog::Catalog;
@@ -77,12 +86,27 @@ pub struct Options {
     pub limits: Limits,
     /// A checkpoint is due once the log is this long.
     pub checkpoint_bytes: u64,
+    /// Where log files are copied before a checkpoint removes them, and
+    /// bases written: see `archive.rs`. `None` keeps no log.
+    pub archive: Option<Arc<Archive>>,
+    /// With an archive: a checkpoint is due once the oldest commit of
+    /// the current log file has waited this long, so that a commit is
+    /// not much longer than this in the data directory alone. Zero
+    /// leaves checkpoints to come when they otherwise would.
+    pub archive_every: Duration,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { sync: true, limits: Limits::default(), checkpoint_bytes: 8 * 1024 * 1024 }
+        Options { sync: true, limits: Limits::default(), checkpoint_bytes: 8 * 1024 * 1024, archive: None, archive_every: Duration::from_secs(60) }
     }
+}
+
+/// A database's place in the archive, and how far its log has got there.
+struct Archiving {
+    archive: Arc<Archive>,
+    history: String,
+    progress: Mutex<Progress>,
 }
 
 /// One version of the database.
@@ -130,16 +154,28 @@ pub struct Database {
     /// dropped, because the segments they read had changed meanwhile.
     pub merges_beside: AtomicU64,
     pub merges_dropped: AtomicU64,
+    archiving: Option<Archiving>,
+    /// A time no commit in the data file's checkpoint was made after,
+    /// and none in the log since before: what a base taken of that
+    /// checkpoint says of itself.
+    moment: AtomicI64,
+    /// When the first commit since the last checkpoint was made.
+    first_commit: Mutex<Instant>,
+    /// When the archive last refused a file, for trying again.
+    archive_failed: Mutex<Option<Instant>>,
 }
 
-fn data_path(dir: &Path, name: &str) -> PathBuf {
+pub(crate) fn data_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.db"))
 }
+
+/// How long after the archive refused a file it is offered again.
+const ARCHIVE_RETRY: Duration = Duration::from_secs(5);
 
 /// Ends the name a data file is made under, before it is whole.
 pub const CREATING: &str = "--creating";
 
-fn random_uuid() -> [u8; 16] {
+pub(crate) fn random_uuid() -> [u8; 16] {
     use std::io::Read;
     let mut bytes = [0u8; 16];
     let filled = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_ok();
@@ -218,11 +254,18 @@ impl Database {
         }
         let file = vfs.open(&making, true)?;
         let store = Arc::new(Store::create(file, cache, store_id, uuid, options.limits)?);
-        let wal = Wal::create(vfs.clone(), dir, name, uuid, 1, 0, options.sync)?;
+        let mut wal = Wal::create(vfs.clone(), dir, name, uuid, 1, 0, options.sync)?;
+        if options.archive.is_some() {
+            wal = wal.stamping(0);
+        }
         vfs.rename(&making, &path)?;
         vfs.sync_dir(dir)?;
         let catalog = Catalog { next_table_id: 1, ..Catalog::default() };
-        Ok(Self::assemble(vfs, dir, name, store, wal, 0, catalog, options))
+        let db = Self::assemble(vfs, dir, name, store, wal, 0, catalog, options);
+        // The archive begins with the database: a base of it empty.
+        db.moment.store(db.wal.moment(), Ordering::Relaxed);
+        db.fatal(db.settle_logs(1, false))?;
+        Ok(db)
     }
 
     /// Opens a database, replaying whatever its log holds beyond the
@@ -232,9 +275,13 @@ impl Database {
         let (store, meta, catalog_bytes) = Store::open(file, cache, store_id, options.limits)?;
         let store = Arc::new(store);
         let catalog = Catalog::decode(&catalog_bytes)?;
-        // Log files from before the checkpoint were only not yet deleted.
-        wal::remove_logs(&*vfs, dir, name, |g| g < meta.wal_gen)?;
-        let generations = wal::list_logs(&*vfs, dir, name)?;
+        // Log files from before the checkpoint were only not yet deleted,
+        // or, with an archive, not yet copied there: those are kept, and
+        // are no part of recovery.
+        if options.archive.is_none() {
+            wal::remove_logs(&*vfs, dir, name, |g| g < meta.wal_gen)?;
+        }
+        let generations: Vec<u64> = wal::list_logs(&*vfs, dir, name)?.into_iter().filter(|g| *g >= meta.wal_gen).collect();
 
         let mut tx = Tx::new(Writer::new(store.clone()), catalog, now_micros());
         tx.logging = false;
@@ -256,6 +303,8 @@ impl Database {
         // The file before: its generation, and where its records ended
         // if it held any.
         let mut before: Option<(u64, u64)> = None;
+        // The newest time a record says its commit was made.
+        let mut stamped = 0i64;
         for generation in &generations {
             let mut records = 0u64;
             let read = wal::replay(&*vfs, dir, name, &meta.uuid, *generation, &mut |record| {
@@ -264,10 +313,11 @@ impl Database {
                 }
                 records += 1;
                 changed = true;
+                stamped = stamped.max(record.time.unwrap_or(0));
                 // A record applied once when it was committed. If it does
                 // not apply now, the data file is not the one it was
                 // logged against: a disk lost pages it said were synced.
-                tx.replay(record).map_err(|e| match e {
+                tx.replay(record.changes).map_err(|e| match e {
                     Error::Io(_) | Error::Corrupt(_) => e,
                     other => Error::corrupt(format!("log file {generation} of database {name:?} does not apply to its data file: {other}")),
                 })
@@ -301,8 +351,12 @@ impl Database {
         }
         let next_generation = generations.last().map_or(meta.wal_gen, |g| g + 1).max(meta.wal_gen);
         let previous = before.filter(|(it, _)| it + 1 == next_generation).map_or(0, |(_, ended)| ended);
-        let wal = Wal::create_after(vfs.clone(), dir, name, meta.uuid, next_generation, version, options.sync, previous)?;
+        let mut wal = Wal::create_after(vfs.clone(), dir, name, meta.uuid, next_generation, version, options.sync, previous)?;
+        if options.archive.is_some() {
+            wal = wal.stamping(stamped);
+        }
         let db = Self::assemble(vfs.clone(), dir, name, store, wal, version, catalog, options);
+        db.moment.store(db.wal.moment(), Ordering::Relaxed);
         if changed {
             // Put what was replayed into the data file now, so the log
             // it came from can go.
@@ -310,13 +364,14 @@ impl Database {
             let capture = db.store.capture(version, &latest.catalog.encode(), next_generation)?;
             db.store.write_checkpoint(capture)?;
         }
-        wal::remove_logs(&*vfs, dir, name, |g| g < next_generation)?;
+        db.settle_logs(next_generation, false)?;
         Ok(db)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn assemble(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, store: Arc<Store>, wal: Wal, version: u64, catalog: Catalog, options: Options) -> Arc<Database> {
         let snapshot = Arc::new(Snapshot { version, catalog: Arc::new(catalog) });
+        let archiving = options.archive.clone().map(|archive| Archiving { history: archive::history_name(name, &store.meta().uuid), archive, progress: Mutex::new(Progress::default()) });
         Arc::new(Database {
             name: name.to_string(),
             dir: dir.to_path_buf(),
@@ -339,6 +394,10 @@ impl Database {
             merging: Mutex::new(()),
             merges_beside: AtomicU64::new(0),
             merges_dropped: AtomicU64::new(0),
+            archiving,
+            moment: AtomicI64::new(0),
+            first_commit: Mutex::new(Instant::now()),
+            archive_failed: Mutex::new(None),
         })
     }
 
@@ -627,31 +686,218 @@ impl Database {
 
     /// Whether a checkpoint would do some good now.
     pub fn checkpoint_due(&self) -> bool {
-        if self.commits_since_checkpoint.load(Ordering::Relaxed) == 0 || self.has_failed() {
+        if self.has_failed() {
             return false;
         }
-        // A long log, or a quiet moment after some writes.
-        self.wal.size() > self.options.checkpoint_bytes || self.last_commit.lock().unwrap().elapsed() > Duration::from_secs(5)
+        // Log files the archive refused are offered again now and then,
+        // whether or not anything was committed since.
+        if self.archive_failed.lock().unwrap().is_some_and(|at| at.elapsed() > ARCHIVE_RETRY) {
+            return true;
+        }
+        if self.commits_since_checkpoint.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        // A long log, or a quiet moment after some writes; or, with an
+        // archive, commits that have waited their time to be copied.
+        let waited = self.archiving.is_some() && !self.options.archive_every.is_zero() && self.first_commit.lock().unwrap().elapsed() > self.options.archive_every;
+        waited || self.wal.size() > self.options.checkpoint_bytes || self.last_commit.lock().unwrap().elapsed() > Duration::from_secs(5)
     }
 
     /// Writes everything committed into the data file and drops the log
-    /// that held it. Writers are held only while the new log file is
-    /// started.
+    /// that held it, or with an archive hands it there. Writers are held
+    /// only while the new log file is started.
     pub fn checkpoint(self: &Arc<Self>) -> Result<()> {
         let _one = self.checkpointing.lock().unwrap();
+        self.checkpoint_held(false).map(|_| ())
+    }
+
+    /// `checkpoint`, by whoever holds `checkpointing`. With `base`, a
+    /// base is written to the archive whether or not it lacks one.
+    /// Returns what the archive refused, if it refused something.
+    fn checkpoint_held(self: &Arc<Self>, base: bool) -> Result<Option<String>> {
         self.check_failed()?;
         let guard = self.lock_writes(Duration::from_secs(3600))?;
         let latest = self.latest.lock().unwrap().clone();
         if latest.version == self.store.meta().version {
-            return Ok(());
+            drop(guard);
+            // Nothing to write. With an archive there may still be log
+            // files to hand it: the ones it refused before.
+            return match self.archiving {
+                Some(_) => self.fatal(self.settle_logs(self.wal.generation(), base)),
+                None => Ok(None),
+            };
         }
         let generation = self.fatal(self.wal.rotate())?;
+        let moment = self.wal.moment();
         self.publish_up_to(latest.version);
         let capture = self.fatal(self.store.capture(latest.version, &latest.catalog.encode(), generation))?;
         self.commits_since_checkpoint.store(0, Ordering::Relaxed);
         drop(guard);
         self.fatal(self.store.write_checkpoint(capture))?;
-        self.fatal(self.wal.remove_before(generation))
+        self.moment.store(moment, Ordering::Relaxed);
+        self.fatal(self.settle_logs(generation, base))
+    }
+
+    /// Lets go of the log files before `generation`, which a checkpoint
+    /// has passed: removes them, or with an archive copies each there
+    /// and removes it when the copy is whole. The caller holds
+    /// `checkpointing`, or is the only one to know of the database yet.
+    ///
+    /// An error is the data directory's. What the archive refuses is
+    /// not one: the files it refused stay, the reason is kept for
+    /// `stats` and returned, and the next checkpoint tries again.
+    fn settle_logs(&self, generation: u64, base: bool) -> Result<Option<String>> {
+        let Some(archiving) = &self.archiving else {
+            wal::remove_logs(&*self.vfs, &self.dir, &self.name, |g| g < generation)?;
+            return Ok(None);
+        };
+        let mut progress = archiving.progress.lock().unwrap();
+        let refused = self.archive_logs(archiving, &mut progress, generation, base)?;
+        let now_failing = refused.is_some();
+        if now_failing != progress.error.is_some() || (now_failing && progress.error != refused) {
+            match &refused {
+                Some(why) => eprintln!("database: archive: {} of database {:?} is not in the archive, and its log files are kept until it is: {why}", archiving.history, self.name),
+                None => eprintln!("database: archive: {} of database {:?} is in the archive again", archiving.history, self.name),
+            }
+        }
+        progress.error = refused.clone();
+        *self.archive_failed.lock().unwrap() = refused.as_ref().map(|_| Instant::now());
+        Ok(refused)
+    }
+
+    fn archive_logs(&self, archiving: &Archiving, progress: &mut Progress, generation: u64, base: bool) -> Result<Option<String>> {
+        let (archive, history) = (&archiving.archive, archiving.history.as_str());
+        let uuid = self.store.meta().uuid;
+        let said = |e: Error| e.to_string();
+        let mut locals: Vec<u64> = wal::list_logs(&*self.vfs, &self.dir, &self.name)?.into_iter().filter(|g| *g < generation).collect();
+        progress.kept = locals.len();
+        if progress.chain == Chain::Unknown {
+            // What the archive holds decides what it still needs. Until
+            // it can be read, nothing is removed.
+            match archive.list(history) {
+                // No further than this server has itself seen the
+                // archive take: a directory may show a file whose sync
+                // failed, and a power cut would take that one back.
+                Ok(listing) => progress.chain = listing.next().map_or(Chain::Broken, |next| Chain::Next(progress.known.take().map_or(next, |known| known.min(next)))),
+                Err(e) => return Ok(Some(said(e))),
+            }
+        }
+        // The archive continues if the next file it needs is one the
+        // data directory still has, or the one being written.
+        let oldest = locals.first().copied().unwrap_or(generation);
+        let continues = matches!(progress.chain, Chain::Next(next) if next >= oldest && next <= generation);
+        let mut refused = None;
+        // A base of the data file as its checkpoint stands. Nothing a
+        // checkpoint names is written again before the next, and the
+        // caller holds the next one off. The log file being written is
+        // the one that continues from it: the checkpoint was made as
+        // that file began, or it is older and no file since holds a
+        // record, the last start having found none to replay.
+        let meta = self.store.meta();
+        let put_base = |progress: &mut Progress| {
+            let len = u64::from(meta.next_page) * crate::page::PAGE_SIZE as u64;
+            let put = archive.put_base(history, generation, self.moment.load(Ordering::Relaxed), len, &|buf, at| self.store.read_file(buf, at));
+            if put.is_ok() {
+                progress.bases_written += 1;
+            }
+            put.map_err(said)
+        };
+        if !continues {
+            // Nothing in the archive leads here: it begins again, with
+            // a base, and the log files the data directory still has
+            // are from before it.
+            match put_base(progress) {
+                Ok(()) => progress.chain = Chain::Next(generation),
+                Err(why) => {
+                    refused = Some(why);
+                    progress.chain = Chain::Broken;
+                }
+            }
+        }
+        let mut removed = false;
+        while let Some(&local) = locals.first() {
+            match progress.chain {
+                // Not continued by any base: no copy of it could be
+                // applied to anything.
+                Chain::Broken | Chain::Unknown => {}
+                // Copied already, or from before the base.
+                Chain::Next(next) if local < next => {}
+                Chain::Next(next) if local == next => {
+                    let copied = self.vfs.open(&wal::wal_path(&self.dir, &self.name, local), false).map_err(Error::Io).and_then(|file| archive.put_log(history, &uuid, local, &*file));
+                    if let Err(e) = copied {
+                        refused = Some(said(e));
+                        break;
+                    }
+                    progress.logs_written += 1;
+                    progress.chain = Chain::Next(next + 1);
+                }
+                // A file the data directory lacks lies between: what
+                // follows it continues from nothing.
+                Chain::Next(_) => progress.chain = Chain::Broken,
+            }
+            self.vfs.remove(&wal::wal_path(&self.dir, &self.name, local))?;
+            removed = true;
+            locals.remove(0);
+        }
+        if removed {
+            self.vfs.sync_dir(&self.dir)?;
+        }
+        progress.kept = locals.len();
+        if continues && base && refused.is_none() {
+            // A base that was asked for. It is written after the log
+            // files before it: the archive's newest base is then always
+            // one that every log file it holds leads to or follows, and
+            // a server that starts on it knows from the base alone
+            // which file the archive lacks next.
+            refused = put_base(progress).err();
+        }
+        Ok(refused)
+    }
+
+    /// Writes a base of the database to the archive, after a checkpoint
+    /// that leaves the log before it there as well. Returns the base's
+    /// place: the log file that continues from it.
+    pub fn base_copy(self: &Arc<Self>) -> Result<u64> {
+        let Some(archiving) = &self.archiving else {
+            return Err(Error::db(ErrorCode::InvalidRequest, "the server has no archive to write a base to: it was started without DATABASE_ARCHIVE"));
+        };
+        let _one = self.checkpointing.lock().unwrap();
+        // What the archive holds is read again: a base is asked for by
+        // someone who may have changed it by hand.
+        {
+            let mut progress = archiving.progress.lock().unwrap();
+            if let Chain::Next(next) = progress.chain {
+                progress.known = Some(next);
+            }
+            progress.chain = Chain::Unknown;
+        }
+        if let Some(why) = self.checkpoint_held(true)? {
+            return Err(Error::db(ErrorCode::Io, format!("the archive did not take the base of {}: {why}", archiving.history)));
+        }
+        Ok(self.wal.generation())
+    }
+
+    /// A checkpoint that fails if the archive did not take every log
+    /// file before it: for whoever is about to remove the database, and
+    /// with it the only other copy of its last commits.
+    pub fn checkpoint_archived(self: &Arc<Self>) -> Result<()> {
+        let _one = self.checkpointing.lock().unwrap();
+        match (self.checkpoint_held(false)?, &self.archiving) {
+            (Some(why), Some(archiving)) => Err(Error::db(ErrorCode::Io, format!("the archive has not taken the log of {} ({why}), and removing database {:?} would remove the only copy of its last commits: make the archive writable, or start the server without it", archiving.history, self.name))),
+            _ => Ok(()),
+        }
+    }
+
+    /// The database's history in the archive, and how its archiving
+    /// stands.
+    pub fn archive_progress(&self) -> Option<(String, Progress)> {
+        self.archiving.as_ref().map(|archiving| (archiving.history.clone(), archiving.progress.lock().unwrap().clone()))
+    }
+
+    /// Where the newest commit's record ends in the log: the file and
+    /// the byte. A restore is asked for a moment by one of these.
+    pub fn log_position(&self) -> (u64, u64) {
+        self.wal.position()
     }
 
     /// Deletes the database's files. The caller makes sure nobody uses it.
@@ -783,8 +1029,20 @@ impl Database {
 
     pub fn stats(&self) -> String {
         let latest = self.latest.lock().unwrap().clone();
+        let archive = match self.archive_progress() {
+            None => String::new(),
+            Some((history, progress)) => {
+                let (generation, offset) = self.wal.position();
+                let stands = match (&progress.error, progress.chain) {
+                    (Some(why), _) => format!("refused, {} log files kept for it: {why}", progress.kept),
+                    (None, Chain::Next(next)) => format!("whole up to log file {next}"),
+                    (None, _) => "without a base yet".to_string(),
+                };
+                format!("archive of {}: log position {}, history {history}, {} log files and {} bases written, {stands}\n", self.name, archive::position_text(generation, offset), progress.logs_written, progress.bases_written)
+            }
+        };
         format!(
-            "database {}: version {}, {} tables, {} pages, {} free, {} dirty, log {} bytes, {} commits, {} disk reads, {} disk writes, {} merges of full-text segments beside the writers and {} dropped\n",
+            "database {}: version {}, {} tables, {} pages, {} free, {} dirty, log {} bytes, {} commits, {} disk reads, {} disk writes, {} merges of full-text segments beside the writers and {} dropped\n{archive}",
             self.name,
             latest.version,
             latest.catalog.tables.len(),
@@ -1206,7 +1464,9 @@ impl WriteTxn {
         *db.latest.lock().unwrap() = snapshot;
         *db.last_commit.lock().unwrap() = Instant::now();
         db.commits.fetch_add(1, Ordering::Relaxed);
-        db.commits_since_checkpoint.fetch_add(1, Ordering::Relaxed);
+        if db.commits_since_checkpoint.fetch_add(1, Ordering::Relaxed) == 0 {
+            *db.first_commit.lock().unwrap() = Instant::now();
+        }
         // A commit that put nothing in the log, with nothing before it
         // still on its way to the disk, has nothing to wait for: readers
         // may see it now.

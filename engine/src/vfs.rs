@@ -39,6 +39,8 @@ pub trait Vfs: Send + Sync {
     fn exists(&self, path: &Path) -> bool;
     /// File names (not paths) directly inside `dir`.
     fn list(&self, dir: &Path) -> io::Result<Vec<String>>;
+    /// The names of the directories in `dir`.
+    fn list_dirs(&self, dir: &Path) -> io::Result<Vec<String>>;
     fn create_dir_all(&self, dir: &Path) -> io::Result<()>;
     /// Makes creations and removals inside `dir` durable.
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
@@ -98,6 +100,19 @@ impl Vfs for DiskVfs {
         for entry in std::fs::read_dir(dir)? {
             if let Ok(name) = entry?.file_name().into_string() {
                 names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+    fn list_dirs(&self, dir: &Path) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    names.push(name);
+                }
             }
         }
         names.sort();
@@ -841,6 +856,13 @@ impl Vfs for MemVfs {
         let state = self.state.lock().unwrap();
         let names = state.files.keys().filter(|p| p.parent() == Some(dir));
         Ok(names.filter_map(|p| p.file_name()?.to_str().map(String::from)).collect())
+    }
+    fn list_dirs(&self, dir: &Path) -> io::Result<Vec<String>> {
+        // A directory is there for as long as it holds a file.
+        let state = self.state.lock().unwrap();
+        let mut names: Vec<String> = state.files.keys().filter(|p| p.parent().and_then(Path::parent) == Some(dir)).filter_map(|p| p.parent()?.file_name()?.to_str().map(String::from)).collect();
+        names.dedup();
+        Ok(names)
     }
     fn create_dir_all(&self, _dir: &Path) -> io::Result<()> {
         Ok(())

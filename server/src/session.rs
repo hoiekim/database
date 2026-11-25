@@ -1678,6 +1678,31 @@ impl Session {
                 Ok(vec![Response::Ok])
             }
             Admin::Dump { .. } => unreachable!("handled by the caller"),
+            Admin::Base { databases } => {
+                let report = blocking(move || state.engine.base_copy(&databases)).await?.map_err(|e| e.into_db())?;
+                Ok(vec![Response::Text(report)])
+            }
+            Admin::Archive { history, commits } => {
+                let report = blocking(move || state.engine.archive_report(&history, commits)).await?.map_err(|e| e.into_db())?;
+                Ok(vec![Response::Text(report)])
+            }
+            Admin::Recover { from, to, target, replace, password } => {
+                let report = blocking(move || {
+                    // A database that is replaced keeps its password;
+                    // one that is new needs one before it has a name.
+                    let known = !state.access.lock().unwrap().note(&target).is_empty();
+                    if !known && password.is_empty() {
+                        return Err(DbError::invalid(format!("database {target:?} has no password yet: give one for it")));
+                    }
+                    let report = state.engine.recover_database(&from, to, &target, replace).map_err(|e| e.into_db())?;
+                    if !known {
+                        state.access.lock().unwrap().set(&target, &password).map_err(|e| DbError::new(ErrorCode::Io, e.to_string()))?;
+                    }
+                    Ok(report)
+                })
+                .await??;
+                Ok(vec![Response::Text(report)])
+            }
         }
     }
 

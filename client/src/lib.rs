@@ -37,6 +37,7 @@ pub use row::{FromRow, Row, Rows};
 pub use database_protocol::decimal::Decimal;
 pub use database_protocol::error::{DbError, DbResult, ErrorCode};
 pub use database_protocol::expr::{self, *};
+pub use database_protocol::message::Moment;
 pub use database_protocol::query::{Access, Assign, Bound, Delete, Direction, Insert, InsertSource, Join, JoinKind, KeyRange, OnConflict, Order, Query, Select, Update, ALL};
 pub use database_protocol::schema::{Check, ColumnDef, ForeignKey, IndexDef, IndexKey, IndexKind, OnDelete, TableDef, TextConfig, TextField, PRIMARY};
 pub use database_protocol::value::{Date, FromValue, Json, Timestamp, Type, Uuid, Value};

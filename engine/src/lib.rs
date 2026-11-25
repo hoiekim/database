@@ -1,5 +1,6 @@
 //! The storage engine.
 
+pub mod archive;
 pub mod blob;
 pub mod btree;
 pub mod cache;

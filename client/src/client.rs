@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::expr::Expr;
-use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Request, Response, TxnKind, EXPLAIN_COLUMNS};
+use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Moment, Request, Response, TxnKind, EXPLAIN_COLUMNS};
 use database_protocol::query::{Delete, Insert, Query, Update};
 use database_protocol::schema::{ColumnDef, IndexDef, TableDef};
 use database_protocol::value::{Timestamp, Value};
@@ -797,6 +797,44 @@ impl Admin<'_> {
         match self.call(AdminRequest::Stats).await? {
             Response::Text(report) => Ok(report),
             _ => Err(unexpected("stats")),
+        }
+    }
+
+    /// Writes a base of the named databases, or of all of them when
+    /// none is named, to the server's archive: the data file as of a
+    /// checkpoint, which the archived log after it brings to any later
+    /// moment. The server writes one by itself where the archive has
+    /// none; a newer one makes a restore shorter, and lets what is older
+    /// be removed from the archive. Returns a line for each base.
+    pub async fn base(&self, databases: &[&str]) -> DbResult<String> {
+        match self.call(AdminRequest::Base { databases: databases.iter().map(|d| d.to_string()).collect() }).await? {
+            Response::Text(report) => Ok(report),
+            _ => Err(unexpected("base")),
+        }
+    }
+
+    /// Reads the server's archive and reports what it holds of the
+    /// histories `history` names: a database's name, one history's
+    /// name, or nothing for all of them. An error if one is not whole:
+    /// a base or a log file is damaged or missing. With `commits`, the
+    /// report has a line for every commit: its position in the log, as
+    /// `Moment::Position` takes it, and its time.
+    pub async fn archive(&self, history: &str, commits: bool) -> DbResult<String> {
+        match self.call(AdminRequest::Archive { history: history.into(), commits }).await? {
+            Response::Text(report) => Ok(report),
+            _ => Err(unexpected("archive")),
+        }
+    }
+
+    /// Makes the database `target` what `from` held at the moment `to`,
+    /// from the server's archive. `from` is a database's name, or the
+    /// name of one history in the archive. `target` must not exist
+    /// unless `replace` is given; replaced, it keeps its password, and
+    /// new, it takes `password`. The server is as it was if this fails.
+    pub async fn recover(&self, from: &str, to: Moment, target: &str, replace: bool, password: &str) -> DbResult<String> {
+        match self.call(AdminRequest::Recover { from: from.into(), to, target: target.into(), replace, password: password.into() }).await? {
+            Response::Text(report) => Ok(report),
+            _ => Err(unexpected("recover")),
         }
     }
 
