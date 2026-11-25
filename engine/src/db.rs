@@ -832,6 +832,17 @@ struct Recent<'a> {
 /// As many pages as a query keeps for itself: half a megabyte.
 const RECENT_PAGES: usize = 64;
 
+impl<'a> Recent<'a> {
+    /// With room from the start for the pages of a few lookups: a map
+    /// grown a step at a time is built again at each step. (Room for all
+    /// it keeps would be a block too large for the allocator's per-thread
+    /// caches, taken for every query.)
+    fn new(store: &'a Store) -> Recent<'a> {
+        let pages = crate::page::PageMap::with_capacity_and_hasher(RECENT_PAGES / 4, Default::default());
+        Recent { store, pages: std::cell::RefCell::new(pages) }
+    }
+}
+
 impl Pages for Recent<'_> {
     fn page(&self, id: PageId) -> Result<crate::page::Page> {
         if let Some(page) = self.pages.borrow().get(&id) {
@@ -878,7 +889,7 @@ impl ReadTxn {
     pub fn query_with(&self, q: &Query, params: &[Value], deadline: Option<Instant>) -> Result<RowSet> {
         // A version's pages never change, so what the query has read
         // once it may read again from its own copy.
-        let recent = Recent { store: &self.db.store, pages: Default::default() };
+        let recent = Recent::new(&self.db.store);
         let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params, cost: &self.cost };
         exec::query(&ctx, q, &Scope::default())
     }
