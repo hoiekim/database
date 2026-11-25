@@ -207,7 +207,7 @@ fn a_standby_reads_its_primary_as_of_one_commit_and_never_an_earlier_one_than_be
 
 /// The disk as it stood before operation `at` of a journal kept from
 /// `base` on, cut there the way `fate` says.
-fn cut(base: &MemVfs, journal: &[Entry], at: usize, fate: &mut dyn FnMut(&Unsynced) -> Fate) -> MemVfs {
+fn cut(base: &MemVfs, journal: &[Entry], at: usize, fate: &mut Cut) -> MemVfs {
     let disk = base.snapshot();
     for entry in &journal[..at] {
         disk.apply(entry);
@@ -215,10 +215,13 @@ fn cut(base: &MemVfs, journal: &[Entry], at: usize, fate: &mut dyn FnMut(&Unsync
     disk.crash_image_with(fate)
 }
 
+/// What a power cut leaves of each change no sync had made durable.
+type Cut = Box<dyn FnMut(&Unsynced) -> Fate>;
+
 /// Three ways a power cut differs: nothing unsynced lost, all of it
 /// lost, and each change kept or lost on its own with the last write
 /// torn.
-fn cuts(journal: &[Entry], at: usize, seed: u64) -> Vec<Box<dyn FnMut(&Unsynced) -> Fate>> {
+fn cuts(journal: &[Entry], at: usize, seed: u64) -> Vec<Cut> {
     let last = journal[..at].iter().rposition(|entry| matches!(entry.op.kind, database_engine::vfs::OpKind::Write { .. })).map(|i| journal[i].op.index);
     vec![
         Box::new(|_| Fate::Kept),

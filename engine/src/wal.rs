@@ -197,6 +197,7 @@ impl Wal {
     /// standby's copy of its primary's log (`append_copy`). What the
     /// file holds beyond `offset` is cut off. A file that is not there,
     /// or has no room for a header, is begun.
+    #[allow(clippy::too_many_arguments)]
     pub fn resume(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, uuid: [u8; 16], generation: u64, version: u64, sync: bool, offset: u64) -> Result<Wal> {
         let path = wal_path(dir, name, generation);
         let (file, offset) = if offset >= HEADER_LEN && vfs.exists(&path) {
