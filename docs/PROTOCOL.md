@@ -21,7 +21,7 @@ What a request *means* (what a query reads, when a transaction
 conflicts) is in `CLIENT.md`. This file says how each one is written and
 what the server answers.
 
-This document describes protocol version **5**. What a version after 2
+This document describes protocol version **6**. What a version after 2
 added is marked "from version N" where it is described; "Versions" lists
 it all in one place. The golden vectors are of version 2, and the
 clients in `clients/` greet with version 2.
@@ -108,7 +108,7 @@ Hello: version u32, database str, password str, client str
 
 - `version` is the protocol version the client speaks: the newest one
   whose messages it implements, both those it sends and those it reads
-  (see "Versions"). A server answers versions 2 to 5.
+  (see "Versions"). A server answers versions 2 to 6.
 - `database` is the database to use. It may be empty, with the
   administrator's password, for a connection that only administers.
 - `password` is that database's password, or the administrator's, which
@@ -119,12 +119,12 @@ Hello: version u32, database str, password str, client str
 The server answers with a `Hello` response, and the connection is open:
 
 ```text
-Hello: version u32, server str        the server's own version, 5, whatever the client said;
+Hello: version u32, server str        the server's own version, 6, whatever the client said;
                                       and its name: "database 0.1.0"
 ```
 
 or with an `Error` response, after which it closes the connection:
-`ProtocolMismatch` if the client's version is below 2 or above 5
+`ProtocolMismatch` if the client's version is below 2 or above 6
 (see "Versions"), `AccessDenied` if the database does not exist or the
 password is wrong (the two are not told apart), `InvalidRequest` if the
 first frame was not a `Hello`.
@@ -163,7 +163,7 @@ tag        u8         which request
 | 19 | Prepared | `id varint, statement opt(Request), params list(Value)` | What the statement answers. From version 3; see "Prepared statements" |
 | 20 | BeginWith | `kind u8, lock_wait_ms varint, statement Request` | What the statement answers. From version 3; see "Beginning with a statement" |
 | 21 | Batch | `items list(BatchItem)`, where `BatchItem` is `statement Request, expect opt(varint)` | One result per statement, or one `Error`. From version 3; see "Batches" |
-| 22 | Explain | `statement Request` | `Rows`: one row of four ints. From version 4; see "Explain" |
+| 22 | Explain | `statement Request` | `Rows`: one row of four ints and, to a client of version 6, a text. From version 4; see "Explain" |
 
 In tags 19 to 22, a field of type `Request` is a request as this table
 gives it, without a `timeout_ms` of its own: its `u8` tag, then its
@@ -331,7 +331,8 @@ BatchItem:  statement Request, expect opt(varint)
 ### Explain
 
 From version 4. `Explain` runs a query and answers with what it read in
-place of its rows.
+place of its rows, and from version 6 with the way into each table it
+read.
 
 ```text
 Explain: statement Request
@@ -348,7 +349,9 @@ Explain: statement Request
   statement.
 - The answer is one `Rows` frame: `more` false, `affected` 1, no
   `total`, the columns `index_entries`, `rows_read`, `rows_returned` and
-  `micros`, and one row of four ints:
+  `micros`, and one row of four ints. To a client that greeted with
+  version 6 or more the frame has a fifth column, `way`, and the row a
+  fifth value, a text:
 
 | Column | |
 |---|---|
@@ -356,6 +359,36 @@ Explain: statement Request
 | `rows_read` | Rows read from tables: in key order, through an index, by a join or a subquery |
 | `rows_returned` | The rows the query returned: its `affected` |
 | `micros` | Microseconds from when the server began on the request to when the query finished. For a `BeginWith`, the wait to begin is included |
+| `way` | From version 6. The way into each table the query read: see below |
+
+- `way` is for a person to read. It is a list of parts joined by `"; "`,
+  each a table's name, quoted and escaped as Rust's `{:?}` writes a
+  string, then ` by ` and the way into it:
+
+| The way in | Written |
+|---|---|
+| The primary key | `its primary key` |
+| An ordered index | `index "name"` |
+| A tree walk | `a tree walk` |
+| A full-text search | `a search of "name"` |
+| Every row | `the whole table` |
+| A tree read in its own order, for a query sorted so | `its primary key, in its order` or `index "name", in its order` |
+
+  The first part is the query's own way in, if it names one (see
+  "Queries"). Then comes one part for each way in the server chose,
+  which ends with `, chosen`: for the query itself if it names none, and
+  for each query inside it that names none and was run (a join's, a
+  subquery's), each distinct choice once, in the order first made, at
+  most eight. The whole table is such a choice: it is what the server
+  reads where nothing narrower is sure to answer the same. A query of
+  no table that chose for nothing has an empty `way`. Examples:
+
+```text
+"mails" by index "mails_user_date"
+"mails" by index "mails_user_date", in its order, chosen
+"mails" by the whole table, chosen
+"sessions" by index "sessions_token"; "users" by its primary key, chosen
+```
 
 ### Requests inside requests
 
@@ -651,9 +684,25 @@ Order:   expr Expr, desc bool, nulls u8 (0 the default, 1 NULLs first, 2 NULLs l
 The server reads the rows `access` names, in key order, then applies
 the rest in a fixed sequence: joins (each run once per row so far), the
 unnest, the filter, grouping and `having`, the sort, offset and limit,
-the select. There is no planner. A table named `""` is one row of no
-table, for a query that only computes. The default null order puts NULLs
-last ascending and first descending.
+the select. A table named `""` is one row of no table, for a query that
+only computes. The default null order puts NULLs last ascending and
+first descending.
+
+**What a query answers is fixed by that sequence. What the server reads
+to answer it is fixed only where the query names its way in.** A query
+names no way in when its `access` is `Primary` with `reverse` false and
+one range whose two bounds are `Unbounded`: every row, which is what a
+client's query is until it is narrowed. For such a query, and for each
+such query inside another (a join's, a subquery's, an insert's source,
+the `rows` of an update or a delete), the server may read a range of
+the primary key or of an index in place of every row, where the query's
+filter gives one. It does so only where the answer is the one the
+sequence above gives over every row: the same rows in the same order,
+or the same error. A client can therefore not tell, except by `Explain`
+and by the time taken. Any other `access` is read as it is written:
+`Whole` (from version 6) is every row and nothing else, and so is a
+`Primary` over every key that is reversed. A server may be set to choose
+for no query; it then reads every row for one that names no way in.
 
 ```text
 Access, a u8 tag:
@@ -662,6 +711,7 @@ Access, a u8 tag:
   3 Walk:    start list(list(Expr)), parent str, direction u8 (0 up, 1 down), index opt(str),
              prune opt(Expr), stop opt(Expr), max_depth u32
   4 Search:  index str, prefix list(Expr), query Expr, match_prefix bool
+  5 Whole:   nothing more                                   every row, by primary key. From version 6
 
 KeyRange:  lower Bound, upper Bound, nulls bool
 Bound, a u8 tag:
@@ -686,6 +736,10 @@ Bound, a u8 tag:
 - **Search** reads the rows whose indexed text holds every word of
   `query`. `prefix` is the values of the full-text index's leading keys,
   all of them.
+- **Whole** reads every row of the table in primary key order, as a
+  `Primary` over every key does, and is never replaced by a range of the
+  server's choosing. From version 6; a server older than that refuses
+  the frame as malformed.
 
 ## Writes
 
@@ -951,13 +1005,16 @@ takes nothing away:
 | 3 | Requests `Prepared` (19), `BeginWith` (20) and `Batch` (21); the expression `Param` (22); the error codes `NotPrepared` (23) and `Unmet` (24) |
 | 4 | The request `Explain` (22) |
 | 5 | A column's last byte is `flags`, which may be followed by `keep_start` (see "Definitions") |
+| 6 | The access `Whole` (5); the fifth column of an `Explain`'s answer, `way` |
 
-**What the server does today.** It speaks versions 2 to 5. It answers a
-`Hello` that names a version in that range with its own, 5, and refuses
+**What the server does today.** It speaks versions 2 to 6. It answers a
+`Hello` that names a version in that range with its own, 6, and refuses
 any other with `ProtocolMismatch`, then closes the connection. It
 answers every request it can decode in the same way whatever version
-the client greeted with, with one difference: to a client that greeted
-with less than 5, it describes its tables without `keep_start`.
+the client greeted with, with two differences: to a client that greeted
+with less than 5, it describes its tables without `keep_start`; and to
+one that greeted with less than 6, it answers an `Explain` with four
+columns, without `way`.
 
 **The rule a client is written to.** It holds for this server and for
 those after it:
@@ -965,8 +1022,9 @@ those after it:
 - A client sends the newest version whose messages it implements, both
   those it sends and those it reads. One that implements only version 2
   sends 2, whatever versions exist by then; one that sends `Prepared`
-  sends at least 3, one that sends `Explain` at least 4, and one that
-  reads `keep_start` 5.
+  sends at least 3, one that sends `Explain` at least 4, one that
+  reads `keep_start` at least 5, and one that sends `Whole` or reads
+  `way` 6.
 - A server answers `ProtocolMismatch` to a version it does not speak,
   in its answer to `Hello`, and to nothing later. A server may speak
   several versions; a client must not assume which, and must be ready
@@ -989,6 +1047,16 @@ such a client never meets the bit; the setting changes where a server
 stores values, not what any request answers. The server takes a column
 with `keep_start` in `CreateTable` or `AddColumn` from a client of any
 version.
+
+**Version 6** adds one thing a client sends, the access `Whole`, and
+one thing a client reads, the column `way` of an `Explain`'s answer,
+which the server leaves out for a client that said less than 6. It
+changes the meaning of no frame: a query answers what it answered. What
+changed with the server that first spoke it is what such a server
+*reads* for a query that names no way in (see "Queries"), which no
+version of the protocol ever fixed, and it reads so for a client of any
+version. A client that must have every row read sends `Whole`, which
+takes version 6, or is served by a server set to choose for no query.
 
 **What a client does with what it does not know:**
 
@@ -1023,8 +1091,9 @@ of its bits, most significant first, so that NaN and the infinities can
 be written. The vectors cover every request and response, every kind of
 value at the edges of its range, every expression, operator, function
 and aggregate, every way into a table, and every error code, all of
-version 2. What versions 3 to 5 added has no vectors; "Requests of
-versions 3 and 4, byte by byte" below gives an example of each request.
+version 2. What versions 3 to 6 added has no vectors; "Requests of
+versions 3 and 4, byte by byte" below gives an example of each request,
+and of what version 6 added.
 
 A client's tests should at least:
 
@@ -1190,4 +1259,40 @@ e8 07                 timeout_ms: 1000
 01                    one row
 03 00 03 02 03 02       int 0, int 1, int 1
 03 e0 03                int, zigzag 480 = 240
+```
+
+That answer is what a client of version 4 or 5 reads. From version 6
+there is a fifth column. A query of every row of `t`, asked for as the
+whole table (the access `Whole`), explained, and its answer to a client
+of version 6: no index entries, 50 rows read and returned, in 240
+microseconds, by the way the query named:
+
+```text
+e8 07                 timeout_ms: 1000
+16                    Explain
+09                    statement: Query
+01 74                   table: "t"
+00                      alias: none
+05                      access: Whole
+00 00 00 00 00 00       no joins, no unnest, no filter, no group_by, no having, no order_by
+00 00                   offset 0, no limit
+00 00 00                select: every column; distinct: false; with_total: false
+```
+
+```text
+03                    Rows
+00                    more: false
+05                    five columns
+0d 69 6e 64 65 78 5f 65 6e 74 72 69 65 73     "index_entries"
+09 72 6f 77 73 5f 72 65 61 64                 "rows_read"
+0d 72 6f 77 73 5f 72 65 74 75 72 6e 65 64     "rows_returned"
+06 6d 69 63 72 6f 73                          "micros"
+03 77 61 79                                   "way"
+01                    affected: 1
+00                    total: none
+01                    one row
+03 00 03 64 03 64       int 0, int 50, int 50
+03 e0 03                int, zigzag 480 = 240
+06 16 22 74 22 20 62 79 20 74 68 65 20 77 68 6f 6c 65 20 74 61 62 6c 65
+                        text, 22 bytes: "t" by the whole table
 ```

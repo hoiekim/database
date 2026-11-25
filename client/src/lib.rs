@@ -21,9 +21,11 @@
 //! let ann = db.query_opt(Query::table("users").index("users_username_key", KeyRange::eq(["ann"]))).await?;
 //! ```
 //!
-//! There is no SQL and no planner: a query says which key or index to
-//! read and in what range, and the server does exactly that. See
-//! `docs/CLIENT.md` in the repository for the common patterns.
+//! There is no SQL: a query says which key or index to read and in what
+//! range, and the server does exactly that. A query that says neither is
+//! given a range by the server where its filter is one, and answers the
+//! same either way. See `docs/CLIENT.md` in the repository for the
+//! common patterns.
 
 mod client;
 mod config;

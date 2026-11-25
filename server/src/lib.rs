@@ -59,6 +59,9 @@ pub struct ServerConfig {
     /// server's log (standard error) with what it read: see
     /// `session::slow`. `None` logs none.
     pub slow_statement: Option<Duration>,
+    /// Whether a query that names no way in has one chosen for it. Where
+    /// not, such a query reads its whole table.
+    pub plan: bool,
 }
 
 impl ServerConfig {
@@ -73,6 +76,7 @@ impl ServerConfig {
             lock_wait: Duration::from_secs(30),
             idle_transaction: Duration::from_secs(60),
             slow_statement: None,
+            plan: true,
         }
     }
 }
@@ -177,7 +181,7 @@ impl Server {
         // quarter in the pages of an open transaction.
         let cache_pages = config.cache_bytes / database_engine::page::PAGE_SIZE;
         let limits = Limits { max_dirty: (cache_pages / 8).max(64), max_private: (cache_pages / 4).max(128) };
-        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, limits, ..Options::default() }, ..EngineOptions::default() };
+        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, limits, plan: config.plan, ..Options::default() }, ..EngineOptions::default() };
         let dir = config.data_dir.clone();
         // Recovery reads and writes files: keep it off the async threads.
         let engine = tokio::task::spawn_blocking(move || Engine::open(&dir, options)).await.map_err(std::io::Error::other)?.map_err(|e| std::io::Error::other(e.to_string()))?;

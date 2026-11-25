@@ -77,11 +77,15 @@ pub struct Options {
     pub limits: Limits,
     /// A checkpoint is due once the log is this long.
     pub checkpoint_bytes: u64,
+    /// Whether a query that names no way in has one chosen for it
+    /// (`plan.rs`). Where not, such a query reads its whole table, as
+    /// one that asks for it with `Access::Whole` always does.
+    pub plan: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { sync: true, limits: Limits::default(), checkpoint_bytes: 8 * 1024 * 1024 }
+        Options { sync: true, limits: Limits::default(), checkpoint_bytes: 8 * 1024 * 1024, plan: true }
     }
 }
 
@@ -488,7 +492,7 @@ impl Database {
         let published = self.published.lock().unwrap();
         let pinned = self.store.pin();
         debug_assert_eq!(pinned, published.version);
-        ReadTxn { db: self.clone(), snapshot: published.clone(), pinned, now: now_micros(), cost: Cost::default() }
+        ReadTxn { db: self.clone(), snapshot: published.clone(), pinned, now: now_micros(), cost: Cost::default(), plan: self.options.plan }
     }
 
     /// Starts a transaction that may write, waiting up to `wait` for the
@@ -503,7 +507,8 @@ impl Database {
             let synced = self.fatal(self.wal.sync_to(base.version))?;
             self.publish_up_to(synced);
         }
-        let tx = Tx::new(self.writer(false), (*base.catalog).clone(), now_micros());
+        let mut tx = Tx::new(self.writer(false), (*base.catalog).clone(), now_micros());
+        tx.plan = self.options.plan;
         Ok(WriteTxn { db: self.clone(), tx: Some(tx), base: base.version, failed: false, savepoints: Vec::new(), guard: Some(guard), pinned: None })
     }
 
@@ -610,7 +615,8 @@ impl Database {
             let published = self.published.lock().unwrap();
             (published.clone(), self.store.pin())
         };
-        let tx = Tx::new(self.writer(true), (*base.catalog).clone(), now_micros());
+        let mut tx = Tx::new(self.writer(true), (*base.catalog).clone(), now_micros());
+        tx.plan = self.options.plan;
         // Its owner will ask what each statement drew, to draw it again
         // if the fork has to be run a second time.
         tx.tape.record(true);
@@ -691,7 +697,7 @@ impl Database {
         let mut rows_total = 0u64;
         for table in latest.catalog.tables.values() {
             let cost = Cost::default();
-            let ctx = Ctx { pages, catalog: &latest.catalog, now: 0, deadline: None, tape: None, params: &[], cost: &cost };
+            let ctx = Ctx { pages, catalog: &latest.catalog, now: 0, deadline: None, tape: None, params: &[], cost: &cost, plan: false };
             // The rows, and the large values they name.
             let mut rows = 0u64;
             let mut blob_bytes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
@@ -818,6 +824,9 @@ pub struct ReadTxn {
     now: i64,
     /// What its queries have read since it was last asked.
     cost: Cost,
+    /// Whether its queries that name no way in have one chosen for
+    /// them: the database's `Options::plan`, unless set otherwise.
+    pub plan: bool,
 }
 
 /// The pages one query has read, kept at hand for as long as it runs. A
@@ -862,7 +871,7 @@ impl Pages for Recent<'_> {
 
 impl ReadTxn {
     pub fn ctx(&self, deadline: Option<Instant>) -> Ctx<'_> {
-        Ctx { pages: &*self.db.store, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params: &[], cost: &self.cost }
+        Ctx { pages: &*self.db.store, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params: &[], cost: &self.cost, plan: self.plan }
     }
 
     /// What its queries have read since this was last asked: see `Read`.
@@ -879,7 +888,7 @@ impl ReadTxn {
         // A version's pages never change, so what the query has read
         // once it may read again from its own copy.
         let recent = Recent { store: &self.db.store, pages: Default::default() };
-        let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params, cost: &self.cost };
+        let ctx = Ctx { pages: &recent, catalog: &self.snapshot.catalog, now: self.now, deadline, tape: None, params, cost: &self.cost, plan: self.plan };
         exec::query(&ctx, q, &Scope::default())
     }
 

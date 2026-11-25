@@ -255,6 +255,20 @@ impl Node<'_> {
 
 /// Makes `edit` in a page's bytes, which have room for it: the cells
 /// after the one changed move up or down, and their offsets with them.
+/// Adds `by` to each of a run of cell offsets as they lie in a page, two
+/// bytes each. An insert at the end of a full leaf passes over every
+/// offset the leaf has. Taken over the run alone, with no bound to check
+/// per offset, the loop is one the compiler makes into vector
+/// instructions wherever it is inlined; reading and writing each offset
+/// through the whole page, it did so or not by what was compiled beside
+/// it, at about a thousand instructions an insert.
+fn add_to_offsets(offsets: &mut [u8], by: u16) {
+    for offset in offsets.chunks_exact_mut(2) {
+        let old = u16::from_le_bytes([offset[0], offset[1]]);
+        offset.copy_from_slice(&old.wrapping_add(by).to_le_bytes());
+    }
+}
+
 fn apply(buf: &mut [u8], edit: &Edit) {
     let n = get_u16(buf, 6) as usize;
     let end = get_u16(buf, 8) as usize;
@@ -274,10 +288,7 @@ fn apply(buf: &mut [u8], edit: &Edit) {
                 put_u16(buf, HEADER + 2 * j, (old + 2 + cell.len()) as u16);
             }
             put_u16(buf, HEADER + 2 * i, (at + 2) as u16);
-            for j in 0..i {
-                let old = offset(buf, j);
-                put_u16(buf, HEADER + 2 * j, (old + 2) as u16);
-            }
+            add_to_offsets(&mut buf[HEADER..HEADER + 2 * i], 2);
             put_u16(buf, 6, (n + 1) as u16);
             put_u16(buf, 8, (end + 2 + cell.len()) as u16);
         }

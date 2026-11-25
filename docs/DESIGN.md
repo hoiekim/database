@@ -24,11 +24,17 @@ rows.
 
 ## What was left out, and what that bought
 
-There is no SQL, no planner and no optimizer. A `Query` names the index
-it reads and the range of keys; joins are lookups the client spells out;
-a filter is applied to whatever the range gives. The server never has to
-guess, so the same request always costs the same, and the executor is a
-few hundred lines.
+There is no SQL and no optimizer. A `Query` names the index it reads
+and the range of keys; joins are lookups the client spells out; a filter
+is applied to whatever the range gives. What a query names is exactly
+what runs, so the same request always costs the same, and the executor
+is a few hundred lines.
+
+A query that names no way in is the one case where the server chooses:
+a range of the primary key or of an index, read off the query's own
+filter by a handful of rules, and only where that answers exactly what
+reading the whole table would. There are no statistics and no cost
+model, and nothing is reordered (see "Choosing a way in").
 
 There is one writer per database at a time. That removes row locks, lock
 ordering and deadlocks: whatever is written is written by one
@@ -392,12 +398,12 @@ reached, which is what makes "the newest 50" cost 50 rows.
 
 **What a statement read is counted as it reads**: an entry for each
 index entry a range or a tree walk gives and each hit of a search, a
-row for each row read from a table, by any path. The two counts are
-all the explaining there is to do where nothing is planned: a
-statement's cost is what its own access path made the server read.
-They are what `Request::Explain` answers with in place of a query's
-rows, and what the server writes to its log beside a statement that
-took longer than `DATABASE_SLOW_MS`.
+row for each row read from a table, by any path. A statement's cost is
+what its way in made the server read, whether the query named that way
+or the server chose it. The two counts, and the ways the server chose,
+are what `Request::Explain` answers with in place of a query's rows, and
+what the server writes to its log beside a statement that took longer
+than `DATABASE_SLOW_MS`.
 
 Expressions are a tree (`Expr`) evaluated against a chain of scopes:
 the current row, the rows of enclosing joins and queries, the proposed
@@ -412,6 +418,179 @@ by one through three functions (`apply_insert`, `apply_update`,
 in step and add to the log record. Constraints are checked before a row
 is written: types and NOT NULL, checks, unique indexes, then foreign
 keys; a delete then visits the tables that point at the deleted rows.
+
+## Choosing a way in (`plan.rs`)
+
+A query that names its way in (`key`, `range`, `index`, a walk, a
+search, `whole`) is run as written and never second-guessed. A query
+that names none, which is what `Query::table` gives until it is
+narrowed, has its way in chosen when it runs. The same holds for the
+query inside a join, a subquery, an `Insert::from_query`, an `Update`
+and a `Delete`: each is a query, and each is looked at on its own.
+
+**A choice never changes what is answered** (R-Q23): the same rows, in
+the same order, or the same error, as reading the whole table and
+filtering. Three things hold for every choice, and each is what makes
+one of those true:
+
+- **The filter is still applied, whole, to every row read.** A chosen
+  range decides which rows are read, never which are kept. So a range
+  that takes in too much costs time and nothing else, and the rules
+  below have only to show that a range leaves out no row the filter
+  keeps.
+- **Rows are given in primary key order**, the order the whole table is
+  read in. A range of the primary key is in that order already. A range
+  of an index is read whole first, entries only; the primary keys it
+  gives are sorted, and the rows are then read in that order. What
+  follows the read (joins, grouping, a sort, which is stable, a limit)
+  therefore sees the rows it would have seen. An index read in a
+  query's own order is the one exception, below.
+- **Nothing that could fail is left unevaluated.** The whole table read
+  evaluates the joins and the filter on rows a range never reads, and
+  an error there (a text compared with a number, a division by zero) is
+  that query's answer. So a way in is chosen only for a query whose
+  filter and joins cannot fail on any row, which is decided from the
+  types of the columns and the values at hand, by a list of what is
+  known not to fail: columns, values, parameters, `now()`; comparisons
+  between kinds that compare; `and`, `or`, `not`; `is null`; `in` over a
+  list of values; `like` on text; `lower`, `upper`, `trim`, `left`,
+  `length` and `octet_length` of text; `try_cast`. Whatever does not read the query's
+  own rows (arithmetic on `now()`, a column of an enclosing query) is
+  computed once, and if that fails the whole table is read and fails as
+  it would have. A query with anything else in its filter (arithmetic
+  on a column, a subquery, a JSON function) reads the whole table, as
+  it did before there was a choice.
+
+**What "light" means.** The choice is made by rules over the filter as
+written and the table's definition. There are no statistics, nothing is
+sampled, and nothing is kept between statements: a statement is looked
+at each time it runs, with its parameters' values in hand, against the
+tables as they are in the version it reads. So a prepared statement
+needs no plan kept for it, and an index created or dropped since it was
+prepared is simply there or not when it next runs. The one count used
+is the table's row count, which the engine keeps anyway (below).
+
+**Which filters a rule can use.** The filter is taken apart at its top
+level `and`s into conditions that must all hold. A tree (the primary
+key, or an ordered index) fits by its leading key parts:
+
+- **Equality** on a key part: `part = value`, `part is not distinct
+  from value`, `part is null`, and `part in (values)`, which gives a
+  range per value. Parts are bound from the first on, without a gap.
+  Lists on several parts multiply; a part whose list would make more
+  than 256 ranges is left to the filter, with the parts after it.
+- **A range** on the part after those: `<`, `<=`, `>`, `>=`, from one
+  side or both. A range never takes in the entries whose part is NULL,
+  on a rising key or a descending one, since no comparison holds for
+  them.
+- A **value** is whatever is the same for every row of the query: a
+  literal, a parameter, `now()`, an enclosing query's column, and
+  expressions of those. It is used as a bound only if it is of the
+  part's own kind, or a text that reads as it (a uuid, a timestamp, a
+  date or a decimal written as text, as a comparison reads it). An
+  integer compared with a decimal column compares, but is not used: the
+  rule is that the bytes of the bound are the bytes a stored key would
+  have. A value that is NULL makes a condition that holds for no row,
+  and nothing is read.
+- A **key part** is a plain column, or an index's key expression
+  written the same way in the filter (`lower(email)`), when its kind is
+  one whose keys sort as its values compare: bool, int, decimal, text,
+  bytes, uuid, timestamp, date. Floats are left out, because a NaN
+  sorts in one place as a key and in another as a value; so are JSON
+  and lists.
+- A **partial index** is used only if its condition stands in the
+  filter, as one of the conditions that must all hold, written as the
+  index has it. Nothing is deduced: `n > 5` does not imply `n > 3` here.
+- A **unique index** is read like any other; one whose whole key is
+  bound is preferred, since it gives one row.
+
+**What is left alone.** `or` at the top of a filter (it is evaluated,
+not split into ranges); a multi-valued index (`on_each`); a full-text
+index, which has its own way in; a query with `each`; a join that is
+not a plain lookup (see below). Each of these reads the whole table as
+before.
+
+**When two fit**, the order is fixed, so the same statement on the same
+schema with values of the same kinds always takes the same way: a tree
+whose whole unique key is bound; then more parts bound by equality;
+then a range on the next part, from both sides before one; then the
+primary key before an index; then the index defined first.
+
+**An index range given up.** A range of an index is gathered before
+any row is read. If it turns out to hold more than a quarter of the
+table's rows (and more than 1,024 entries), or more than about a
+million entries, it is dropped and the whole table is read: by then
+reading in key order is as cheap, and the keys held to be sorted are
+bounded. Nothing has been given out at that point, so the answer is
+the whole table's by construction.
+
+**Order and limit** (R-Q24). A query with an `order_by`, a `limit` and
+no `with_total` reads its whole range and sorts, when its way in is
+named. Where none is named, a tree whose key parts, after those bound
+by equality, are the `order_by` columns in order is read in its own
+order, and the read stops when the page is full: the untuned "newest
+50 of a mailbox". It is taken only if all of this holds:
+
+- Every sort key is a plain column of a kind listed above, each with
+  the direction and the place for NULLs that the key has, read forwards
+  or all backwards.
+- Rows that tie on the sort keys come in primary key order, which is
+  where a stable sort of the whole table leaves them: the key parts
+  after the sort keys must lead with the primary key. Read backwards,
+  ties would come reversed, so then there may be none: the sort keys
+  and the bound parts must take in the primary key.
+- The query has no joins, no `distinct` and no grouping, and what it
+  selects cannot fail either: rows past the page are never selected
+  now, and the whole table read selects every row before it sorts.
+- **No other tree binds more parts by equality.** A narrower range is
+  never given up for an order: reading in order stops early only if
+  the filter keeps most of what it meets, which rules cannot know, and
+  a range that is narrow by equality is bounded whatever the data.
+
+**Joins and subqueries are in scope, each as a query of its own.** The
+inner side of a join runs once per row so far, with that row as its
+enclosing scope, and a column of the outer row is a value for it: so
+`join(Query::table("users").filter(col("users.id").eq(col("s.user_id"))))`
+is a lookup by primary key per row, chosen each time it runs. Nothing
+is reordered, no join is turned into another kind, and the outer side
+is not chosen by what the inner side could do. Choosing per row costs a
+look at the filter per row, which is small beside the table read it
+replaces. What the *outer* query needs of its joins is only that they
+cannot fail on the rows it will no longer read: a join qualifies if
+its query is a plain lookup (no joins of its own, a filter that cannot
+fail, a named range whose bounds are of the key's kinds, or no way in
+named); otherwise the outer query reads its whole table.
+
+**Writes are chosen for, by range.** An `Update` or a `Delete` finds
+its rows with a query, collects them all, and only then writes
+(`Tx::targets`). The query goes through the same function as a read's,
+so its rows are the same rows in the same order by the argument above,
+and since no row is written until all are found, what is written is
+the same (R-W14). The read in an index's own order is not used for
+writes: their sort is made in `targets`, not by the query.
+
+**Seeing the choice.** Each choice is noted beside the counts of what
+was read: the table and the tree, or the whole table when nothing fit
+or a range was given up. `Explain` answers with them in a fifth column,
+`way`, and the slow-statement log ends its line with them. A statement
+whose way in was named shows that, and is not marked as chosen. A
+query that ran its inner side many times shows each distinct choice
+once, up to eight.
+
+**It is the default.** A query that names no way in is chosen for
+unless it asks otherwise. The case for: the queries it changes are
+exactly the ones that read a whole table to keep a few rows, it changes
+their cost and never their answer (`engine/tests/planner.rs` runs each
+generated statement both ways and compares), and an application gets it
+without a new client. The case against: a statement's cost is no longer
+read off the statement alone, since it depends on which indexes exist;
+and an application that relied on a whole-table read's timing, or on
+its failing by deadline, sees that change. Two things answer that. A
+query can say it wants the whole table, `Query::whole()` (a way in of
+its own on the wire, from protocol version 6), and is then never chosen
+for. And a server started with `DATABASE_PLAN=off` chooses for nobody,
+which is also how a client of an older protocol version gets the old
+behaviour.
 
 ## Full-text indexes (`fts.rs`, `text.rs`)
 

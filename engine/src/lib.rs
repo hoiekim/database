@@ -13,6 +13,7 @@ pub mod exec;
 pub mod fts;
 pub mod keys;
 pub mod page;
+pub mod plan;
 pub mod row;
 pub mod store;
 pub mod text;

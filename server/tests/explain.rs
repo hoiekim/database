@@ -1,7 +1,7 @@
-//! What a statement cost, where there is no plan to show: how many index
-//! entries and rows its access path made the server read (R-O7). Asked
-//! for with `explain`, and written to the server's log for a statement
-//! that was slow.
+//! What a statement cost: how many index entries and rows its way in
+//! made the server read, and which way that was, named by the statement
+//! or chosen by the server (R-O7). Asked for with `explain`, and written
+//! to the server's log for a statement that was slow.
 
 mod common;
 use std::io::{BufRead, BufReader};
@@ -9,7 +9,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use common::*;
-use database_protocol::message::Request;
+use database_protocol::message::{decode_response, encode_request, Request, Response, CHOSEN_WAY_VERSION, OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 1,000 notes of 20 owners, 50 each, with an index by owner and day and
 /// a full-text index by owner.
@@ -104,11 +105,13 @@ async fn a_query_says_what_its_way_in_made_the_server_read() -> DbResult<()> {
     assert_eq!(read(db.explain(Query::table("notes").key([7])).await?), (0, 1, 1));
     assert_eq!(read(db.explain(Query::table("notes").key([7_000])).await?), (0, 0, 0));
     // A filter over the whole table reads the whole table, however few
-    // rows it keeps: this is the query that needs an index.
-    assert_eq!(read(db.explain(Query::table("notes").filter(col("owner").eq(3).and(col("day").eq(10)))).await?), (0, 1_000, 1));
+    // rows it keeps.
+    assert_eq!(read(db.explain(Query::table("notes").whole().filter(col("owner").eq(3).and(col("day").eq(10)))).await?), (0, 1_000, 1));
     // The same rows through the index: the entries of the range, and a
-    // row for each.
+    // row for each. The same again where no way in is named and the
+    // server reads that range of its own accord.
     assert_eq!(read(db.explain(Query::table("notes").index("notes_owner_day", KeyRange::eq([3, 10]))).await?), (1, 1, 1));
+    assert_eq!(read(db.explain(Query::table("notes").filter(col("owner").eq(3).and(col("day").eq(10)))).await?), (1, 1, 1));
     assert_eq!(read(db.explain(Query::table("notes").index("notes_owner_day", KeyRange::eq([3]))).await?), (50, 50, 50));
     // A range wider than what the filter keeps shows as the difference.
     assert_eq!(read(db.explain(Query::table("notes").index("notes_owner_day", KeyRange::eq([3])).filter(col("day").ge(45))).await?), (50, 50, 5));
@@ -134,8 +137,145 @@ async fn a_query_says_what_its_way_in_made_the_server_read() -> DbResult<()> {
 
     // It says how long it took, and it took some time.
     let slow = db.explain(Query::table("notes").filter(col("body").like("%rare%"))).await?;
-    assert_eq!(read(slow), (0, 1_000, 10));
+    assert_eq!(read(slow.clone()), (0, 1_000, 10));
     assert!(slow.took > Duration::ZERO && slow.took < Duration::from_secs(10), "{:?}", slow.took);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_says_which_way_in_it_took_and_who_chose_it() -> DbResult<()> {
+    // R-O7, R-Q23
+    let (_server, db) = fresh().await;
+    notes(&db).await?;
+    let way = |q: Query| {
+        let db = &db;
+        async move { db.explain(q).await.map(|e| e.way) }
+    };
+    // A way in the query names is shown as named.
+    assert_eq!(way(Query::table("notes").key([7])).await?, r#""notes" by its primary key"#);
+    assert_eq!(way(Query::table("notes").index("notes_owner_day", KeyRange::eq([3]))).await?, r#""notes" by index "notes_owner_day""#);
+    assert_eq!(way(Query::table("notes").search("notes_search", [0], "rare")).await?, r#""notes" by a search of "notes_search""#);
+    assert_eq!(way(Query::table("notes").whole().filter(col("owner").eq(3))).await?, r#""notes" by the whole table"#);
+    // Where it names none, what the server chose, marked so: a range of
+    // an index or of the primary key, a tree in its own order for a
+    // sorted page, or the whole table when nothing fits.
+    assert_eq!(way(Query::table("notes").filter(col("owner").eq(3))).await?, r#""notes" by index "notes_owner_day", chosen"#);
+    assert_eq!(way(Query::table("notes").filter(col("id").lt(9))).await?, r#""notes" by its primary key, chosen"#);
+    assert_eq!(way(Query::table("notes").filter(col("owner").eq(3)).order_by(col("day")).limit(5)).await?, r#""notes" by index "notes_owner_day", in its order, chosen"#);
+    assert_eq!(way(Query::table("notes").filter(col("body").like("%rare%"))).await?, r#""notes" by the whole table, chosen"#);
+    assert_eq!(way(Query::table("notes")).await?, r#""notes" by the whole table, chosen"#);
+    // A join and a subquery each have a way in of their own: the
+    // query's first, then each that was chosen.
+    let joined = Query::table("notes").alias("n").index("notes_owner_day", KeyRange::eq([3])).join(Query::table("owners").alias("o").filter(col("o.id").eq(col("n.owner"))));
+    let explained = db.explain(joined).await?;
+    assert_eq!(explained.way, r#""notes" by index "notes_owner_day"; "owners" by its primary key, chosen"#);
+    assert_eq!(read(explained), (50, 100, 50));
+    let with_notes = Query::table("owners").filter(exists(Query::table("notes").filter(col("notes.owner").eq(col("owners.id")).and(col("notes.day").eq(0)))));
+    assert_eq!(way(with_notes).await?, r#""owners" by the whole table, chosen; "notes" by index "notes_owner_day", chosen"#);
+    assert_eq!(way(Query::row().select("n", scalar(Query::table("notes").filter(col("id").eq(1)).columns(["day"])))).await?, r#""notes" by its primary key, chosen"#);
+    assert_eq!(way(Query::row().select("at", now())).await?, "");
+    // A prepared query is chosen for each time it runs, by the values
+    // it is run with: a NULL owner is no range at all.
+    let by_owner = Prepared::new(Query::table("notes").filter(col("owner").eq(param(0))));
+    let explained = db.explain_prepared(&by_owner, [4]).await?;
+    assert_eq!((explained.way.as_str(), explained.rows_read), (r#""notes" by index "notes_owner_day", chosen"#, 50));
+    let explained = db.explain_prepared(&by_owner, [Value::Null]).await?;
+    assert_eq!((explained.way.as_str(), explained.rows_read), (r#""notes" by its primary key, chosen"#, 0));
+    Ok(())
+}
+
+/// Sends frames as they are and reads one answer to each.
+async fn raw(port: u16, frames: &[Vec<u8>]) -> Vec<Response> {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut answers = Vec::new();
+    for frame in frames {
+        stream.write_all(&(frame.len() as u32).to_le_bytes()).await.unwrap();
+        stream.write_all(frame).await.unwrap();
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).await.unwrap();
+        let mut answer = vec![0u8; u32::from_le_bytes(len) as usize];
+        stream.read_exact(&mut answer).await.unwrap();
+        answers.push(decode_response(&answer).unwrap());
+    }
+    answers
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_from_before_the_way_was_told_is_answered_as_it_always_was() -> DbResult<()> {
+    // R-O7
+    let (server, db) = fresh().await;
+    notes(&db).await?;
+    let hello = |version: u32| encode_request(&Request::Hello { version, database: "test".into(), password: PASSWORD.into(), client: "raw".into() }, 0);
+    let explain = encode_request(&Request::Explain(Box::new(Request::Query(Query::table("notes").filter(col("owner").eq(3))))), 0);
+    for version in OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION {
+        let answers = raw(server.port, &[hello(version), explain.clone()]).await;
+        let Response::Rows { set, .. } = &answers[1] else { panic!("version {version}: {:?}", answers[1]) };
+        // The query is chosen for whoever sends it: 50 entries, 50 rows.
+        assert_eq!(set.rows[0][..3], [Value::Int(50), Value::Int(50), Value::Int(50)], "version {version}");
+        if version >= CHOSEN_WAY_VERSION {
+            assert_eq!(set.columns, ["index_entries", "rows_read", "rows_returned", "micros", "way"], "version {version}");
+            assert_eq!(set.rows[0][4], Value::Text(r#""notes" by index "notes_owner_day", chosen"#.into()), "version {version}");
+        } else {
+            assert_eq!(set.columns, ["index_entries", "rows_read", "rows_returned", "micros"], "version {version}");
+            assert_eq!(set.rows[0].len(), 4, "version {version}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_told_not_to_choose_reads_the_whole_table_for_every_query_that_names_no_way_in() -> DbResult<()> {
+    // R-Q23
+    let server = TestServer::start_with(TempDir::new(), |config| config.plan = false).await;
+    let db = server.client("test").await;
+    notes(&db).await?;
+    let untuned = Query::table("notes").filter(col("owner").eq(3));
+    let explained = db.explain(untuned.clone()).await?;
+    assert_eq!(explained.way, r#""notes" by the whole table"#);
+    assert_eq!(read(explained), (0, 1_000, 50));
+    assert_eq!(read(db.explain(untuned.clone().order_by(col("day")).limit(5)).await?), (0, 1_000, 5));
+    // An update finds its rows the same way.
+    assert_eq!(db.update(Update::table("notes").filter(col("owner").eq(3)).set("day", 0)).await?.affected(), 50);
+    // A way in that is named is read as named, as everywhere.
+    assert_eq!(read(db.explain(Query::table("notes").index("notes_owner_day", KeyRange::eq([4]))).await?), (50, 50, 50));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_statement_is_chosen_for_by_the_indexes_there_are_when_it_runs() -> DbResult<()> {
+    // R-Q23, R-X11
+    let server = TestServer::start().await;
+    server.client("test").await;
+    // One connection, so that the statement is kept by it throughout.
+    let db = server.client_with("test", |config| config.pool_size = 1).await;
+    notes(&db).await?;
+    let by_day = Prepared::new(Query::table("notes").filter(col("day").eq(param(0))).columns(["id"]));
+    let run = |day: i64| {
+        let (db, by_day) = (&db, &by_day);
+        async move {
+            let ids: Vec<i64> = db.execute(by_day, [day]).await?.column()?;
+            let explained = db.explain_prepared(by_day, [day]).await?;
+            Ok::<_, DbError>((ids, explained.index_entries, explained.rows_read, explained.way))
+        }
+    };
+    let ids: Vec<i64> = (200..220).collect();
+    assert_eq!(run(10).await?, (ids.clone(), 0, 1_000, r#""notes" by the whole table, chosen"#.to_string()));
+    // An index made after the statement was prepared serves it the next
+    // time it runs; dropped, the statement reads the whole table again.
+    // It answers the same throughout.
+    db.create_index("notes", IndexDef::new("notes_day").on(["day"])).await?;
+    assert_eq!(run(10).await?, (ids.clone(), 20, 20, r#""notes" by index "notes_day", chosen"#.to_string()));
+    db.drop_index("notes", "notes_day").await?;
+    assert_eq!(run(10).await?, (ids.clone(), 0, 1_000, r#""notes" by the whole table, chosen"#.to_string()));
+    // A column the filter reads, dropped and made again as another
+    // type: the statement is looked at afresh, and fails as the whole
+    // table read does, on a text compared with an integer.
+    db.drop_index("notes", "notes_owner_day").await?;
+    db.drop_column("notes", "day").await?;
+    db.add_column("notes", ColumnDef::new("day", Type::Text).default("ten")).await?;
+    db.create_index("notes", IndexDef::new("notes_day").on(["day"])).await?;
+    assert_eq!(db.execute(&by_day, [10]).await.unwrap_err().code, ErrorCode::TypeMismatch);
+    assert_eq!(db.execute(&by_day, ["ten"]).await?.len(), 1_000);
     Ok(())
 }
 
@@ -222,6 +362,9 @@ async fn a_slow_statement_is_written_to_the_log_with_what_it_read() -> DbResult<
     let (mut server, lines, db) = logged(&dir, Some("0")).await;
     notes(&db).await?;
     db.query(Query::table("notes").filter(col("body").eq("secret-filter-value"))).await?;
+    db.query(Query::table("notes").filter(col("owner").eq(6)).limit(7)).await?;
+    db.query(Query::table("notes").whole().filter(col("owner").eq(6)).limit(9)).await?;
+    db.update(Update::table("notes").filter(col("owner").eq(7).and(col("day").lt(2))).set("body", "secret-other-value")).await?;
     db.query(Query::table("notes").alias("n").index("notes_owner_day", KeyRange::eq([3])).join(Query::table("owners").alias("o").key([col("n.owner")])).order_by(col("n.day")).limit(5)).await?;
     db.update(Update::table("notes").index("notes_owner_day", KeyRange::eq([4])).set("body", "secret-new-value")).await?;
     db.transaction(|tx| async move {
@@ -250,16 +393,24 @@ async fn a_slow_statement_is_written_to_the_log_with_what_it_read() -> DbResult<
     let find = |what: &str| slow.iter().find(|line| line.contains(what)).unwrap_or_else(|| panic!("no line about {what:?} in {slow:#?}"));
 
     // Who, what, and what it read.
-    let scan = find("query \"notes\" by the whole table, filtered");
+    // A query that names no way in is described so, and what the
+    // server chose for it ends the line.
+    let scan = find("query \"notes\" by the server's choice, filtered:");
     assert!(scan.contains("database \"test\", client \"the test\""), "{scan}");
-    assert!(scan.ends_with("read 0 index entries and 1000 rows"), "{scan}");
+    assert!(scan.ends_with("read 0 index entries and 1000 rows; chose \"notes\" by the whole table"), "{scan}");
+    let chosen = find("query \"notes\" by the server's choice, filtered, limit 7");
+    assert!(chosen.ends_with("read 50 index entries and 7 rows; chose \"notes\" by index \"notes_owner_day\""), "{chosen}");
+    let asked = find("query \"notes\" by the whole table, filtered, limit 9");
+    assert!(asked.ends_with("read 0 index entries and 167 rows"), "{asked}");
+    let untuned = find("update \"notes\" by the server's choice, filtered");
+    assert!(untuned.contains("read 2 index entries") && untuned.ends_with("; chose \"notes\" by index \"notes_owner_day\""), "{untuned}");
     let joined = find("query \"notes\" by index \"notes_owner_day\", 1 joined, sorted, limit 5");
     assert!(joined.ends_with("read 50 index entries and 100 rows"), "{joined}");
     let update = find("update \"notes\" by index \"notes_owner_day\"");
     assert!(update.contains("read 50 index entries"), "{update}");
     find("delete from \"notes\" by its primary key");
     let batch = find("batch of 2 statements");
-    assert!(batch.ends_with("read 0 index entries and 21 rows"), "{batch}");
+    assert!(batch.ends_with("read 0 index entries and 21 rows; chose \"owners\" by the whole table"), "{batch}");
     find("insert into \"notes\", 250 rows");
     let prepared = find("query \"notes\" by index \"notes_owner_day\", filtered");
     assert!(prepared.ends_with("read 50 index entries and 50 rows"), "{prepared}");
@@ -270,7 +421,7 @@ async fn a_slow_statement_is_written_to_the_log_with_what_it_read() -> DbResult<
     find(": commit: ");
     // A name is written quoted and escaped, so it stays inside its line:
     // every line of the log is one the server wrote.
-    find(r#"query "notes\ndatabase: slow: 9 ms, database \"forged\"" by the whole table"#);
+    find(r#"query "notes\ndatabase: slow: 9 ms, database \"forged\"" by the server's choice"#);
     find(r#"by index "notes\ndatabase: slow: 9 ms, database \"forged\"""#);
     find(r#"insert into "notes\ndatabase: slow: 9 ms, database \"forged\"", 1 rows"#);
     // (Told apart by the forged database's name, and not by the forged

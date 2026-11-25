@@ -121,7 +121,8 @@ db.create_table_if_not_exists(
 A query names one way into the table and reads rows in that order:
 
 ```rust
-Query::table("mails")                                   // every row, by primary key
+Query::table("mails")                                   // no way in named: the server chooses (below)
+Query::table("mails").whole()                           // every row, by primary key
 Query::table("mails").key([mail_id])                    // one row by primary key
 Query::table("mails").keys(ids.iter().map(|id| [*id]))  // several, in the order given
 Query::table("mails").range(KeyRange::new(Bound::excluded([cursor]), Bound::Unbounded))
@@ -148,18 +149,78 @@ is `IS NOT DISTINCT FROM` for each value (with a literal NULL, `IS
 NULL`), and `.nulls()` does the same for any range. NULL keys sort after
 all others, and a range with no upper bound runs through them.
 
-**There is no planner.** `filter` is applied to the rows the range gives,
-whatever it mentions. `Query::table("users").filter(col("email").eq(x))`
-reads the whole table; give it an index range to make it fast. A text in
-a range bound or compared with a uuid, timestamp, date or decimal is read
-as one, as in SQL.
+**A way in that is named is exactly what runs.** `filter` is applied to
+the rows the range gives, whatever it mentions, and a query that names
+an index reads that index however the filter could have been served
+better. A text in a range bound or compared with a uuid, timestamp,
+date or decimal is read as one, as in SQL.
+
+**A query that names no way in has one chosen for it**, each time it
+runs. `Query::table("users").filter(col("email").eq(x))` reads the
+index on `email` if there is one, and the whole table if not. The
+choice never changes what the query answers: the same rows, in the same
+order, or the same error, as reading every row and filtering (R-Q23).
+It is made by a few rules over the filter as written, with no
+statistics behind them, so it can be read off the query and the
+table's definition:
+
+- The filter is taken apart at its top-level `and`s. A key (the primary
+  key or an ordered index) is used by its leading parts: equality on
+  each from the first (`=`, `in` over values, `is null`), then
+  optionally a range (`<`, `<=`, `>`, `>=`) on the next.
+- What a part is compared with must be the same for every row: a
+  value, a `param`, `now()`, a column of an enclosing query, or an
+  expression of those. It must be of the part's own kind (or a text
+  that reads as a uuid, timestamp, date or decimal, as everywhere). An
+  integer compared with a decimal column compares, and is not a range.
+- A key part is a plain column, or an index's expression written the
+  same way (`col("email").lower()`), of a kind other than float, JSON
+  or list. A partial index is used only if the filter repeats its
+  condition as the index has it.
+- **Every condition of the filter must be one that cannot fail on any
+  row**: comparisons between kinds that compare, `and`/`or`/`not`, `is
+  null`, `in`, `like`, `lower`/`upper`/`trim`/`left`/`length`,
+  `try_cast`. Arithmetic on a column, a strict `cast`, a JSON function
+  or a subquery in the filter leaves the query on the whole table,
+  because that read would have evaluated them on rows a range skips,
+  and their error is the query's answer. The same goes for its joins:
+  each must be a plain lookup.
+- `or` at the top of a filter, an `on_each` index and a query with
+  `each` are left alone. Full-text search has its own way in.
+- Of two keys that fit: one whose whole unique key is bound, then the
+  one with more parts bound by equality, then a range from both sides
+  before one, then the primary key, then the index defined first.
+- **A sorted page.** With `order_by`, a `limit` and no `with_total`, a
+  key whose parts after the equalities are the sort columns, in the
+  key's directions (or all reversed), is read in its own order and the
+  read stops when the page is full (R-Q24):
+  `Query::table("mails").filter(col("user_id").eq(u)).order_by(col("date").desc()).limit(50)`
+  reads 50 rows through an index on `(user_id, date desc, mail_id)`.
+  Rows that tie on the sort keys must come as the sort would leave
+  them, in primary key order, so the index's remaining parts must lead
+  with the primary key. No join, no `distinct`, nothing selected that
+  could fail. A key that binds fewer parts by equality than another is
+  not read for its order.
+- The inner side of a `join` and a subquery are queries of their own,
+  chosen for each time they run: `join(Query::table("users").filter(col("users.id").eq(col("s.user_id"))))`
+  is a lookup by primary key per row.
+- `Update` and `Delete` find their rows the same way, by range; what
+  they change is the same (R-W14).
+
+`whole()` is the whole table on purpose: it is never chosen for. A
+server started with `DATABASE_PLAN=off` chooses for nobody. When the
+rules do not give the way wanted, name it: a named way in is the
+contract, and the choice is a default for queries nobody tuned.
+`docs/DESIGN.md`, "Choosing a way in", says why each rule is safe.
 
 The steps, in order: the range's rows; `join`s; `each`; `filter`;
 grouping and `having`; `order_by`; `offset` and `limit`; `select`.
 
 - **Without `order_by`, rows come in key order and `limit` stops the
   read early.** With it, the server reads the whole range, sorts, then
-  cuts: leave it out when the index's order is the one wanted.
+  cuts: leave it out when the index's order is the one wanted. (A query
+  that names no way in may be read in an index's order instead: "a
+  sorted page" above.)
 - `select("name", expr)` and `columns([..])` choose what comes back;
   without them, every column of the query's own table. NULLs sort last
   ascending and first descending unless `.nulls_last()`/`.nulls_first()`.
@@ -172,17 +233,34 @@ grouping and `having`; `order_by`; `offset` and `limit`; `select`.
 
 ### What a query costs
 
-There is no planner, so there is no plan to ask for. What can be wrong
-with a query is that the range it names takes in far more than it
-returns, and `explain` says how much it read:
+What can be wrong with a query is that it reads far more than it
+returns: a named range that takes in too much, or no way in named and
+nothing the server could choose. `explain` says how much was read and
+by which way in:
 
 ```rust
+let cost = db.explain(Query::table("mails").filter(col("subject").eq("hello")).limit(50)).await?;
+// Explained { index_entries: 0, rows_read: 98_112, rows_returned: 50, took: 71ms,
+//             way: "\"mails\" by the whole table, chosen" }
 let cost = db.explain(Query::table("mails").filter(col("user_id").eq(user)).limit(50)).await?;
-// Explained { index_entries: 0, rows_read: 98_112, rows_returned: 50, took: 71ms }
+// Explained { index_entries: 5_000, rows_read: 50, rows_returned: 50, took: 1ms,
+//             way: "\"mails\" by index \"mails_user_date\", chosen" }
 let cost = db.explain(Query::table("mails").index("mails_user_date", KeyRange::eq([user])).limit(50)).await?;
-// Explained { index_entries: 50, rows_read: 50, rows_returned: 50, took: 240µs }
+// Explained { index_entries: 50, rows_read: 50, rows_returned: 50, took: 240µs,
+//             way: "\"mails\" by index \"mails_user_date\"" }
 ```
 
+- `way` names the way into each table: the query's own first, if it
+  named one, then each the server chose, marked `chosen`, for the query
+  and for its joins and subqueries. `the whole table, chosen` means no
+  rule gave a range: the filter has no index, or holds something that
+  could fail on a row (above).
+- A chosen range of an index gives its rows in primary key order, as
+  the whole table would: its entries are read first, all of them, and
+  then the rows, which is why the second query above read 5,000 entries
+  for 50 rows where the named range read 50. A range that turns out to
+  hold more than a quarter of the table is given up for the whole
+  table, and `explain` then shows the entries read before it was.
 - `rows_read` counts every row read from a table: in key order, through
   an index, and by joins and subqueries. `index_entries` counts the
   entries read from indexes, and a search's hits.
@@ -190,15 +268,16 @@ let cost = db.explain(Query::table("mails").index("mails_user_date", KeyRange::e
   for an aggregate, to what it has to count). `rows_read` near the size
   of the table means a filter doing an index's work; `index_entries` far
   above `rows_returned` means a range wider than the filter after it;
-  and `order_by` reads its whole range before `limit` cuts, where an
-  index in that order would stop early.
+  and `order_by` on a named range reads the whole range before `limit`
+  cuts, where an index in that order would stop early.
 - Explaining runs the query, in a transaction if called on one, and
   returns no rows. Only a query can be explained: a write would take
   effect. `explain_prepared(&prepared, [values])` explains a prepared
   one.
 - The server can also say so unasked: with `DATABASE_SLOW_MS` set it
   logs every statement that takes that long, writes included, with the
-  same figures (`OPERATIONS.md`).
+  same figures and the ways in it chose (`OPERATIONS.md`). That is
+  where an update's or a delete's way in is seen.
 
 ### Expressions
 
@@ -568,6 +647,7 @@ dropped or the process dies. It occupies one pooled connection.
 |---|---|
 | `WHERE lower(email) = lower($1)` | an index `on_expr(col("email").lower())`, read with `KeyRange::eq([email.to_lowercase()])` |
 | `WHERE id > $1 ORDER BY id LIMIT $2` | `.range(KeyRange::new(Bound::excluded([cursor]), Bound::Unbounded)).limit(n)` |
+| any `WHERE` left to the planner | `.filter(..)` with no way in named: the server reads a range of a key where the filter is one ("Reading"), and `explain` says which |
 | `WHERE (date, id) < ($1, $2) ORDER BY date DESC, id DESC` | an index on `(.., date, id)` read `.reverse()` with upper bound `Bound::excluded([.., date, id])` |
 | `col = ANY($1)` on a key | `.keys(..)` or `.index_ranges(name, values.map(KeyRange::eq))` |
 | `col = ANY($1)` elsewhere | `.filter(col("c").in_list(values))` |

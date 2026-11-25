@@ -19,8 +19,8 @@ use crate::value::Value;
 /// meaning changes, or when the client comes to send something an older
 /// server would not know (version 3: `Prepared`, `BeginWith`, `Batch`,
 /// `Expr::Param`; version 4: `Explain`; version 5: see
-/// `COLUMN_FLAGS_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 5;
+/// `COLUMN_FLAGS_VERSION`; version 6: see `CHOSEN_WAY_VERSION`).
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// From this version a column's last byte is a byte of flags, and a
 /// column may carry `keep_start` after it (`codec::put_column`). A
@@ -29,6 +29,12 @@ pub const PROTOCOL_VERSION: u32 = 5;
 /// read: the setting changes where values are stored, never what a
 /// query answers.
 pub const COLUMN_FLAGS_VERSION: u32 = 5;
+
+/// From this version a query can ask for the whole table
+/// (`Access::Whole`), and an `Explain`'s answer has a fifth column,
+/// `EXPLAIN_WAY`. A server answers an older client's `Explain` with the
+/// four columns that client has always read.
+pub const CHOSEN_WAY_VERSION: u32 = 6;
 
 /// The oldest version a server still answers. Everything a client of
 /// that version sends means what it meant, so a server is upgraded
@@ -122,9 +128,10 @@ pub enum Request {
     /// error if one failed: nothing of the batch then remains.
     Batch(Vec<BatchItem>),
     /// Runs a query, as it is or prepared, and answers with what it read
-    /// instead of what it found: one row of `EXPLAIN_COLUMNS`. There is
-    /// no plan to show, since a query names its own access path; what
-    /// there is to know is how much that path made the server read.
+    /// instead of what it found: one row of `EXPLAIN_COLUMNS`, and of
+    /// `EXPLAIN_WAY` after them. How much the query's way in made the
+    /// server read, and which way that was where the query named none
+    /// and the server chose.
     Explain(Box<Request>),
 }
 
@@ -132,6 +139,11 @@ pub enum Request {
 /// indexes, rows read from tables, rows the query returned, and the
 /// microseconds it took.
 pub const EXPLAIN_COLUMNS: [&str; 4] = ["index_entries", "rows_read", "rows_returned", "micros"];
+
+/// The column of an `Explain`'s answer after `EXPLAIN_COLUMNS`, a text:
+/// the way into each table the query read, and whether the query named
+/// it or the server chose it. From `CHOSEN_WAY_VERSION`.
+pub const EXPLAIN_WAY: &str = "way";
 
 /// One statement of a `Request::Batch`.
 #[derive(Clone, Debug, PartialEq)]

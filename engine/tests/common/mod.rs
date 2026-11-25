@@ -31,7 +31,7 @@ pub fn options() -> EngineOptions {
     // does on the disk, and when, would differ from one run to the next,
     // and these tests have every run be the same. A test that wants
     // merges beside its writers makes them by hand, or lets the thread go.
-    EngineOptions { cache_bytes: 64 * 8192, db: Options { sync: true, limits: Limits { max_dirty: 24, max_private: 24 }, checkpoint_bytes: 64 * 1024 }, merging_paused: true }
+    EngineOptions { cache_bytes: 64 * 8192, db: Options { sync: true, limits: Limits { max_dirty: 24, max_private: 24 }, checkpoint_bytes: 64 * 1024, ..Options::default() }, merging_paused: true }
 }
 
 pub fn try_open_with(vfs: &MemVfs, options: EngineOptions) -> database_engine::error::Result<Engine> {

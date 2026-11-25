@@ -28,6 +28,7 @@ database stats
 | `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well (see "On the same host") |
 | `DATABASE_CACHE_MB` | `32` | memory for cached pages (see "Memory") |
 | `DATABASE_SLOW_MS` | (none) | log every statement that takes this many milliseconds or more (see "Checking") |
+| `DATABASE_PLAN` | `on` | `off`: a query that names no way in reads its whole table, where the server would otherwise choose a range for it (see "Checking") |
 
 It recovers every database in the data directory, then listens. On
 `SIGTERM` or `SIGINT` it stops taking connections, lets requests in
@@ -186,11 +187,12 @@ docker rm -f drill
   milliseconds or more:
 
   ```text
-  database: slow: 153 ms, database "shop", client "shop-web": query "mails" by the whole table, filtered, limit 50: read 0 index entries and 98112 rows
+  database: slow: 153 ms, database "shop", client "shop-web": query "mails" by the server's choice, filtered, limit 50: read 0 index entries and 98112 rows; chose "mails" by the whole table
   ```
 
   How long it took, on which database, for which client (the `name` of
-  its URL), what the statement was, and how much it read to answer. The
+  its URL), what the statement was, how much it read to answer, and the
+  ways in the server chose where the statement named none. The
   statement is described by its table, its way in and its clauses,
   never by its values. Names are written quoted and escaped, as the
   client sent them, so each line of the log is one line. For a statement on its own and for a batch the
@@ -200,12 +202,27 @@ docker rm -f drill
   the write lock, and a `commit` line a wait for the disk, or for an
   optimistic transaction's turn and its statements run again (it then
   counts what that second run read). A transaction's first statement,
-  when it brings the begin with it, includes the begin's wait. There is no planner whose choice could be at
-  fault: a statement is slow because of what its own access path made
-  the server read, and the two counts say which it was. This one read
-  the whole table to return 50 rows, and wants an index range. The
-  same counts for any query, slow or not, are `db.explain(query)`
-  (`CLIENT.md`).
+  when it brings the begin with it, includes the begin's wait. A
+  statement is slow because of what its way in made the server read,
+  and the two counts say how much that was. A way in the statement
+  named is run as named (`by index "mails_user_date"`). Where it named
+  none the line says `by the server's choice` and ends with what was
+  chosen: a range of the primary key or of an index, an index `in its
+  order` for a sorted page, or the whole table where no rule gave a
+  range. The choice is made by fixed rules over the filter and the
+  table's definition (`CLIENT.md`, "Reading"), so the same statement
+  takes the same way every time, and a different way means a different
+  schema or values of another kind. This one named no way in, nothing
+  fit its filter, and it read the whole table to return 50 rows: it
+  wants an index. The same counts and ways for any query, slow or not,
+  are `db.explain(query)` (`CLIENT.md`).
+- **Choosing for nobody.** A server started with `DATABASE_PLAN=off`
+  reads the whole table for every query that names no way in, as every
+  server did before it chose. No answer differs either way; what
+  differs is what untuned statements cost. It is there for comparing
+  the two, and for an application that would rather meet a slow
+  statement than have its cost depend on which indexes exist. One
+  statement can ask the same for itself with `Query::whole()`.
 
 ## When the disk fails
 

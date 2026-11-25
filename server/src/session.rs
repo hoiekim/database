@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use database_engine::db::{Database, ReadTxn, WriteTxn};
 use database_engine::dump::{self, Restore};
-use database_engine::eval::{Drawn, Read};
+use database_engine::eval::{Chosen, Drawn, Read};
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::message::*;
 use database_protocol::query::{Access, Bound, InsertSource, Query};
@@ -727,19 +727,36 @@ fn batch_read(db: &Arc<Database>, parts: &[Part], deadline: Option<Instant>) -> 
     (Ok(responses), txn.take_read())
 }
 
+/// The way in a query names, in a few words; `None` if it names none
+/// and the server chooses (`plan` says whether it does).
+fn named_way(q: &Query, plan: bool) -> Option<String> {
+    Some(match &q.access {
+        Access::Primary { .. } if plan && q.access.is_unnamed() && !q.table.is_empty() => return None,
+        Access::Whole => "the whole table".to_string(),
+        Access::Primary { ranges, .. } if ranges.iter().any(|r| matches!((&r.lower, &r.upper), (Bound::Unbounded, Bound::Unbounded))) => "the whole table".to_string(),
+        Access::Primary { .. } => "its primary key".to_string(),
+        Access::Index { index, .. } => format!("index {index:?}"),
+        Access::Walk { .. } => "a tree walk".to_string(),
+        Access::Search { index, .. } => format!("a search of {index:?}"),
+    })
+}
+
+/// What an `Explain` says of the ways in: the query's own if it named
+/// one, then each the server chose, for the query or for a join or a
+/// subquery of it, marked as chosen.
+fn ways(named: Option<String>, chosen: &[Chosen]) -> String {
+    named.into_iter().chain(chosen.iter().map(|chosen| format!("{chosen}, chosen"))).collect::<Vec<_>>().join("; ")
+}
+
 /// A statement in a few words, for the log: what it is, on which table
 /// and by which way in, never its values. A statement can name a table
 /// or an index that does not exist, so a name is whatever a client sent:
 /// it is written quoted, with anything that would end the line escaped.
-fn shape(request: &Request) -> String {
-    fn query(q: &Query) -> String {
-        let way = match &q.access {
-            Access::Primary { ranges, .. } if ranges.iter().any(|r| matches!((&r.lower, &r.upper), (Bound::Unbounded, Bound::Unbounded))) => "the whole table".to_string(),
-            Access::Primary { .. } => "its primary key".to_string(),
-            Access::Index { index, .. } => format!("index {index:?}"),
-            Access::Walk { .. } => "a tree walk".to_string(),
-            Access::Search { index, .. } => format!("a search of {index:?}"),
-        };
+/// Where the query names no way in the server chooses one as it runs,
+/// and the log says which after what was read.
+fn shape(request: &Request, plan: bool) -> String {
+    let query = |q: &Query| -> String {
+        let way = named_way(q, plan).unwrap_or_else(|| "the server's choice".to_string());
         let mut out = if q.table.is_empty() { format!("no table by {way}") } else { format!("{:?} by {way}", q.table) };
         if !q.joins.is_empty() {
             out.push_str(&format!(", {} joined", q.joins.len()));
@@ -754,7 +771,7 @@ fn shape(request: &Request) -> String {
             out.push_str(&format!(", limit {limit}"));
         }
         out
-    }
+    };
     match request {
         Request::Query(q) => format!("query {}", query(q)),
         Request::Insert(insert) => match &insert.source {
@@ -1051,6 +1068,13 @@ impl Session {
 
     /// Runs a query and answers with what it read: see `Request::Explain`.
     async fn explain(&mut self, started: Instant, statement: Stmt, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
+        let plan = self.state.config.plan;
+        // The way in as the query names it, noted before the query is
+        // run and given away: none where the server is to choose.
+        let named = match &*statement.request {
+            Request::Query(q) if !q.table.is_empty() => named_way(q, plan).map(|way| format!("{:?} by {way}", q.table)),
+            _ => None,
+        };
         let answer = self.timed(started, statement, deadline).await?;
         let micros = started.elapsed().as_micros() as i64;
         let returned = match answer.first() {
@@ -1058,7 +1082,14 @@ impl Session {
             _ => 0,
         };
         let figures = [self.read.entries as i64, self.read.rows as i64, returned as i64, micros];
-        Ok(rows(RowSet { columns: EXPLAIN_COLUMNS.iter().map(|c| c.to_string()).collect(), rows: vec![figures.into_iter().map(Value::Int).collect()], affected: 1, total: None }))
+        let mut columns: Vec<String> = EXPLAIN_COLUMNS.iter().map(|c| c.to_string()).collect();
+        let mut row: Vec<Value> = figures.into_iter().map(Value::Int).collect();
+        // A client older than the column reads the four it knows.
+        if self.version >= CHOSEN_WAY_VERSION {
+            columns.push(EXPLAIN_WAY.to_string());
+            row.push(Value::Text(ways(named, &self.read.chosen)));
+        }
+        Ok(rows(RowSet { columns, rows: vec![row], affected: 1, total: None }))
     }
 
     /// Runs a statement, noting what it read, and says so in the log if
@@ -1067,7 +1098,7 @@ impl Session {
         self.read = Read::default();
         // Described before it runs, since running it gives it away; and
         // only where slow statements are logged at all.
-        let described = self.state.config.slow_statement.map(|_| shape(&statement.request));
+        let described = self.state.config.slow_statement.map(|_| shape(&statement.request, self.state.config.plan));
         let answer = self.statement(statement, deadline).await;
         self.slow(started, || described.unwrap_or_default());
         answer
@@ -1075,7 +1106,8 @@ impl Session {
 
     /// Writes a line to the server's log about what has just been
     /// answered, if it took as long as the server was told to call slow:
-    /// how long it took, for whom, what it was and what it read. What it
+    /// how long it took, for whom, what it was, what it read, and the
+    /// ways in the server chose where the statement named none. What it
     /// read is what there is to explain it by: an index range that takes
     /// in too much, a filter over a whole table.
     fn slow(&self, started: Instant, what: impl FnOnce() -> String) {
@@ -1085,8 +1117,9 @@ impl Session {
             return;
         }
         let client = if self.client.is_empty() { String::new() } else { format!(", client {:?}", self.client) };
+        let chosen = if self.read.chosen.is_empty() { String::new() } else { format!("; chose {}", self.read.chosen.iter().map(|chosen| chosen.to_string()).collect::<Vec<_>>().join("; ")) };
         eprintln!(
-            "database: slow: {} ms, database {:?}{client}: {}: read {} index entries and {} rows",
+            "database: slow: {} ms, database {:?}{client}: {}: read {} index entries and {} rows{chosen}",
             took.as_millis(),
             self.name,
             what(),
