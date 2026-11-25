@@ -42,6 +42,18 @@
 //! a log file of the data directory. Nothing of this is on a commit's
 //! way but the time its record is stamped with.
 //!
+//! **Following.** A database may be a standby's copy of another
+//! server's: it takes no writes of its own and is given its primary's
+//! log instead, the bytes of each log file as they lie there
+//! (`receive`). It writes them to a file of the same number at the same
+//! places, syncs, and applies the records that are whole, as recovery
+//! applies them, each batch as one version. So its files are at every
+//! moment a prefix of the primary's, a crash leaves it a shorter prefix
+//! that its own recovery reads, and its readers see the primary as of
+//! some commit. It checkpoints where the primary's log passes from one
+//! file to the next, which is the one place where a checkpoint can say
+//! which log continues from it.
+//!
 //! **Merges beside the writers.** A full-text index is kept in segments
 //! that are merged as they gather (`fts.rs`), and merging reads nothing
 //! that changes. So it is done beside the writers, as a fork's work is:
@@ -94,11 +106,17 @@ pub struct Options {
     /// not much longer than this in the data directory alone. Zero
     /// leaves checkpoints to come when they otherwise would.
     pub archive_every: Duration,
+    /// How many bytes of log files a checkpoint has passed are kept in
+    /// the data directory all the same, the newest first, for standbys
+    /// to be sent: one that was away (its primary restarted, the
+    /// network cut) asks for the log from where it had got to. Zero
+    /// keeps none.
+    pub keep_log_bytes: u64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { sync: true, limits: Limits::default(), checkpoint_bytes: 8 * 1024 * 1024, archive: None, archive_every: Duration::from_secs(60) }
+        Options { sync: true, limits: Limits::default(), checkpoint_bytes: 8 * 1024 * 1024, archive: None, archive_every: Duration::from_secs(60), keep_log_bytes: 0 }
     }
 }
 
@@ -163,6 +181,70 @@ pub struct Database {
     first_commit: Mutex<Instant>,
     /// When the archive last refused a file, for trying again.
     archive_failed: Mutex<Option<Instant>>,
+    /// Set for a database that follows another server's: see `receive`.
+    following: Option<Mutex<Mirror>>,
+    /// The oldest log file each reader of the log still needs: a
+    /// standby being sent it, or one that was just sent a base. Log
+    /// files from the least of these on are not removed.
+    log_pins: Mutex<(u64, std::collections::BTreeMap<u64, u64>)>,
+}
+
+/// How far a following database has got in its primary's log.
+struct Mirror {
+    /// Bytes of the current log file that are written and synced here
+    /// and are not yet a whole record.
+    pending: Vec<u8>,
+    /// Where the records applied so far end in the current log file.
+    applied: u64,
+    /// Where the records of the log file before ended: 0 if it held
+    /// none, or it is not known.
+    previous: u64,
+    /// The primary's own place in its log when it was last heard from,
+    /// its clock then, and when that was by this server's.
+    source: Option<((u64, u64), i64, Instant)>,
+}
+
+/// How a following database stands, for `stats`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Followed {
+    /// Where the copy of the primary's log ends here: the file and the
+    /// byte. Everything before it is on this server's disk.
+    pub received: (u64, u64),
+    /// Where the records applied, which readers see, end in that file.
+    pub applied: u64,
+    /// The primary's place when it was last heard from, the time its
+    /// clock gave then, and how long ago that was.
+    pub source: Option<((u64, u64), i64, Duration)>,
+}
+
+/// A hold on the log files from one on: see `Database::pin_log`.
+pub struct LogPin {
+    db: Arc<Database>,
+    id: u64,
+}
+
+impl LogPin {
+    /// Moves the hold forward: files before `generation` may go.
+    pub fn advance(&self, generation: u64) {
+        self.db.log_pins.lock().unwrap().1.insert(self.id, generation);
+    }
+}
+
+impl Drop for LogPin {
+    fn drop(&mut self) {
+        self.db.log_pins.lock().unwrap().1.remove(&self.id);
+    }
+}
+
+/// What a reader of the log is given next: see `Database::read_log`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LogRead {
+    /// Bytes of the log file asked for, from the place asked for.
+    Bytes(Vec<u8>),
+    /// That file holds no more and never will: the next one follows.
+    Next,
+    /// Nothing more is on disk yet.
+    Wait,
 }
 
 pub(crate) fn data_path(dir: &Path, name: &str) -> PathBuf {
@@ -261,7 +343,7 @@ impl Database {
         vfs.rename(&making, &path)?;
         vfs.sync_dir(dir)?;
         let catalog = Catalog { next_table_id: 1, ..Catalog::default() };
-        let db = Self::assemble(vfs, dir, name, store, wal, 0, catalog, options);
+        let db = Self::assemble(vfs, dir, name, store, wal, 0, catalog, options, None);
         // The archive begins with the database: a base of it empty.
         db.moment.store(db.wal.moment(), Ordering::Relaxed);
         db.fatal(db.settle_logs(1, false))?;
@@ -271,6 +353,21 @@ impl Database {
     /// Opens a database, replaying whatever its log holds beyond the
     /// last checkpoint.
     pub fn open(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, cache: Arc<PageCache>, store_id: u32, options: Options) -> Result<Arc<Database>> {
+        Self::open_as(vfs, dir, name, cache, store_id, options, false)
+    }
+
+    /// Opens a database that follows another server's (see `receive`):
+    /// replays the copy of the primary's log that is here, and goes on
+    /// from where its records end. Unlike `open` it begins no log file
+    /// and writes no checkpoint, since both would say that the log
+    /// continues somewhere the primary's does not.
+    pub fn open_following(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, cache: Arc<PageCache>, store_id: u32, mut options: Options) -> Result<Arc<Database>> {
+        options.archive = None;
+        options.keep_log_bytes = 0;
+        Self::open_as(vfs, dir, name, cache, store_id, options, true)
+    }
+
+    fn open_as(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, cache: Arc<PageCache>, store_id: u32, options: Options, following: bool) -> Result<Arc<Database>> {
         let file = vfs.open(&data_path(dir, name), false)?;
         let (store, meta, catalog_bytes) = Store::open(file, cache, store_id, options.limits)?;
         let store = Arc::new(store);
@@ -278,7 +375,7 @@ impl Database {
         // Log files from before the checkpoint were only not yet deleted,
         // or, with an archive, not yet copied there: those are kept, and
         // are no part of recovery.
-        if options.archive.is_none() {
+        if options.archive.is_none() && options.keep_log_bytes == 0 {
             wal::remove_logs(&*vfs, dir, name, |g| g < meta.wal_gen)?;
         }
         let generations: Vec<u64> = wal::list_logs(&*vfs, dir, name)?.into_iter().filter(|g| *g >= meta.wal_gen).collect();
@@ -303,6 +400,8 @@ impl Database {
         // The file before: its generation, and where its records ended
         // if it held any.
         let mut before: Option<(u64, u64)> = None;
+        // The newest file, and where what was read of it ends.
+        let mut last: Option<(u64, u64)> = None;
         // The newest time a record says its commit was made.
         let mut stamped = 0i64;
         for generation in &generations {
@@ -339,6 +438,7 @@ impl Database {
                 torn.get_or_insert(*generation);
             }
             before = Some((*generation, if records > 0 { read.at } else { 0 }));
+            last = Some((*generation, read.at));
         }
         let mut version = meta.version;
         let Tx { writer, catalog, .. } = tx;
@@ -349,13 +449,22 @@ impl Database {
         } else {
             writer.rollback();
         }
+        if following {
+            // The copy goes on in the file it had got to, after the
+            // last record that is whole: a tail the crash tore is cut
+            // off, and the primary sends those bytes again.
+            let (generation, at) = last.unwrap_or((meta.wal_gen, 0));
+            let wal = Wal::resume(vfs.clone(), dir, name, meta.uuid, generation, version, options.sync, at)?;
+            let mirror = Mirror { pending: Vec::new(), applied: wal.position().1, previous: 0, source: None };
+            return Ok(Self::assemble(vfs, dir, name, store, wal, version, catalog, options, Some(mirror)));
+        }
         let next_generation = generations.last().map_or(meta.wal_gen, |g| g + 1).max(meta.wal_gen);
         let previous = before.filter(|(it, _)| it + 1 == next_generation).map_or(0, |(_, ended)| ended);
         let mut wal = Wal::create_after(vfs.clone(), dir, name, meta.uuid, next_generation, version, options.sync, previous)?;
         if options.archive.is_some() {
             wal = wal.stamping(stamped);
         }
-        let db = Self::assemble(vfs.clone(), dir, name, store, wal, version, catalog, options);
+        let db = Self::assemble(vfs.clone(), dir, name, store, wal, version, catalog, options, None);
         db.moment.store(db.wal.moment(), Ordering::Relaxed);
         if changed {
             // Put what was replayed into the data file now, so the log
@@ -369,7 +478,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn assemble(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, store: Arc<Store>, wal: Wal, version: u64, catalog: Catalog, options: Options) -> Arc<Database> {
+    fn assemble(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, store: Arc<Store>, wal: Wal, version: u64, catalog: Catalog, options: Options, following: Option<Mirror>) -> Arc<Database> {
         let snapshot = Arc::new(Snapshot { version, catalog: Arc::new(catalog) });
         let archiving = options.archive.clone().map(|archive| Archiving { history: archive::history_name(name, &store.meta().uuid), archive, progress: Mutex::new(Progress::default()) });
         Arc::new(Database {
@@ -398,6 +507,8 @@ impl Database {
             moment: AtomicI64::new(0),
             first_commit: Mutex::new(Instant::now()),
             archive_failed: Mutex::new(None),
+            following: following.map(Mutex::new),
+            log_pins: Mutex::new((0, std::collections::BTreeMap::new())),
         })
     }
 
@@ -412,6 +523,14 @@ impl Database {
     fn check_failed(&self) -> Result<()> {
         if self.failed.load(Ordering::Relaxed) {
             return Err(Error::db(ErrorCode::Unavailable, format!("database {:?} is no longer available: it was dropped or replaced, or it stopped after a disk error", self.name)));
+        }
+        Ok(())
+    }
+
+    /// A database that follows another takes no writes of its own.
+    fn check_writable(&self) -> Result<()> {
+        if self.following.is_some() {
+            return Err(Error::db(ErrorCode::ReadOnly, format!("database {:?} follows another server's and takes no writes: write to the primary, or promote this one", self.name)));
         }
         Ok(())
     }
@@ -554,6 +673,7 @@ impl Database {
     /// write lock. `interactive` says the caller will see results before
     /// it commits: then everything it could read is made durable first.
     pub fn begin_write(self: &Arc<Self>, wait: Duration, interactive: bool) -> Result<WriteTxn> {
+        self.check_writable()?;
         self.check_failed()?;
         let guard = self.lock_writes(wait)?;
         self.check_failed()?;
@@ -664,6 +784,7 @@ impl Database {
     /// lock: a fork of the newest durable version, which it holds as a
     /// reader does. It cannot commit as it is: see `WriteTxn::attach`.
     pub fn begin_fork(self: &Arc<Self>) -> Result<WriteTxn> {
+        self.check_writable()?;
         self.check_failed()?;
         let (base, pinned) = {
             let published = self.published.lock().unwrap();
@@ -686,7 +807,9 @@ impl Database {
 
     /// Whether a checkpoint would do some good now.
     pub fn checkpoint_due(&self) -> bool {
-        if self.has_failed() {
+        // A following database checkpoints where its primary's log
+        // passes from one file to the next, and nowhere else.
+        if self.has_failed() || self.following.is_some() {
             return false;
         }
         // Log files the archive refused are offered again now and then,
@@ -734,6 +857,9 @@ impl Database {
     /// `checkpoint_held`, waiting no longer than `wait` for the writer
     /// to let go.
     fn checkpoint_within(self: &Arc<Self>, base: bool, close: bool, wait: Duration) -> Result<Option<String>> {
+        if self.following.is_some() {
+            return Ok(None);
+        }
         self.check_failed()?;
         let guard = self.lock_writes(wait)?;
         let latest = self.latest.lock().unwrap().clone();
@@ -772,7 +898,13 @@ impl Database {
     /// `stats` and returned, and the next checkpoint tries again.
     fn settle_logs(&self, generation: u64, base: bool) -> Result<Option<String>> {
         let Some(archiving) = &self.archiving else {
-            wal::remove_logs(&*self.vfs, &self.dir, &self.name, |g| g < generation)?;
+            let passed: Vec<u64> = if self.options.keep_log_bytes == 0 && self.log_pins.lock().unwrap().1.is_empty() {
+                // Nothing asks for a file to stay: each goes by its name.
+                return wal::remove_logs(&*self.vfs, &self.dir, &self.name, |g| g < generation).map(|()| None);
+            } else {
+                wal::list_logs(&*self.vfs, &self.dir, &self.name)?.into_iter().filter(|g| *g < generation).collect()
+            };
+            self.remove_passed(&passed)?;
             return Ok(None);
         };
         let mut progress = archiving.progress.lock().unwrap();
@@ -857,7 +989,7 @@ impl Database {
         // data file's checkpoint was made, or the start found: no commit
         // in one of them is later than that.
         let sealed = self.moment.load(Ordering::Relaxed);
-        let mut removed = false;
+        let mut passed = Vec::new();
         while let Some(&local) = locals.first() {
             match progress.chain {
                 // Not continued by any base: no copy of it could be
@@ -878,13 +1010,11 @@ impl Database {
                 // follows it continues from nothing.
                 Chain::Next(_) => progress.chain = Chain::Broken,
             }
-            self.vfs.remove(&wal::wal_path(&self.dir, &self.name, local))?;
-            removed = true;
             locals.remove(0);
+            passed.push(local);
         }
-        if removed {
-            self.vfs.sync_dir(&self.dir)?;
-        }
+        // Copied or not to be copied, a file may yet stay for a standby.
+        self.remove_passed(&passed)?;
         progress.kept = locals.len();
         if continues && base && refused.is_none() {
             // A base that was asked for. It is written after the log
@@ -931,6 +1061,268 @@ impl Database {
             (Some(why), Some(archiving)) => Err(Error::db(ErrorCode::Io, format!("the archive has not taken the log of {} ({why}), and removing database {:?} would remove the only copy of its last commits: make the archive writable, or start the server without it", archiving.history, self.name))),
             _ => Ok(()),
         }
+    }
+
+    // ------------------------------------------------------- a standby
+
+    /// Removes the log files `passed` names, ascending, which nothing
+    /// in this server needs any more, but for what standbys may ask
+    /// for: the files a pin holds, and the newest of the rest up to
+    /// `keep_log_bytes`.
+    fn remove_passed(&self, passed: &[u64]) -> Result<()> {
+        let pinned = self.pinned_from();
+        let mut room = self.options.keep_log_bytes;
+        let mut keeping = room > 0;
+        let mut removed = false;
+        for generation in passed.iter().rev() {
+            let path = wal::wal_path(&self.dir, &self.name, *generation);
+            if keeping {
+                // The newest stay while they fit, and nothing older
+                // than one that did not: a standby needs them in a row.
+                let len = self.vfs.open(&path, false)?.len()?;
+                keeping = len <= room;
+                if keeping {
+                    room -= len;
+                    continue;
+                }
+            }
+            if *generation >= pinned {
+                continue;
+            }
+            self.vfs.remove(&path)?;
+            removed = true;
+        }
+        if removed {
+            self.vfs.sync_dir(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    /// The oldest log file a reader of the log still needs: none is
+    /// removed from that one on.
+    fn pinned_from(&self) -> u64 {
+        self.log_pins.lock().unwrap().1.values().copied().min().unwrap_or(u64::MAX)
+    }
+
+    /// Holds the log files from `generation` on in the data directory,
+    /// whatever checkpoints pass them, until the pin is dropped or moved
+    /// on: for whoever sends them to a standby.
+    pub fn pin_log(self: &Arc<Self>, generation: u64) -> LogPin {
+        let mut pins = self.log_pins.lock().unwrap();
+        pins.0 += 1;
+        let id = pins.0;
+        pins.1.insert(id, generation);
+        LogPin { db: self.clone(), id }
+    }
+
+    /// The data file's uuid: what the log files, the archive and a
+    /// standby know this history by.
+    pub fn uuid(&self) -> [u8; 16] {
+        self.store.meta().uuid
+    }
+
+    /// Where the log is on disk up to. Every commit whose record ends
+    /// at or before it was synced, and none after it was acknowledged.
+    pub fn synced_position(&self) -> (u64, u64) {
+        self.wal.synced_position()
+    }
+
+    /// Waits until the log is on disk beyond `position` or `patience`
+    /// has passed, and returns where it is on disk up to.
+    pub fn wait_for_log(&self, position: (u64, u64), patience: Duration) -> (u64, u64) {
+        self.wal.wait_beyond(position, patience)
+    }
+
+    /// Reads the log for a standby that has it up to byte `offset` of
+    /// file `generation`: at most `most` bytes of what is on disk beyond
+    /// that. Only what is synced is given out, so that a standby never
+    /// holds a commit its primary could lose in a crash and then make
+    /// differently.
+    ///
+    /// `Behind` if the file is no longer kept; an error, too, for a
+    /// place the log has not reached, which is a place in some other
+    /// history.
+    pub fn read_log(&self, generation: u64, offset: u64, most: usize) -> Result<LogRead> {
+        self.check_failed()?;
+        let synced = self.wal.synced_position();
+        if (generation, offset) > synced || offset < wal::FIRST_RECORD {
+            return Err(Error::db(ErrorCode::InvalidRequest, format!("the log of database {:?} is at {} and does not hold {}: the standby has another history than this server's", self.name, archive::position_text(synced.0, synced.1), archive::position_text(generation, offset))));
+        }
+        let file = match self.vfs.open(&wal::wal_path(&self.dir, &self.name, generation), false) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::db(ErrorCode::Behind, format!("log file {generation} of database {:?} is no longer kept", self.name))),
+            Err(e) => return Err(e.into()),
+        };
+        // Up to where it is synced, in the file being written; in an
+        // older one, to where its records end.
+        let end = if generation == synced.0 { synced.1 } else { wal::replay_file(&*file, &self.uuid(), generation, &mut |_| Ok(()))?.at.max(wal::FIRST_RECORD) };
+        if offset > end {
+            return Err(Error::db(ErrorCode::InvalidRequest, format!("log file {generation} of database {:?} ends at byte {end}, before byte {offset}: the standby has another history than this server's", self.name)));
+        }
+        if offset == end {
+            return Ok(if generation == synced.0 { LogRead::Wait } else { LogRead::Next });
+        }
+        let mut bytes = vec![0u8; ((end - offset) as usize).min(most)];
+        crate::vfs::read_exact_at(&*file, &mut bytes, offset)?;
+        Ok(LogRead::Bytes(bytes))
+    }
+
+    /// Gives a base of the database to `sink`, as `archive.rs` writes
+    /// one: the data file as of a checkpoint, then the trailer that
+    /// says which log file continues from it. Returns that file's
+    /// number, and a pin that keeps the log from it on until whoever
+    /// took the base has come back for the log.
+    pub fn base_to(self: &Arc<Self>, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<(u64, LogPin)> {
+        self.check_writable()?;
+        let _one = self.checkpointing.lock().unwrap();
+        self.checkpoint_held(false, false)?;
+        let generation = self.wal.generation();
+        let pin = self.pin_log(generation);
+        let meta = self.store.meta();
+        let len = u64::from(meta.next_page) * crate::page::PAGE_SIZE as u64;
+        archive::write_base(generation, self.moment.load(Ordering::Relaxed), len, &|buf, at| self.store.read_file(buf, at), sink)?;
+        Ok((generation, pin))
+    }
+
+    /// How a following database stands; `None` for one that does not
+    /// follow.
+    pub fn followed(&self) -> Option<Followed> {
+        let mirror = self.following.as_ref()?.lock().unwrap();
+        Some(Followed { received: self.wal.position(), applied: mirror.applied, source: mirror.source.map(|(position, time, heard)| (position, time, heard.elapsed())) })
+    }
+
+    /// Notes where the primary's own log was, and what its clock said,
+    /// when it last told this standby.
+    pub fn heard_from_source(&self, position: (u64, u64), time: i64) {
+        if let Some(mirror) = &self.following {
+            mirror.lock().unwrap().source = Some((position, time, Instant::now()));
+        }
+    }
+
+    /// Takes bytes of the primary's log: `bytes` lie at byte `offset` of
+    /// its log file `generation`. They are written to this database's
+    /// file of that number at that place and synced, and then the
+    /// records that are now whole are applied, all of them as one
+    /// version, which readers see when it is whole.
+    ///
+    /// Bytes this database already has are passed over, so that a
+    /// primary may send again from wherever the standby says it is.
+    /// Bytes beyond the end of what it has are refused: there would be
+    /// a hole before them. The first bytes of the next file end the
+    /// current one: what it held is checkpointed, and the files before
+    /// the new one removed.
+    ///
+    /// Killed at any step, the database starts as a shorter prefix of
+    /// the primary's log, and is sent the rest again.
+    pub fn receive(self: &Arc<Self>, generation: u64, offset: u64, bytes: &[u8]) -> Result<()> {
+        let Some(mirror) = &self.following else {
+            return Err(Error::db(ErrorCode::InvalidRequest, format!("database {:?} follows no other", self.name)));
+        };
+        self.check_failed()?;
+        let _one = self.checkpointing.lock().unwrap();
+        let mut mirror = mirror.lock().unwrap();
+        let (current, end) = self.wal.position();
+        let out_of_place = || Error::db(ErrorCode::InvalidRequest, format!("database {:?} has its primary's log up to {} and was sent {}", self.name, archive::position_text(current, end), archive::position_text(generation, offset)));
+        let mut bytes = bytes;
+        if generation == current + 1 && offset == wal::FIRST_RECORD {
+            if !mirror.pending.is_empty() {
+                return Err(Error::corrupt(format!("log file {current} of database {:?} ends inside a record, and the primary has gone on to the next", self.name)));
+            }
+            self.fatal(self.turn_log(&mut mirror))?;
+        } else if generation == current && offset <= end {
+            bytes = &bytes[((end - offset) as usize).min(bytes.len())..];
+        } else {
+            return Err(out_of_place());
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let generation = self.wal.generation();
+        self.fatal(self.wal.append_copy(bytes))?;
+        mirror.pending.extend_from_slice(bytes);
+        // The records that are whole now.
+        let mut at = mirror.applied;
+        let mut taken = 0usize;
+        let mut changes: Vec<std::ops::Range<usize>> = Vec::new();
+        while let Some((record, len)) = self.fatal(wal::parse(generation, at, &mirror.pending[taken..]))? {
+            match record {
+                wal::Record::Link(after) => {
+                    if mirror.previous > 0 && mirror.previous != after {
+                        return self.fatal(Err(Error::corrupt(format!("log file {} of database {:?} ended at byte {} here, and the primary's next file says it ended at byte {after}", generation - 1, self.name, mirror.previous))));
+                    }
+                }
+                wal::Record::Commit { changes: body, .. } => {
+                    let start = taken + len - body.len();
+                    changes.push(start..start + body.len());
+                }
+            }
+            taken += len;
+            at += len as u64;
+        }
+        if !changes.is_empty() {
+            let records: Vec<&[u8]> = changes.iter().map(|range| &mirror.pending[range.clone()]).collect();
+            self.fatal(self.apply(&records))?;
+        }
+        mirror.applied = at;
+        mirror.pending.drain(..taken);
+        Ok(())
+    }
+
+    /// Applies records of the primary's log as one commit: the changes
+    /// of each, in order, by the code that replays a log, and then one
+    /// version that readers see whole or not at all.
+    fn apply(self: &Arc<Self>, records: &[&[u8]]) -> Result<()> {
+        let guard = self.lock_writes(Duration::from_secs(3600))?;
+        let base = self.latest.lock().unwrap().clone();
+        let mut tx = Tx::new(self.writer(false), (*base.catalog).clone(), now_micros());
+        tx.logging = false;
+        for record in records {
+            // A record applied once on the primary. If it does not
+            // apply here, this is not the data file it was logged
+            // against.
+            tx.replay(record).map_err(|e| match e {
+                Error::Io(_) | Error::Corrupt(_) => e,
+                other => Error::corrupt(format!("the primary's log does not apply to database {:?}: {other}", self.name)),
+            })?;
+        }
+        let version = base.version + 1;
+        let Tx { writer, catalog, .. } = tx;
+        let left_due = writer.left_due();
+        // Its record is on this server's disk already: the version is
+        // durable as it is made.
+        self.wal.skip(version);
+        writer.commit(version)?;
+        let snapshot = Arc::new(Snapshot { version, catalog: Arc::new(catalog) });
+        self.pending.lock().unwrap().push_back(snapshot.clone());
+        *self.latest.lock().unwrap() = snapshot;
+        self.commits.fetch_add(records.len() as u64, Ordering::Relaxed);
+        self.publish_up_to(version);
+        drop(guard);
+        if left_due {
+            if let Some(wake) = self.merger.get() {
+                wake();
+            }
+        }
+        Ok(())
+    }
+
+    /// Passes from the copy of one log file to the next, as the primary
+    /// has: everything the file held is applied, so the data file is
+    /// checkpointed as of here, with the next file as the one that
+    /// continues from it, and the files before that one are removed.
+    fn turn_log(self: &Arc<Self>, mirror: &mut Mirror) -> Result<()> {
+        let guard = self.lock_writes(Duration::from_secs(3600))?;
+        let latest = self.latest.lock().unwrap().clone();
+        let generation = self.wal.begin_copy()?;
+        if latest.version != self.store.meta().version {
+            let capture = self.store.capture(latest.version, &latest.catalog.encode(), generation)?;
+            drop(guard);
+            self.store.write_checkpoint(capture)?;
+        }
+        wal::remove_logs(&*self.vfs, &self.dir, &self.name, |g| g < generation)?;
+        mirror.previous = if mirror.applied > wal::FIRST_RECORD { mirror.applied } else { 0 };
+        mirror.applied = wal::FIRST_RECORD;
+        Ok(())
     }
 
     /// The database's history in the archive, and how its archiving

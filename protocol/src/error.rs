@@ -61,6 +61,12 @@ pub enum ErrorCode {
     /// A statement of a batch did not affect as many rows as the batch
     /// said it must. Nothing of the batch took effect.
     Unmet = 24,
+    /// A write was sent to a database that follows another server's: a
+    /// standby answers reads and takes no writes until it is promoted.
+    ReadOnly = 25,
+    /// A standby asked for its primary's log from a place the primary
+    /// no longer keeps it from. Said between servers only.
+    Behind = 26,
 }
 
 impl ErrorCode {
@@ -90,6 +96,8 @@ impl ErrorCode {
             22 => Conflict,
             23 => NotPrepared,
             24 => Unmet,
+            25 => ReadOnly,
+            26 => Behind,
             _ => Internal,
         }
     }

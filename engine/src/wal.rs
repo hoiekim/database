@@ -142,6 +142,9 @@ struct Synced {
     version: u64,
     syncing: bool,
     failed: bool,
+    /// Where the log is on disk up to: the file, and the byte in it.
+    /// What lies before is what a standby may be sent.
+    position: (u64, u64),
 }
 
 pub struct Wal {
@@ -182,11 +185,83 @@ impl Wal {
             name: name.to_string(),
             uuid,
             tail: Mutex::new(Tail { file, generation, link: previous, offset: HEADER_LEN, allocated: HEADER_LEN, grow: 0, appended: version, last_record: version, stamped: 0 }),
-            synced: Mutex::new(Synced { version, syncing: false, failed: false }),
+            synced: Mutex::new(Synced { version, syncing: false, failed: false, position: (generation, HEADER_LEN) }),
             wake: Condvar::new(),
             sync,
             stamp: false,
         })
+    }
+
+    /// Takes up a log file where its records end, at `offset`, to go on
+    /// writing it with bytes that were written elsewhere first: a
+    /// standby's copy of its primary's log (`append_copy`). What the
+    /// file holds beyond `offset` is cut off. A file that is not there,
+    /// or has no room for a header, is begun.
+    pub fn resume(vfs: Arc<dyn Vfs>, dir: &Path, name: &str, uuid: [u8; 16], generation: u64, version: u64, sync: bool, offset: u64) -> Result<Wal> {
+        let path = wal_path(dir, name, generation);
+        let (file, offset) = if offset >= HEADER_LEN && vfs.exists(&path) {
+            let file = vfs.open(&path, false)?;
+            if file.len()? != offset {
+                file.set_len(offset)?;
+                file.sync()?;
+            }
+            (file, offset)
+        } else {
+            (Self::start_file(&*vfs, dir, name, &uuid, generation)?, HEADER_LEN)
+        };
+        Ok(Wal {
+            vfs,
+            dir: dir.to_path_buf(),
+            name: name.to_string(),
+            uuid,
+            tail: Mutex::new(Tail { file, generation, link: 0, offset, allocated: offset, grow: 0, appended: version, last_record: version, stamped: 0 }),
+            synced: Mutex::new(Synced { version, syncing: false, failed: false, position: (generation, offset) }),
+            wake: Condvar::new(),
+            sync,
+            stamp: false,
+        })
+    }
+
+    /// Writes bytes of the primary's log file of this generation where
+    /// they lie there, and syncs them: a standby's copy of the file is
+    /// the same bytes at the same places, so each record's CRC, which
+    /// covers its place, checks in the copy as in the original.
+    pub fn append_copy(&self, bytes: &[u8]) -> Result<()> {
+        if self.synced.lock().unwrap().failed {
+            return Err(failed());
+        }
+        let mut tail = self.tail.lock().unwrap();
+        let written = tail.file.write_at(bytes, tail.offset).and_then(|()| if self.sync { tail.file.sync() } else { Ok(()) });
+        let mut synced = self.synced.lock().unwrap();
+        if let Err(e) = written {
+            synced.failed = true;
+            return Err(e.into());
+        }
+        tail.offset += bytes.len() as u64;
+        tail.allocated = tail.offset;
+        synced.position = (tail.generation, tail.offset);
+        Ok(())
+    }
+
+    /// Begins the copy of the primary's next log file. No link is
+    /// written: the primary's own comes with the file's first bytes.
+    pub fn begin_copy(&self) -> Result<u64> {
+        let generation = self.rotate()?;
+        self.tail.lock().unwrap().link = 0;
+        Ok(generation)
+    }
+
+    /// Where the log is on disk up to: the file and the byte.
+    pub fn synced_position(&self) -> (u64, u64) {
+        self.synced.lock().unwrap().position
+    }
+
+    /// Waits until the log is on disk beyond `position`, or `patience`
+    /// has passed, and returns where it is on disk up to.
+    pub fn wait_beyond(&self, position: (u64, u64), patience: std::time::Duration) -> (u64, u64) {
+        let synced = self.synced.lock().unwrap();
+        let (synced, _) = self.wake.wait_timeout_while(synced, patience, |synced| synced.position <= position && !synced.failed).unwrap();
+        synced.position
     }
 
     /// Has every record from now on say when its commit was made, none
@@ -327,15 +402,18 @@ impl Wal {
             }
             synced.syncing = true;
             drop(synced);
-            let (file, appended) = {
+            let (file, appended, position) = {
                 let tail = self.tail.lock().unwrap();
-                (tail.file.clone(), tail.appended)
+                (tail.file.clone(), tail.appended, (tail.generation, tail.offset))
             };
             let result = if self.sync { file.sync() } else { Ok(()) };
             synced = self.synced.lock().unwrap();
             synced.syncing = false;
             match result {
-                Ok(()) => synced.version = synced.version.max(appended),
+                Ok(()) => {
+                    synced.version = synced.version.max(appended);
+                    synced.position = synced.position.max(position);
+                }
                 Err(_) => synced.failed = true,
             }
             self.wake.notify_all();
@@ -362,6 +440,7 @@ impl Wal {
         match result {
             Ok((generation, file)) => {
                 synced.version = synced.version.max(tail.appended);
+                synced.position = (generation, HEADER_LEN);
                 self.wake.notify_all();
                 // A file that holds a record holds a transaction's.
                 tail.link = if tail.offset > HEADER_LEN { tail.offset } else { 0 };
@@ -527,6 +606,46 @@ pub fn replay_file(file: &dyn File, uuid: &[u8; 16], generation: u64, on_record:
         offset = end;
         at = end;
     }
+}
+
+/// What a log file holds at one place: see `parse`.
+#[derive(Clone, Copy, Debug)]
+pub enum Record<'a> {
+    /// Where the records of the file before ended.
+    Link(u64),
+    Commit { time: Option<i64>, changes: &'a [u8] },
+}
+
+/// Reads the record at the start of `bytes`, which lie at `offset` of
+/// log file `generation`: the record and how many bytes it takes, or
+/// `None` if `bytes` do not hold the whole of it yet. Bytes that are no
+/// record are an error: this is for a copy that is still arriving,
+/// which ends where it ends and is never torn.
+pub fn parse(generation: u64, offset: u64, bytes: &[u8]) -> Result<Option<(Record<'_>, usize)>> {
+    if bytes.len() < 8 {
+        return Ok(None);
+    }
+    let size = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    let crc = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if size == 0 || size > MAX_RECORD {
+        return Err(Error::corrupt(format!("byte {offset} of log file {generation} does not begin a record")));
+    }
+    let len = 8 + size as usize;
+    if bytes.len() < len {
+        return Ok(None);
+    }
+    let record = &bytes[8..len];
+    if record_crc(generation, offset, record) != crc {
+        return Err(Error::corrupt(format!("the record at byte {offset} of log file {generation} does not check")));
+    }
+    let record = if offset == HEADER_LEN && record.len() == LINK_LEN && record[0] == LINK {
+        Record::Link(u64::from_le_bytes(record[1..].try_into().unwrap()))
+    } else if record[0] == STAMP && record.len() >= STAMP_LEN {
+        Record::Commit { time: Some(i64::from_le_bytes(record[1..STAMP_LEN].try_into().unwrap())), changes: &record[STAMP_LEN..] }
+    } else {
+        Record::Commit { time: None, changes: record }
+    };
+    Ok(Some((record, len)))
 }
 
 /// A seal to follow the records of a copy of log file `generation` that

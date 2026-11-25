@@ -338,6 +338,25 @@ impl Store {
         Ok((Store::assemble(file, cache, id, meta.clone(), free, chain_pages, limits), meta, catalog))
     }
 
+    /// The uuid of a data file that nothing has open.
+    pub fn uuid_of(file: &dyn File) -> Result<[u8; 16]> {
+        let mut best: Option<Meta> = None;
+        for slot in 0..2u64 {
+            let mut page = vec![0u8; PAGE_SIZE];
+            match read_exact_at(file, &mut page, slot * PAGE_SIZE as u64) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+                Err(e) => return Err(Error::Io(e)),
+            }
+            if let Some(meta) = Meta::decode(&page) {
+                if best.as_ref().is_none_or(|b| meta.counter > b.counter) {
+                    best = Some(meta);
+                }
+            }
+        }
+        best.map(|meta| meta.uuid).ok_or_else(|| Error::corrupt("neither copy of the data file's header is valid"))
+    }
+
     /// Gives a data file that nothing has open another uuid: a new
     /// history, which no log file of the old one is taken for (see
     /// `archive.rs`). The checkpoint is otherwise as it was, written as

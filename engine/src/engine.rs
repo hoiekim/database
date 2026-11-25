@@ -93,6 +93,72 @@ impl Inner {
         options
     }
 
+    fn mark_path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{name}{MARK}"))
+    }
+
+    /// What the database's mark says, if it has one: see `MARK`.
+    fn mark(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.mark_path(name);
+        if !self.vfs.exists(&path) {
+            return Ok(None);
+        }
+        let file = self.vfs.open(&path, false)?;
+        let mut said = vec![0u8; file.len()? as usize];
+        crate::vfs::read_exact_at(&*file, &mut said, 0)?;
+        Ok(Some(said))
+    }
+
+    /// Writes the database's mark, so that it says `what` or what it
+    /// said before and nothing between.
+    fn set_mark(&self, name: &str, what: &[u8]) -> Result<()> {
+        let writing = self.dir.join(format!("{name}{CREATING}{MARK}"));
+        let file = self.vfs.open(&writing, true)?;
+        file.set_len(0)?;
+        file.write_at(what, 0)?;
+        file.sync()?;
+        drop(file);
+        self.vfs.rename(&writing, &self.mark_path(name))?;
+        Ok(self.vfs.sync_dir(&self.dir)?)
+    }
+
+    /// Opens a database as its mark says: one that follows, as a
+    /// follower; one whose promotion a stop interrupted, once that is
+    /// finished; any other, as its own.
+    fn open(&self, name: &str) -> Result<Arc<Database>> {
+        let id = self.next_store.fetch_add(1, Ordering::Relaxed);
+        match self.mark(name)?.as_deref() {
+            None => Database::open(self.vfs.clone(), &self.dir, name, self.cache.clone(), id, self.options_for(name)),
+            Some(PROMOTING) => {
+                self.finish_promotion(name)?;
+                Database::open(self.vfs.clone(), &self.dir, name, self.cache.clone(), id, self.options_for(name))
+            }
+            Some(_) => Database::open_following(self.vfs.clone(), &self.dir, name, self.cache.clone(), id, self.options_for(name)),
+        }
+    }
+
+    /// Makes a database that followed another its own: recovery of the
+    /// log it holds, as after a crash, which leaves it whole at the last
+    /// commit it had been sent; then a new uuid, since what is committed
+    /// to it from here is not what its primary commits from here; and
+    /// then its mark goes. The mark says `PROMOTING` all the while, so
+    /// that a stop at any step is followed by this again, from its
+    /// start, and never by following: recovery has begun a log file of
+    /// this server's own, and the copy is no longer the primary's.
+    fn finish_promotion(&self, name: &str) -> Result<()> {
+        let mut options = self.options.db.clone();
+        (options.archive, options.keep_log_bytes) = (None, 0);
+        let id = self.next_store.fetch_add(1, Ordering::Relaxed);
+        let db = Database::open(self.vfs.clone(), &self.dir, name, self.cache.clone(), id, options)?;
+        db.checkpoint()?;
+        db.retire();
+        drop(db);
+        Store::rebrand(&*self.vfs.open(&data_path(&self.dir, name), false)?, random_uuid())?;
+        wal::remove_logs(&*self.vfs, &self.dir, name, |_| true)?;
+        self.vfs.remove(&self.mark_path(name))?;
+        Ok(self.vfs.sync_dir(&self.dir)?)
+    }
+
     fn adopt(&self, db: Arc<Database>) -> Arc<Database> {
         let due = self.due.clone();
         db.merge_beside(Box::new(move || due.say()));
@@ -106,6 +172,18 @@ pub struct Engine {
     checkpointer: Option<std::thread::JoinHandle<()>>,
     merger: Option<std::thread::JoinHandle<()>>,
 }
+
+/// Ends the name of a database's mark: a file beside the data file of a
+/// database that follows another server's. It is what makes the
+/// database a standby's, whatever the server is started as: a copy of a
+/// primary's history takes no writes until it has been promoted, which
+/// gives it a history of its own. Two servers therefore never both
+/// write to one history because one was started without being told
+/// that it is a standby.
+const MARK: &str = ".standby";
+const FOLLOWING: &[u8] = b"following";
+/// What a mark says while its database is being promoted.
+const PROMOTING: &[u8] = b"promoting";
 
 /// How long a drop, with an archive, waits for a transaction that holds
 /// the database before it gives up: the database's log goes to the
@@ -176,11 +254,23 @@ impl Engine {
         if swept {
             vfs.sync_dir(dir)?;
         }
-        for file in vfs.list(dir)? {
+        let files = vfs.list(dir)?;
+        // A mark without its database is what a standby's seeding left
+        // when the server stopped in the middle of it.
+        let mut unmarked = false;
+        for file in &files {
+            if file.strip_suffix(MARK).is_some_and(|name| !files.contains(&format!("{name}.db"))) {
+                vfs.remove(&dir.join(file))?;
+                unmarked = true;
+            }
+        }
+        if unmarked {
+            vfs.sync_dir(dir)?;
+        }
+        for file in &files {
             if let Some(name) = file.strip_suffix(".db") {
                 if check_database_name(name).is_ok() {
-                    let id = inner.next_store.fetch_add(1, Ordering::Relaxed);
-                    let db = inner.adopt(Database::open(vfs.clone(), dir, name, inner.cache.clone(), id, inner.options_for(name))?);
+                    let db = inner.adopt(inner.open(name)?);
                     inner.dbs.lock().unwrap().insert(name.to_string(), db);
                 }
             }
@@ -280,7 +370,13 @@ impl Engine {
         }
         self.inner.dbs.lock().unwrap().remove(name);
         db.retire();
-        Database::destroy(&*self.inner.vfs, &self.inner.dir, name)
+        Database::destroy(&*self.inner.vfs, &self.inner.dir, name)?;
+        let mark = self.inner.mark_path(name);
+        if self.inner.vfs.exists(&mark) {
+            self.inner.vfs.remove(&mark)?;
+            self.inner.vfs.sync_dir(&self.inner.dir)?;
+        }
+        Ok(())
     }
 
     /// Puts the database built as `temp` in the place of `name`, which
@@ -300,6 +396,9 @@ impl Engine {
     fn install(&self, temp: &str, name: &str) -> Result<()> {
         let (vfs, dir) = (&*self.inner.vfs, &self.inner.dir);
         let old = self.inner.dbs.lock().unwrap().get(name).cloned();
+        if old.as_ref().is_some_and(|old| old.followed().is_some()) {
+            return Err(Error::db(ErrorCode::ReadOnly, format!("database {name:?} follows another server's and is not replaced: promote it or drop it first")));
+        }
         if let Some(old) = old {
             // Its log emptied into its file, the old database is whole
             // on disk until the rename replaces it; and with an archive,
@@ -313,9 +412,111 @@ impl Engine {
         crate::wal::remove_logs(vfs, dir, temp, |_| true)?;
         vfs.sync_dir(dir)?;
         let id = self.inner.next_store.fetch_add(1, Ordering::Relaxed);
-        let db = self.inner.adopt(Database::open(self.inner.vfs.clone(), dir, name, self.inner.cache.clone(), id, self.inner.options_for(name))?);
+        let _ = id;
+        let db = self.inner.adopt(self.inner.open(name)?);
         self.inner.dbs.lock().unwrap().insert(name.to_string(), db);
         Ok(())
+    }
+
+    // ------------------------------------------------------- a standby
+
+    /// Begins a database that follows another server's, from a base of
+    /// it that the caller feeds in as the primary sends it: see `Seed`.
+    pub fn seed(&self, name: &str) -> Result<Seed<'_>> {
+        check_database_name(name)?;
+        if self.inner.dbs.lock().unwrap().contains_key(name) {
+            return Err(Error::db(ErrorCode::AlreadyExists, format!("database {name:?} already exists")));
+        }
+        let temp = format!("{name}{RECOVERING}");
+        // Log files left by an earlier database of this name are not
+        // the primary's.
+        wal::remove_logs(&*self.inner.vfs, &self.inner.dir, name, |_| true)?;
+        let file = self.inner.vfs.open(&data_path(&self.inner.dir, &temp), true)?;
+        file.set_len(0)?;
+        Ok(Seed { engine: self, name: name.to_string(), temp, file, written: 0, hasher: crc32fast::Hasher::new(), held: Vec::new() })
+    }
+
+    /// Begins a database that follows another server's from the
+    /// archive, if the archive holds the history `uuid` of it: its
+    /// newest base and every log file after it. Returns whether it did.
+    /// What the archive does not hold yet the primary sends.
+    pub fn seed_from_archive(&self, name: &str, uuid: &[u8; 16]) -> Result<bool> {
+        let Some(archive) = self.inner.options.db.archive.clone() else { return Ok(false) };
+        check_database_name(name)?;
+        let history = archive::history_name(name, uuid);
+        if archive.list(&history)?.bases.is_empty() {
+            return Ok(false);
+        }
+        let _one = self.inner.recovering.lock().unwrap();
+        if self.inner.dbs.lock().unwrap().contains_key(name) {
+            return Err(Error::db(ErrorCode::AlreadyExists, format!("database {name:?} already exists")));
+        }
+        let temp = format!("{name}{RECOVERING}");
+        wal::remove_logs(&*self.inner.vfs, &self.inner.dir, name, |_| true)?;
+        self.build_from_archive(&archive, &history, Moment::End, &temp, false)?;
+        self.install_following(&temp, name)?;
+        Ok(true)
+    }
+
+    /// Gives the data file built as `temp` the name `name`, marked as a
+    /// database that follows, and opens it so.
+    fn install_following(&self, temp: &str, name: &str) -> Result<()> {
+        let (vfs, dir) = (&*self.inner.vfs, &self.inner.dir);
+        // The mark first: without it the file would be a database of
+        // this server's own, that takes writes.
+        self.inner.set_mark(name, FOLLOWING)?;
+        vfs.rename(&data_path(dir, temp), &data_path(dir, name))?;
+        wal::remove_logs(vfs, dir, temp, |_| true)?;
+        vfs.sync_dir(dir)?;
+        let db = self.inner.adopt(self.inner.open(name)?);
+        self.inner.dbs.lock().unwrap().insert(name.to_string(), db);
+        Ok(())
+    }
+
+    /// Gives a following database what the archive holds of its
+    /// primary's log beyond where it has got to: for a standby that was
+    /// away for longer than its primary keeps the log. Returns whether
+    /// the archive held anything more.
+    pub fn catch_up_from_archive(&self, name: &str) -> Result<bool> {
+        let Some(archive) = self.inner.options.db.archive.clone() else { return Ok(false) };
+        let db = self.database(name)?;
+        let uuid = db.uuid();
+        let history = archive::history_name(name, &uuid);
+        let mut more = false;
+        loop {
+            let Some(followed) = db.followed() else { return Ok(more) };
+            let (generation, offset) = followed.received;
+            let Some((bytes, sealed)) = archive.log_bytes(&history, &uuid, generation, offset)? else { return Ok(more) };
+            if !bytes.is_empty() {
+                db.receive(generation, offset, &bytes)?;
+                more = true;
+            }
+            if !sealed {
+                return Ok(more);
+            }
+            // A sealed copy is the whole file: the primary went on.
+            db.receive(generation + 1, wal::FIRST_RECORD, &[])?;
+            more = true;
+        }
+    }
+
+    /// Makes a database that follows another this server's own, at the
+    /// last commit it was sent, under a new uuid: from here it takes
+    /// writes and follows nothing. Returns what it was and is.
+    pub fn promote(&self, name: &str) -> Result<String> {
+        let db = self.database(name)?;
+        let Some(followed) = db.followed() else {
+            return Err(Error::db(ErrorCode::InvalidRequest, format!("database {name:?} follows no other: there is nothing to promote")));
+        };
+        let was = archive::history_name(name, &db.uuid());
+        self.inner.set_mark(name, PROMOTING)?;
+        self.inner.dbs.lock().unwrap().remove(name);
+        db.retire();
+        drop(db);
+        let db = self.inner.adopt(self.inner.open(name)?);
+        let now = archive::history_name(name, &db.uuid());
+        self.inner.dbs.lock().unwrap().insert(name.to_string(), db);
+        Ok(format!("{name}: promoted at {} of {was}; it is now {now}\n", archive::position_text(followed.received.0, followed.applied)))
     }
 
     fn archive(&self) -> Result<&Arc<Archive>> {
@@ -408,7 +609,7 @@ impl Engine {
             Ok(vfs.sync_dir(dir)?)
         };
         sweep()?;
-        let built = self.build_from_archive(&archive, &history, to, &temp);
+        let built = self.build_from_archive(&archive, &history, to, &temp, true);
         let restored = match built {
             Ok(restored) => restored,
             Err(e) => {
@@ -422,7 +623,7 @@ impl Engine {
 
     /// Builds, under the name `temp`, the data file of `history` at the
     /// moment `to`, with nothing in its log and a uuid of its own.
-    fn build_from_archive(&self, archive: &Archive, history: &str, to: Moment, temp: &str) -> Result<Restored> {
+    fn build_from_archive(&self, archive: &Archive, history: &str, to: Moment, temp: &str, new_history: bool) -> Result<Restored> {
         let (vfs, dir) = (&self.inner.vfs, &self.inner.dir);
         let (_, uuid) = archive::parse_history(history).expect("a history's name");
         let refused = |what: String| Error::Db(DbError::invalid(format!("{history} cannot be restored to that moment: {what}")));
@@ -525,8 +726,11 @@ impl Engine {
         db.retire();
         drop(db);
         // A new history from here: what is committed to it next is not
-        // what the old one holds after this moment.
-        Store::rebrand(&*vfs.open(&data_path(dir, temp), false)?, random_uuid())?;
+        // what the old one holds after this moment. A standby's copy
+        // stays the history it copies.
+        if new_history {
+            Store::rebrand(&*vfs.open(&data_path(dir, temp), false)?, random_uuid())?;
+        }
         Ok(restored)
     }
 
@@ -602,5 +806,61 @@ impl std::fmt::Display for Restored {
             Some((generation, end, time)) => write!(f, "{} commits after it, the last at {}, made {}", self.commits, archive::position_text(generation, end), archive::time_text(time.unwrap_or(0))),
             None => write!(f, "no commit after it"),
         }
+    }
+}
+
+/// A base arriving from a primary, to begin a database that follows it.
+/// The bytes are those of a base in the archive: the data file, then a
+/// trailer with their CRC and the log file that continues from them.
+/// Nothing bears the database's name until `finish` has checked them.
+pub struct Seed<'a> {
+    engine: &'a Engine,
+    name: String,
+    temp: String,
+    file: Arc<dyn crate::vfs::File>,
+    written: u64,
+    hasher: crc32fast::Hasher,
+    /// The last bytes fed, which may be the trailer.
+    held: Vec<u8>,
+}
+
+impl Seed<'_> {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<()> {
+        self.held.extend_from_slice(bytes);
+        let trailer = archive::BASE_TRAILER as usize;
+        if self.held.len() > trailer {
+            let data = self.held.len() - trailer;
+            self.file.write_at(&self.held[..data], self.written)?;
+            self.hasher.update(&self.held[..data]);
+            self.written += data as u64;
+            self.held.drain(..data);
+        }
+        Ok(())
+    }
+
+    /// Checks the base, and makes it the database, following. `uuid` is
+    /// the history the primary said it is of.
+    pub fn finish(self, uuid: &[u8; 16]) -> Result<()> {
+        let (vfs, dir) = (&*self.engine.inner.vfs, &self.engine.inner.dir);
+        let checked = (|| {
+            let bad = || Error::corrupt(format!("the base of database {:?} did not arrive whole", self.name));
+            let base = archive::read_trailer(&self.held, self.written + self.held.len() as u64).ok_or_else(bad)?;
+            if self.hasher.clone().finalize() != base.crc || Store::uuid_of(&*self.file)? != *uuid {
+                return Err(bad());
+            }
+            self.file.sync()?;
+            // The log file that continues from the base, empty: it is
+            // where the copy of the primary's log begins.
+            let log = vfs.open(&wal::wal_path(dir, &self.name, base.generation), true)?;
+            log.set_len(0)?;
+            log.write_at(&wal::file_header(base.generation, uuid), 0)?;
+            log.sync()?;
+            Ok(())
+        })();
+        if let Err(e) = checked {
+            let _ = vfs.remove(&data_path(dir, &self.temp));
+            return Err(e);
+        }
+        self.engine.install_following(&self.temp, &self.name)
     }
 }

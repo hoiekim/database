@@ -152,7 +152,7 @@ pub struct Base {
     pub time: i64,
     /// The bytes of the data file it holds.
     pub len: u64,
-    crc: u32,
+    pub(crate) crc: u32,
 }
 
 impl Base {
@@ -283,19 +283,12 @@ impl Archive {
     /// Writes a base: `len` bytes that `read` gives, and the trailer.
     pub fn put_base(&self, history: &str, generation: u64, time: i64, len: u64, read: &dyn Fn(&mut [u8], u64) -> std::io::Result<()>) -> Result<()> {
         self.put(history, &base_file(generation), &mut |out| {
-            let mut hasher = crc32fast::Hasher::new();
-            let mut buf = vec![0u8; CHUNK];
             let mut at = 0u64;
-            while at < len {
-                let n = (len - at).min(CHUNK as u64) as usize;
-                read(&mut buf[..n], at)?;
-                hasher.update(&buf[..n]);
-                out.write_at(&buf[..n], at)?;
-                at += n as u64;
-            }
-            let base = Base { generation, time, len, crc: hasher.finalize() };
-            out.write_at(&base.trailer(), len)?;
-            Ok(())
+            write_base(generation, time, len, read, &mut |bytes| {
+                out.write_at(bytes, at)?;
+                at += bytes.len() as u64;
+                Ok(())
+            })
         })
     }
 
@@ -356,6 +349,26 @@ impl Archive {
     pub fn read_log(&self, history: &str, uuid: &[u8; 16], generation: u64, on_commit: &mut dyn FnMut(Commit) -> Result<()>) -> Result<Replayed> {
         let file = self.open(history, &log_file(generation))?;
         wal::replay_file(&*file, uuid, generation, on_commit)
+    }
+
+    /// The bytes of an archived log file from byte `from` to where its
+    /// records end, and whether the copy is sealed: whole, the primary
+    /// having gone on to the next file. `None` if the history has no
+    /// such file. For a standby that reads what its primary no longer
+    /// keeps.
+    pub fn log_bytes(&self, history: &str, uuid: &[u8; 16], generation: u64, from: u64) -> Result<Option<(Vec<u8>, bool)>> {
+        let file = match self.vfs.open(&self.history_dir(history).join(log_file(generation)), false) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let read = wal::replay_file(&*file, uuid, generation, &mut |_| Ok(()))?;
+        if read.end == End::Torn || read.at == 0 || from > read.at {
+            return Err(damaged(format!("log file {generation} of {history} in the archive does not hold byte {from}, or is damaged")));
+        }
+        let mut bytes = vec![0u8; (read.at - from) as usize];
+        read_exact_at(&*file, &mut bytes, from)?;
+        Ok(Some((bytes, read.sealed != 0)))
     }
 
     /// Copies the first `len` bytes of an archived log file to `out`.
@@ -433,6 +446,36 @@ impl Archive {
         Ok(out)
     }
 }
+
+/// Gives a base to `sink`, piece by piece: `len` bytes that `read`
+/// gives, and the trailer.
+pub fn write_base(generation: u64, time: i64, len: u64, read: &dyn Fn(&mut [u8], u64) -> std::io::Result<()>, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; CHUNK.min(len as usize)];
+    let mut at = 0u64;
+    while at < len {
+        let n = (len - at).min(CHUNK as u64) as usize;
+        read(&mut buf[..n], at)?;
+        hasher.update(&buf[..n]);
+        sink(&buf[..n])?;
+        at += n as u64;
+    }
+    sink(&Base { generation, time, len, crc: hasher.finalize() }.trailer())
+}
+
+/// Reads the trailer that ends a base of `len` bytes in all, if those
+/// bytes end with one.
+pub fn read_trailer(trailer: &[u8], len: u64) -> Option<Base> {
+    if trailer.len() as u64 != TRAILER_LEN || len < TRAILER_LEN {
+        return None;
+    }
+    let field = |at: usize| u64::from_le_bytes(trailer[at..at + 8].try_into().unwrap());
+    let base = Base { generation: field(8), time: field(16) as i64, len: field(24), crc: u32::from_le_bytes(trailer[32..36].try_into().unwrap()) };
+    (trailer == base.trailer() && base.len == len - TRAILER_LEN).then_some(base)
+}
+
+/// How many bytes a base's trailer takes.
+pub const BASE_TRAILER: u64 = TRAILER_LEN;
 
 /// A base's or a commit's time as a report shows it.
 pub fn time_text(time: i64) -> String {
