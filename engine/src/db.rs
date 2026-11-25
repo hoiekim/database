@@ -1478,8 +1478,32 @@ impl Database {
                 format!("archive of {}: log position {}, history {history}, {} log files and {} bases written, {stands}\n", self.name, archive::position_text(generation, offset), progress.logs_written, progress.bases_written)
             }
         };
+        let standby = match self.followed() {
+            None => {
+                let pins = self.log_pins.lock().unwrap();
+                match pins.1.values().min() {
+                    Some(from) => format!("log of {}: {} standbys are being sent it, and it is kept from file {from} on for them\n", self.name, pins.1.len()),
+                    None => String::new(),
+                }
+            }
+            Some(followed) => {
+                let at = archive::position_text(followed.received.0, followed.received.1);
+                let source = match followed.source {
+                    None => "its primary has not been heard from since this server started".to_string(),
+                    Some((end, _, heard)) => {
+                        let behind = match (end.0 == followed.received.0, end.1.saturating_sub(followed.received.1)) {
+                            (true, 0) => "it has all of it".to_string(),
+                            (true, bytes) => format!("it is {bytes} bytes behind"),
+                            (false, _) => format!("it is {} log files behind", end.0.saturating_sub(followed.received.0)),
+                        };
+                        format!("its primary's log was at {} when last heard from, {} ms ago: {behind}", archive::position_text(end.0, end.1), heard.as_millis())
+                    }
+                };
+                format!("standby copy {}: a copy of {}, which takes no writes; it has its primary's log up to {at}; {source}\n", self.name, archive::history_name(&self.name, &self.uuid()))
+            }
+        };
         format!(
-            "database {}: version {}, {} tables, {} pages, {} free, {} dirty, log {} bytes, {} commits, {} disk reads, {} disk writes, {} merges of full-text segments beside the writers and {} dropped\n{archive}",
+            "database {}: version {}, {} tables, {} pages, {} free, {} dirty, log {} bytes, {} commits, {} disk reads, {} disk writes, {} merges of full-text segments beside the writers and {} dropped\n{archive}{standby}",
             self.name,
             latest.version,
             latest.catalog.tables.len(),

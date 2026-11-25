@@ -11,6 +11,7 @@ mod access;
 mod gate;
 pub mod memory;
 mod session;
+mod standby;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,6 +28,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Notify};
 
 pub use access::sha256;
+pub use standby::Primary;
 
 /// How a server is started.
 #[derive(Clone, Debug)]
@@ -68,6 +70,16 @@ pub struct ServerConfig {
     /// directory before a checkpoint is made to copy its log file
     /// there. Zero leaves checkpoints to come when they otherwise would.
     pub archive_every: Duration,
+    /// How many bytes of log files checkpoints have passed are kept in
+    /// the data directory, for standbys that ask for the log from where
+    /// they had got to after being away. Zero keeps none: a standby
+    /// that is behind a checkpoint then reads the archive, or begins
+    /// again from a base.
+    pub keep_log_bytes: u64,
+    /// A server to follow: this one is then its standby, keeps a copy
+    /// of each of its databases and answers reads from them. `None` for
+    /// a server that follows nothing.
+    pub primary: Option<Primary>,
 }
 
 impl ServerConfig {
@@ -84,6 +96,8 @@ impl ServerConfig {
             slow_statement: None,
             archive: None,
             archive_every: Duration::from_secs(60),
+            keep_log_bytes: 0,
+            primary: None,
         }
     }
 }
@@ -110,6 +124,12 @@ pub(crate) struct State {
     /// run again on a newer version and answered the same; or they were
     /// run again and did not, and so failed with a conflict.
     pub forks: [AtomicU64; 3],
+    /// What a standby last said of its primary (under the empty name)
+    /// and of each database it follows or leaves alone: for `stats`.
+    pub standby: Mutex<HashMap<String, String>>,
+    /// The log kept for standbys that were just sent a base, each until
+    /// it has had time to come back for the log.
+    pub base_pins: Mutex<Vec<(std::time::Instant, database_engine::db::LogPin)>>,
 }
 
 /// How many connections are being served, and a way to be told when one
@@ -188,7 +208,7 @@ impl Server {
         // quarter in the pages of an open transaction.
         let cache_pages = config.cache_bytes / database_engine::page::PAGE_SIZE;
         let limits = Limits { max_dirty: (cache_pages / 8).max(64), max_private: (cache_pages / 4).max(128) };
-        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, limits, archive_every: config.archive_every, ..Options::default() }, archive: config.archive.clone(), ..EngineOptions::default() };
+        let options = EngineOptions { cache_bytes: config.cache_bytes, db: Options { sync: config.sync, limits, archive_every: config.archive_every, keep_log_bytes: config.keep_log_bytes, ..Options::default() }, archive: config.archive.clone(), ..EngineOptions::default() };
         let dir = config.data_dir.clone();
         // Recovery reads and writes files: keep it off the async threads.
         let engine = tokio::task::spawn_blocking(move || Engine::open(&dir, options)).await.map_err(std::io::Error::other)?.map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -216,6 +236,8 @@ impl Server {
             requests: AtomicU64::new(0),
             gates: Mutex::new(HashMap::new()),
             forks: Default::default(),
+            standby: Mutex::new(HashMap::new()),
+            base_pins: Mutex::new(Vec::new()),
         });
         let (stop, stopping) = watch::channel(false);
         // While requests arrive, and once more after they stop, memory
@@ -237,6 +259,9 @@ impl Server {
                 }
             }
         }));
+        if let Some(primary) = state.config.primary.clone() {
+            tasks.push(tokio::spawn(standby::run(state.clone(), primary, stopping.clone())));
+        }
         let (accept_state, accept_stopping) = (state.clone(), stopping.clone());
         tasks.push(tokio::spawn(async move {
             let mut stopped = accept_stopping.clone();

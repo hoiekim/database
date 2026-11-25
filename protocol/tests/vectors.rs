@@ -406,7 +406,7 @@ fn admin(a: &Admin) -> Json {
         Admin::RestoreChunk(bytes) => json!({"kind": "restore_chunk", "hex": hex(bytes)}),
         Admin::RestoreEnd => json!({"kind": "restore_end"}),
         // Of versions after 2, which the vectors do not hold.
-        Admin::Base { .. } | Admin::Archive { .. } | Admin::Recover { .. } => unreachable!("not a request of version 2"),
+        Admin::Base { .. } | Admin::Archive { .. } | Admin::Recover { .. } | Admin::Sources | Admin::BaseOf { .. } | Admin::Promote { .. } => unreachable!("not a request of version 2"),
     }
 }
 
@@ -458,6 +458,8 @@ fn response(r: &Response) -> Json {
         Response::Names(names) => json!({"kind": "names", "names": names}),
         Response::Text(text) => json!({"kind": "text", "text": text}),
         Response::Chunk(bytes) => json!({"kind": "chunk", "hex": hex(bytes)}),
+        // Of versions after 2, which the vectors do not hold.
+        Response::Sources(_) | Response::Log { .. } => unreachable!("not a response of version 2"),
         Response::Error(e) => json!({
             "kind": "error",
             "code": e.code as u8,

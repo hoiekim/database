@@ -17,6 +17,7 @@
 //! database recover <name> [--to <moment>] [--as <name>] [--replace]
 //!                                      restore a database from the archive as it stood at a moment:
 //!                                      a time, a commit's position, or `end`
+//! database promote [name...]           make a standby's copies its own databases, which take writes
 //! ```
 //!
 //! `serve` reads its settings from the environment:
@@ -31,6 +32,9 @@
 //! | `DATABASE_SLOW_MS` | (none) | log statements that take this many milliseconds or more, with what they read |
 //! | `DATABASE_ARCHIVE` | (none) | a directory to keep the log in beyond its checkpoints, for restoring to a moment |
 //! | `DATABASE_ARCHIVE_SECONDS` | `60` | with an archive: the longest a commit waits before its log file is copied there |
+//! | `DATABASE_PRIMARY` | (none) | `host:port` of a server to follow: this one is then its standby |
+//! | `DATABASE_PRIMARY_PASSWORD` | `DATABASE_ADMIN_PASSWORD` | the primary's administrator's password |
+//! | `DATABASE_KEEP_LOG_MB` | `0` | on a primary: megabytes of log kept past its checkpoints, for standbys that were away |
 //!
 //! The other commands connect to `DATABASE_HOST` (default `127.0.0.1`) on
 //! the port of `DATABASE_LISTEN`, or through `DATABASE_SOCKET` if that is
@@ -42,7 +46,7 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use database_client::{Client, Config, DbError, Moment, DEFAULT_PORT};
-use database_server::{Server, ServerConfig};
+use database_server::{Primary, Server, ServerConfig};
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -85,6 +89,13 @@ async fn serve() -> Result<(), String> {
     config.archive = env("DATABASE_ARCHIVE").map(Into::into);
     if let Some(seconds) = env("DATABASE_ARCHIVE_SECONDS") {
         config.archive_every = std::time::Duration::from_secs(seconds.parse().map_err(|_| "DATABASE_ARCHIVE_SECONDS is not a number of seconds".to_string())?);
+    }
+    if let Some(mb) = env("DATABASE_KEEP_LOG_MB") {
+        config.keep_log_bytes = mb.parse::<u64>().map_err(|_| "DATABASE_KEEP_LOG_MB is not a number".to_string())? * 1024 * 1024;
+    }
+    if let Some(primary) = env("DATABASE_PRIMARY") {
+        let (host, port) = primary.rsplit_once(':').and_then(|(host, port)| Some((host.to_string(), port.parse().ok()?))).ok_or_else(|| format!("DATABASE_PRIMARY is not host:port: {primary}"))?;
+        config.primary = Some(Primary { host, port, password: env("DATABASE_PRIMARY_PASSWORD").unwrap_or_else(|| config.admin_password.clone()) });
     }
     let data_dir = config.data_dir.clone();
     let server = Server::start(config).await.map_err(|e| format!("cannot start: {e}"))?;
@@ -238,7 +249,12 @@ async fn run(command: &str, mut args: Vec<String>) -> Result<(), String> {
             print!("{}", admin().await?.admin().recover(&from, to, &target, replace, &password).await.map_err(text)?);
             Ok(())
         }
-        _ => Err("usage: database serve | ping | create <name> | drop <name> | password <name> | list | dump [name...] | restore [--replace] | check | checkpoint | stats | base [name...] | archive [name] [--commits] | recover <name> [--to <moment>] [--as <name>] [--replace]".to_string()),
+        "promote" => {
+            let names: Vec<&str> = args.iter().map(String::as_str).collect();
+            print!("{}", admin().await?.admin().promote(&names).await.map_err(text)?);
+            Ok(())
+        }
+        _ => Err("usage: database serve | ping | create <name> | drop <name> | password <name> | list | dump [name...] | restore [--replace] | check | checkpoint | stats | base [name...] | archive [name] [--commits] | recover <name> [--to <moment>] [--as <name>] [--replace] | promote [name...]".to_string()),
     }
 }
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::expr::Expr;
-use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Moment, Request, Response, TxnKind, EXPLAIN_COLUMNS};
+use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Moment, Request, Response, Source, TxnKind, EXPLAIN_COLUMNS};
 use database_protocol::query::{Delete, Insert, Query, Update};
 use database_protocol::schema::{ColumnDef, IndexDef, TableDef};
 use database_protocol::value::{Timestamp, Value};
@@ -738,6 +738,37 @@ impl LockGuard {
     }
 }
 
+/// An answer that comes in pieces on a connection of its own: a base,
+/// or a database's log for as long as it is read. Dropped before its
+/// end, it takes its connection with it.
+pub struct Stream {
+    conn: PooledConn,
+}
+
+impl Stream {
+    async fn open(client: &Client, request: Request) -> DbResult<Stream> {
+        let mut conn = client.pool.acquire().await?;
+        conn.conn().send(&request).await?;
+        Ok(Stream { conn })
+    }
+
+    /// The next piece: `None` once the server has said `Ok`, which ends
+    /// a base; an error if it said that instead.
+    pub async fn next(&mut self) -> DbResult<Option<Response>> {
+        match self.conn.conn().receive().await? {
+            Response::Ok => {
+                self.conn.conn().settle();
+                Ok(None)
+            }
+            Response::Error(e) => {
+                self.conn.conn().settle();
+                Err(e)
+            }
+            piece => Ok(Some(piece)),
+        }
+    }
+}
+
 /// Server-wide operations. See `Client::admin`.
 pub struct Admin<'a> {
     client: &'a Client,
@@ -835,6 +866,39 @@ impl Admin<'_> {
         match self.call(AdminRequest::Recover { from: from.into(), to, target: target.into(), replace, password: password.into() }).await? {
             Response::Text(report) => Ok(report),
             _ => Err(unexpected("recover")),
+        }
+    }
+
+    /// The databases a standby of the server would follow: see
+    /// `Source`. What a standby asks its primary first.
+    pub async fn sources(&self) -> DbResult<Vec<Source>> {
+        match self.call(AdminRequest::Sources).await? {
+            Response::Sources(sources) => Ok(sources),
+            _ => Err(unexpected("sources")),
+        }
+    }
+
+    /// Asks for a base of a database: its data file as of a checkpoint,
+    /// with a trailer, in pieces. What a standby begins from.
+    pub async fn base_of(&self, database: &str) -> DbResult<Stream> {
+        Stream::open(self.client, Request::Admin(AdminRequest::BaseOf { database: database.into() })).await
+    }
+
+    /// Asks for a database's log from byte `offset` of log file
+    /// `generation` of the history `uuid`: answered with
+    /// `Response::Log` pieces for as long as the stream is read. What a
+    /// standby does all its life.
+    pub async fn follow(&self, database: &str, uuid: [u8; 16], generation: u64, offset: u64) -> DbResult<Stream> {
+        Stream::open(self.client, Request::Follow { database: database.into(), uuid, generation, offset }).await
+    }
+
+    /// Makes the named databases that follow another server's, or all
+    /// that do when none is named, the server's own: each at the last
+    /// commit it was sent, under a new identity, taking writes.
+    pub async fn promote(&self, databases: &[&str]) -> DbResult<String> {
+        match self.call(AdminRequest::Promote { databases: databases.iter().map(|d| d.to_string()).collect() }).await? {
+            Response::Text(report) => Ok(report),
+            _ => Err(unexpected("promote")),
         }
     }
 

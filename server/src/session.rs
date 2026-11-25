@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use database_engine::db::{Database, ReadTxn, WriteTxn};
+use database_engine::db::{Database, LogRead, ReadTxn, WriteTxn};
 use database_engine::dump::{self, Restore};
 use database_engine::eval::{Drawn, Read};
 use database_protocol::error::{DbError, DbResult, ErrorCode};
@@ -212,6 +212,9 @@ struct Session {
     /// The named locks this connection holds.
     held: Vec<String>,
     restore: Option<(mpsc::Sender<Vec<u8>>, RestoreTask)>,
+    /// Told when the server is stopping: an answer that goes on for as
+    /// long as it is read ends then.
+    stopping: watch::Receiver<bool>,
 }
 
 fn already_open() -> DbError {
@@ -233,6 +236,15 @@ fn admin_only() -> DbError {
 async fn blocking<T>(f: impl FnOnce() -> T) -> DbResult<T> {
     Ok(tokio::task::block_in_place(f))
 }
+
+/// How much of a log file a standby is sent at a time.
+const LOG_PIECE: usize = 1 << 20;
+/// How often a standby with nothing to be sent is told where the log
+/// stands.
+const FOLLOW_BEAT: Duration = Duration::from_secs(1);
+/// How long the log from a base on is kept for the standby that took
+/// the base to come back and ask for it.
+const BASE_PIN: Duration = Duration::from_secs(120);
 
 /// The largest frame taken from a connection that has not yet said who
 /// it is: room for a greeting and little else.
@@ -340,6 +352,7 @@ where
         read: Read::default(),
         held: Vec::new(),
         restore: None,
+        stopping: stopping.clone(),
     };
 
     // The greeting, within ten seconds.
@@ -942,6 +955,8 @@ impl Session {
     async fn handle<W: AsyncWrite + Unpin>(&mut self, request: Request, deadline: Option<Instant>, writer: &mut W) -> Result<Vec<Response>, ()> {
         let answer = match request {
             Request::Admin(Admin::Dump { databases }) => return self.dump(databases, writer).await,
+            Request::Admin(Admin::BaseOf { database }) => return self.base_of(database, writer).await,
+            Request::Follow { database, uuid, generation, offset } => return self.follow(database, uuid, generation, offset, writer).await,
             other => self.answer(other, deadline).await,
         };
         Ok(answer.unwrap_or_else(|e| vec![Response::Error(e)]))
@@ -950,6 +965,7 @@ impl Session {
     async fn answer(&mut self, request: Request, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
         match request {
             Request::Hello { .. } => Err(DbError::invalid("already greeted")),
+            Request::Follow { .. } => unreachable!("handled by the caller"),
             Request::Ping => Ok(vec![Response::Ok]),
             Request::Begin { kind, lock_wait_ms } => {
                 if self.txn.is_some() {
@@ -1639,6 +1655,19 @@ impl Session {
                 let forks = |how: usize| state.forks[how].load(Ordering::Relaxed);
                 report.push_str(&format!("optimistic transactions: {} committed as they stood, {} run again, {} in conflict\n", forks(AS_IT_STOOD), forks(RUN_AGAIN), forks(IN_CONFLICT)));
                 report.push_str(&format!("requests: {}\n", state.requests.load(Ordering::Relaxed)));
+                // What a standby has to say of its primary, and of each
+                // database it keeps a copy of or leaves alone.
+                if self.admin {
+                    let said = state.standby.lock().unwrap();
+                    let mut names: Vec<&String> = said.keys().collect();
+                    names.sort();
+                    for name in names {
+                        match name.as_str() {
+                            "" => report.push_str(&format!("standby: {}\n", said[name])),
+                            _ => report.push_str(&format!("standby: {name:?}: {}\n", said[name])),
+                        }
+                    }
+                }
                 Ok(vec![Response::Text(report)])
             }
             Admin::RestoreBegin { replace } => {
@@ -1677,7 +1706,29 @@ impl Session {
                 task.await.map_err(|e| DbError::new(ErrorCode::Internal, e.to_string()))??;
                 Ok(vec![Response::Ok])
             }
-            Admin::Dump { .. } => unreachable!("handled by the caller"),
+            Admin::Dump { .. } | Admin::BaseOf { .. } => unreachable!("handled by the caller"),
+            Admin::Sources => {
+                // What a standby would follow: this server's own
+                // databases, not the ones it follows itself.
+                let access = state.access.lock().unwrap();
+                let sources = state.engine.names().into_iter().filter_map(|name| {
+                    let db = state.engine.database(&name).ok()?;
+                    db.followed().is_none().then(|| Source { uuid: db.uuid(), note: access.note(&name), name })
+                });
+                Ok(vec![Response::Sources(sources.collect())])
+            }
+            Admin::Promote { databases } => {
+                let report = blocking(move || {
+                    let following = |name: &String| state.engine.database(name).is_ok_and(|db| db.followed().is_some());
+                    let names: Vec<String> = if databases.is_empty() { state.engine.names().into_iter().filter(following).collect() } else { databases };
+                    if names.is_empty() {
+                        return Err(DbError::invalid("no database of this server follows another: there is nothing to promote"));
+                    }
+                    names.iter().map(|name| state.engine.promote(name).map_err(|e| e.into_db())).collect::<DbResult<String>>()
+                })
+                .await??;
+                Ok(vec![Response::Text(report)])
+            }
             Admin::Base { databases } => {
                 let report = blocking(move || state.engine.base_copy(&databases)).await?.map_err(|e| e.into_db())?;
                 Ok(vec![Response::Text(report)])
@@ -1704,6 +1755,119 @@ impl Session {
                 Ok(vec![Response::Text(report)])
             }
         }
+    }
+
+    /// Streams a base of a database to a standby that begins from it:
+    /// chunks, then `Ok` or the error that stopped it. The log from the
+    /// base on is kept for a while afterwards, for the standby to come
+    /// back and ask for it.
+    async fn base_of<W: AsyncWrite + Unpin>(&mut self, database: String, writer: &mut W) -> Result<Vec<Response>, ()> {
+        if !self.admin {
+            return Ok(vec![Response::Error(admin_only())]);
+        }
+        let state = self.state.clone();
+        let (out, mut chunks) = mpsc::channel::<Vec<u8>>(4);
+        let task = tokio::task::spawn_blocking(move || {
+            let db = state.engine.database(&database).map_err(|e| e.into_db())?;
+            let (_, pin) = db
+                .base_to(&mut |bytes| out.blocking_send(bytes.to_vec()).map_err(|_| database_engine::error::Error::db(ErrorCode::Connection, "the standby went away")))
+                .map_err(|e| e.into_db())?;
+            let mut held = state.base_pins.lock().unwrap();
+            held.retain(|(since, _)| since.elapsed() < BASE_PIN);
+            held.push((Instant::now(), pin));
+            Ok(())
+        });
+        while let Some(chunk) = chunks.recv().await {
+            if write_response(writer, &mut Vec::new(), &Response::Chunk(chunk)).await.is_err() {
+                return Err(());
+            }
+        }
+        Ok(vec![match task.await {
+            Ok(Ok(())) => Response::Ok,
+            Ok(Err(e)) => Response::Error(e),
+            Err(e) => Response::Error(DbError::new(ErrorCode::Internal, e.to_string())),
+        }])
+    }
+
+    /// Sends a standby a database's log from where the standby has it
+    /// up to, and goes on sending as commits reach this server's disk,
+    /// until the connection ends or the server stops; or answers with
+    /// the error that says why it cannot. See `Request::Follow`.
+    ///
+    /// Nothing here is on a commit's way. The log is read back from its
+    /// files, up to where it is synced, on a thread of this stream's
+    /// own, which sleeps until a sync wakes it.
+    async fn follow<W: AsyncWrite + Unpin>(&mut self, database: String, uuid: [u8; 16], generation: u64, offset: u64, writer: &mut W) -> Result<Vec<Response>, ()> {
+        let refuse = |e: DbError| Ok(vec![Response::Error(e)]);
+        if !self.admin {
+            return refuse(admin_only());
+        }
+        let db = match self.state.engine.database(&database) {
+            Ok(db) => db,
+            Err(e) => return refuse(e.into_db()),
+        };
+        if db.followed().is_some() {
+            return refuse(DbError::invalid(format!("database {database:?} follows another server's itself, and a standby is not followed")));
+        }
+        if db.uuid() != uuid {
+            return refuse(DbError::invalid(format!("database {database:?} of this server is another history than the standby's copy")));
+        }
+        let (out, mut pieces) = mpsc::channel::<Response>(4);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        tokio::task::spawn_blocking(move || {
+            // The files not yet sent stay, whatever checkpoints pass them.
+            let pin = db.pin_log(generation);
+            let (mut generation, mut offset) = (generation, offset);
+            while !stopped.load(Ordering::Relaxed) {
+                let (at, bytes) = match db.read_log(generation, offset, LOG_PIECE) {
+                    Ok(LogRead::Bytes(bytes)) => {
+                        offset += bytes.len() as u64;
+                        (offset - bytes.len() as u64, bytes)
+                    }
+                    Ok(LogRead::Next) => {
+                        generation += 1;
+                        offset = database_engine::wal::FIRST_RECORD;
+                        pin.advance(generation);
+                        (offset, Vec::new())
+                    }
+                    // Nothing new: wait for a sync, and say where the
+                    // log stands at least once a second.
+                    Ok(LogRead::Wait) => {
+                        if db.wait_for_log((generation, offset), FOLLOW_BEAT) != (generation, offset) {
+                            continue;
+                        }
+                        (offset, Vec::new())
+                    }
+                    Err(e) => {
+                        let _ = out.blocking_send(Response::Error(e.into_db()));
+                        return;
+                    }
+                };
+                let piece = Response::Log { generation, offset: at, bytes, end: db.synced_position(), time: now_micros() };
+                if out.blocking_send(piece).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut sending = Vec::new();
+        let outcome = loop {
+            let piece = tokio::select! {
+                piece = pieces.recv() => piece,
+                _ = self.stopping.changed() => break Err(()),
+            };
+            match piece {
+                Some(Response::Error(e)) => break Ok(vec![Response::Error(e)]),
+                Some(piece) => {
+                    if write_response(writer, &mut sending, &piece).await.is_err() {
+                        break Err(());
+                    }
+                }
+                None => break Err(()),
+            }
+        };
+        stop.store(true, Ordering::Relaxed);
+        outcome
     }
 
     /// Streams a dump: chunks, then `Ok` or the error that stopped it.

@@ -20,8 +20,10 @@ use crate::value::Value;
 /// server would not know (version 3: `Prepared`, `BeginWith`, `Batch`,
 /// `Expr::Param`; version 4: `Explain`; version 5: see
 /// `COLUMN_FLAGS_VERSION`; version 6: `Admin::Base`, `Admin::Archive`,
-/// `Admin::Recover`).
-pub const PROTOCOL_VERSION: u32 = 6;
+/// `Admin::Recover`; version 7: `Follow`, `Admin::Sources`,
+/// `Admin::BaseOf`, `Admin::Promote`, what answers them, and the error
+/// codes `ReadOnly` and `Behind`).
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// From this version a column's last byte is a byte of flags, and a
 /// column may carry `keep_start` after it (`codec::put_column`). A
@@ -127,6 +129,13 @@ pub enum Request {
     /// no plan to show, since a query names its own access path; what
     /// there is to know is how much that path made the server read.
     Explain(Box<Request>),
+    /// A standby's request for its primary's log of a database, from
+    /// where the standby has it up to: byte `offset` of log file
+    /// `generation`, of the history `uuid`. It is answered with `Log`
+    /// responses, for as long as the connection lasts, or with one
+    /// error: `Behind` if the primary no longer keeps the log from
+    /// there. Only what is on the primary's disk is sent.
+    Follow { database: String, uuid: [u8; 16], generation: u64, offset: u64 },
 }
 
 /// The columns of an `Explain`'s answer, all integers: entries read from
@@ -206,6 +215,27 @@ pub enum Admin {
     /// `replace` is given. `password` is the database's if it has none
     /// yet; a database that is replaced keeps its own.
     Recover { from: String, to: Moment, target: String, replace: bool, password: String },
+    /// The databases a standby of this server would follow: each one's
+    /// name, the uuid of its history, and its password as stored.
+    Sources,
+    /// Streams a base of the database, as `Chunk` frames: its data file
+    /// as of a checkpoint, and a trailer that says which log file
+    /// continues from it. The server keeps the log from there on for a
+    /// while, for the `Follow` that comes after.
+    BaseOf { database: String },
+    /// Makes the named databases that follow another server's, or all
+    /// that do when none is named, this server's own: each at the last
+    /// commit it was sent, as a history of its own that takes writes.
+    Promote { databases: Vec<String> },
+}
+
+/// A database a standby would follow: see `Admin::Sources`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub name: String,
+    pub uuid: [u8; 16],
+    /// The password's salt and hash, as a dump carries them.
+    pub note: Vec<u8>,
 }
 
 /// A moment of a database's history: what `Admin::Recover` restores.
@@ -244,6 +274,12 @@ pub enum Response {
     Text(String),
     Chunk(Vec<u8>),
     Error(DbError),
+    Sources(Vec<Source>),
+    /// Bytes of a primary's log file `generation`, which lie at byte
+    /// `offset` of it; none, to say only where the primary is. `end` is
+    /// where the primary's log is on its disk up to, as the file and
+    /// the byte, and `time` its clock, when this was sent.
+    Log { generation: u64, offset: u64, bytes: Vec<u8>, end: (u64, u64), time: i64 },
 }
 
 // ---------------------------------------------------------------- encoding
@@ -383,6 +419,13 @@ fn put_request(w: &mut Writer, request: &Request) {
             w.u8(22);
             put_request(w, statement);
         }
+        Request::Follow { database, uuid, generation, offset } => {
+            w.u8(23);
+            w.str(database);
+            w.bytes(uuid);
+            w.varint(*generation);
+            w.varint(*offset);
+        }
     }
 }
 
@@ -443,9 +486,14 @@ fn get_request(r: &mut Reader, depth: u32) -> DbResult<Request> {
             Request::Batch(items)
         }
         22 => Request::Explain(Box::new(get_request(r, depth + 1)?)),
+        23 => Request::Follow { database: r.str()?, uuid: get_uuid(r)?, generation: r.varint()?, offset: r.varint()? },
         _ => return Err(DbError::new(ErrorCode::InvalidRequest, "unknown request")),
     };
     Ok(request)
+}
+
+fn get_uuid(r: &mut Reader) -> DbResult<[u8; 16]> {
+    r.bytes()?.try_into().map_err(|_| DbError::new(ErrorCode::InvalidRequest, "a history's uuid is 16 bytes"))
 }
 
 fn put_ddl(w: &mut Writer, ddl: &Ddl) {
@@ -562,6 +610,15 @@ fn put_admin(w: &mut Writer, admin: &Admin) {
             w.bool(*replace);
             w.str(password);
         }
+        Admin::Sources => w.u8(15),
+        Admin::BaseOf { database } => {
+            w.u8(16);
+            w.str(database);
+        }
+        Admin::Promote { databases } => {
+            w.u8(17);
+            w.strs(databases);
+        }
     }
 }
 
@@ -590,6 +647,9 @@ fn get_admin(r: &mut Reader) -> DbResult<Admin> {
             };
             Admin::Recover { from, to, target: r.str()?, replace: r.bool()?, password: r.str()? }
         }
+        15 => Admin::Sources,
+        16 => Admin::BaseOf { database: r.str()? },
+        17 => Admin::Promote { databases: r.strs()? },
         _ => return Err(DbError::new(ErrorCode::InvalidRequest, "unknown admin request")),
     })
 }
@@ -659,6 +719,24 @@ pub fn encode_response_onto(buf: Vec<u8>, response: &Response) -> Vec<u8> {
             w.u8(10);
             put_error(&mut w, e);
         }
+        Response::Sources(sources) => {
+            w.u8(11);
+            w.varint(sources.len() as u64);
+            for source in sources {
+                w.str(&source.name);
+                w.bytes(&source.uuid);
+                w.bytes(&source.note);
+            }
+        }
+        Response::Log { generation, offset, bytes, end, time } => {
+            w.u8(12);
+            w.varint(*generation);
+            w.varint(*offset);
+            w.bytes(bytes);
+            w.varint(end.0);
+            w.varint(end.1);
+            w.zigzag(*time);
+        }
     }
     w.buf
 }
@@ -699,6 +777,15 @@ pub fn decode_response(frame: &[u8]) -> DbResult<Response> {
         8 => Response::Text(r.str()?),
         9 => Response::Chunk(r.bytes()?.to_vec()),
         10 => Response::Error(get_error(&mut r)?),
+        11 => {
+            let n = r.count()?;
+            let mut sources = Vec::with_capacity(n.min(RESERVE));
+            for _ in 0..n {
+                sources.push(Source { name: r.str()?, uuid: get_uuid(&mut r)?, note: r.bytes()?.to_vec() });
+            }
+            Response::Sources(sources)
+        }
+        12 => Response::Log { generation: r.varint()?, offset: r.varint()?, bytes: r.bytes()?.to_vec(), end: (r.varint()?, r.varint()?), time: r.zigzag()? },
         _ => return Err(DbError::new(ErrorCode::Connection, "unknown response")),
     };
     r.finish()?;
@@ -864,6 +951,10 @@ mod tests {
             Request::Admin(Admin::RestoreBegin { replace: true }),
             Request::Admin(Admin::RestoreChunk(vec![1, 2, 3])),
             Request::Admin(Admin::RestoreEnd),
+            Request::Follow { database: "shop".into(), uuid: [7; 16], generation: 12, offset: 4096 },
+            Request::Admin(Admin::Sources),
+            Request::Admin(Admin::BaseOf { database: "shop".into() }),
+            Request::Admin(Admin::Promote { databases: vec!["shop".into()] }),
             Request::Admin(Admin::Base { databases: vec!["shop".into()] }),
             Request::Admin(Admin::Archive { history: "shop".into(), commits: true }),
             Request::Admin(Admin::Recover { from: "shop".into(), to: Moment::End, target: "shop".into(), replace: true, password: String::new() }),
@@ -902,6 +993,9 @@ mod tests {
             Response::Names(vec!["a".into(), "b".into()]),
             Response::Text("ok".into()),
             Response::Chunk(vec![0; 1000]),
+            Response::Sources(vec![Source { name: "shop".into(), uuid: [7; 16], note: vec![1; 48] }]),
+            Response::Log { generation: 12, offset: 4096, bytes: vec![9; 300], end: (13, 36), time: 1_700_000_000_000_000 },
+            Response::Log { generation: 12, offset: 4096, bytes: Vec::new(), end: (12, 4096), time: -1 },
             Response::Error(DbError::new(ErrorCode::UniqueViolation, "duplicate key").with_constraint("users", "users_email")),
         ];
         for response in responses {
