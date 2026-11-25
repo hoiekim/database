@@ -172,12 +172,13 @@ docker rm -f drill
   every page is either in use once or free. It holds writers off while
   it runs. Prints a line per table, or the first inconsistency.
 - `database stats`: per database, its version, pages, free pages, log
-  size, and counts of commits and disk reads and writes; then how the
-  commits of optimistic transactions went: as they stood, run again
-  beside another's commit, or in conflict (and so run again by their
-  client); then the requests received since the server started. Many
-  conflicts mean transactions that read and write the same rows: see
-  `PERFORMANCE.md`.
+  size, and counts of commits and disk reads and writes; then how many
+  pages the cache holds, and the memory held for pages and how much of
+  it is free (see "Memory"); then how the commits of optimistic
+  transactions went: as they stood, run again beside another's commit,
+  or in conflict (and so run again by their client); then the requests
+  received since the server started. Many conflicts mean transactions
+  that read and write the same rows: see `PERFORMANCE.md`.
 - `database checkpoint`: writes everything committed into the data
   files now and empties the logs. Never needed; useful before copying
   the files of a stopped server.
@@ -291,29 +292,41 @@ The server's memory is the page cache plus a part in proportion to it:
 | | With the default 32 MB |
 |---|---|
 | Page cache (`DATABASE_CACHE_MB`), shared by all databases | 32 MB |
-| Committed pages waiting for their checkpoint, per busy database | up to 4 MB |
-| Pages of a transaction in progress, per writer | up to 8 MB |
-| Requests and results in flight | requests over 64 KiB: 4 MB of them decoded at once, and each connection's next request as sent while it waits; results: their size |
+| Committed pages waiting for their checkpoint, per busy database | up to 4 MB, and as many again while a checkpoint writes them |
+| Pages of a transaction in progress, per writer | up to 8 MB; merging full-text segments beside the writers takes as much again |
+| Requests in flight | requests over 64 KiB: 4 MB of them, counted as sent, decoded at once, which take two to three times that once decoded and their texts cut into words; each connection's next request as sent while it waits; results: their size |
+| Memory freed and not yet given back | with the GNU C library, 20 to 30 MB in its per-thread pools under a load of megabyte statements, and the free part of the pages' memory (below) |
+
+Pages, in the cache or outside it, are kept in memory the server maps
+for them alone (on Linux with the GNU C library): a page freed makes
+room for the next, so this memory is never more than the most pages
+held at once, the first three rows of the table, and `database stats`
+shows how much it is and how much of it is free. The rest comes from
+the C library, which keeps a pool for each thread. Every few seconds
+while requests arrive, and as large requests are answered, the server
+hands memory that is free in either back to the system, all but 4 MB of
+the pages'. With the default cache and one database being loaded, then,
+the bound is about 56 MB for pages (32 + 4 + 4 + 8 + 8), about 12 MB for
+large requests, 20 to 30 MB that the C library keeps, and a few
+megabytes of code and thread stacks: about 100 MB.
 
 An idle server with nothing cached holds about 3 MB. Under the
 benchmark's load (`bench/`) it holds 45 to 50 MB once the load has
-passed, and at most 117 to 130 MB while four connections load megabyte
-statements into a table with a full-text index (150 to 171 MB before
-large requests shared a budget): the cache, the requests and their log
-records in flight, and freed memory that the allocator has not yet
-returned. Large requests take turns for 4 MB of memory to be decoded and
-answered in, a request larger than that runs alone, a request waiting
-for its turn is held as it was sent, and the memory each held is
-returned to the system as it is answered (on Linux with the GNU C
-library; elsewhere the budget alone bounds it). A container limit of 128
-MB fits ordinary requests with the default cache, but not quite a bulk
-load of megabyte statements from four connections, which went 2 MB over
-it in one run of six: give that 160 MB, and 192 MB if rows of a megabyte
-and more are common (the load above has rows of 4 kB, and a row is held
-whole), and raise `DATABASE_CACHE_MB` only if `stats` shows many disk
-reads for the working set. A transaction that runs beside other writers
-keeps at most about a megabyte of its own before it takes the write
-lock.
+passed, and at most 81 to 87 MB while four connections load megabyte
+statements into a table with a full-text index (112 to 131 MB before
+pages were kept apart, 150 to 171 MB before large requests shared a
+budget): about 50 MB for pages, 10 to 15 MB of requests and their log
+records in flight, and 20 to 30 MB that the C library's pools keep.
+Large requests take turns for 4 MB of memory to be decoded and answered
+in, a request larger than that runs alone, and a request waiting for its
+turn is held as it was sent. A container limit of 128 MB fits that load
+with the default cache; give 192 MB if rows of a megabyte and more are
+common (the load above has rows of 4 kB, and a row is held whole), and
+raise `DATABASE_CACHE_MB` only if `stats` shows many disk reads for the
+working set, adding to the limit what is added to the cache and half as
+much again for the pages outside it. A transaction that runs beside
+other writers keeps at most about a megabyte of its own before it takes
+the write lock.
 
 The largest single request or result is 256 MiB, and it is held in
 memory while it is handled. A text of tens of megabytes works; a habit

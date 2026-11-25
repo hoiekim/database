@@ -235,6 +235,24 @@ async fn a_clean_restart_keeps_everything() -> DbResult<()> {
     Ok(())
 }
 
+// The memory held for pages is in the stats, where it is kept apart
+// (`memory::pages`): never less than the pages the cache holds.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stats_say_how_much_memory_pages_hold() -> DbResult<()> {
+    let (server, db) = fresh().await;
+    pairs(&db).await?;
+    let stats = server.admin().await.admin().stats().await?;
+    let number = |label: &str, nth: usize| -> f64 {
+        let line = stats.lines().find(|l| l.starts_with(label)).unwrap_or_else(|| panic!("no line {label:?} in {stats}"));
+        line.split(|c: char| !c.is_ascii_digit() && c != '.').filter(|s| !s.is_empty() && *s != ".").nth(nth).unwrap().parse().unwrap()
+    };
+    let (mapped, free) = (number("memory for pages:", 0), number("memory for pages:", 1));
+    let cached = number("cache:", 0) * 8192.0 / 1_048_576.0;
+    assert!(mapped > 0.0 && free <= mapped && mapped - free >= cached - 0.1, "{stats}");
+    Ok(())
+}
+
 // R-O3: a health check and the server's clock.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_server_answers_a_ping_and_tells_the_time() -> DbResult<()> {
