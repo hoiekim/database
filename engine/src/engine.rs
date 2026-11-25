@@ -107,6 +107,11 @@ pub struct Engine {
     merger: Option<std::thread::JoinHandle<()>>,
 }
 
+/// How long a drop, with an archive, waits for a transaction that holds
+/// the database before it gives up: the database's log goes to the
+/// archive first, and that takes the writer's place for a moment.
+const LAST_CHECKPOINT_WAIT: Duration = Duration::from_secs(30);
+
 /// Ends the name a database is built under while a dump is loaded.
 pub const RESTORING: &str = "--restoring";
 /// Ends the name a database is built under while it is restored from
@@ -270,8 +275,8 @@ impl Engine {
         // With an archive, the log goes there before the files go: a
         // database dropped by mistake is then in the archive up to its
         // last commit. One that has failed has no checkpoint to make.
-        if !db.has_failed() {
-            db.checkpoint_archived()?;
+        if self.has_archive() && !db.has_failed() {
+            db.checkpoint_archived(LAST_CHECKPOINT_WAIT)?;
         }
         self.inner.dbs.lock().unwrap().remove(name);
         db.retire();
@@ -299,7 +304,7 @@ impl Engine {
             // Its log emptied into its file, the old database is whole
             // on disk until the rename replaces it; and with an archive,
             // its history is there to its last commit.
-            old.checkpoint_archived()?;
+            old.checkpoint_archived(Duration::from_secs(3600))?;
             self.inner.dbs.lock().unwrap().remove(name);
             old.retire();
         }

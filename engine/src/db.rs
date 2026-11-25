@@ -728,8 +728,14 @@ impl Database {
     /// nothing was committed to it. Returns what the archive refused,
     /// if it refused something.
     fn checkpoint_held(self: &Arc<Self>, base: bool, close: bool) -> Result<Option<String>> {
+        self.checkpoint_within(base, close, Duration::from_secs(3600))
+    }
+
+    /// `checkpoint_held`, waiting no longer than `wait` for the writer
+    /// to let go.
+    fn checkpoint_within(self: &Arc<Self>, base: bool, close: bool, wait: Duration) -> Result<Option<String>> {
         self.check_failed()?;
-        let guard = self.lock_writes(Duration::from_secs(3600))?;
+        let guard = self.lock_writes(wait)?;
         let latest = self.latest.lock().unwrap().clone();
         if latest.version == self.store.meta().version {
             // Nothing to write. With an archive there may still be log
@@ -917,9 +923,11 @@ impl Database {
     /// A checkpoint that fails if the archive did not take every log
     /// file before it: for whoever is about to remove the database, and
     /// with it the only other copy of its last commits.
-    pub fn checkpoint_archived(self: &Arc<Self>) -> Result<()> {
+    /// It waits up to `wait` for a transaction that holds the database
+    /// to end.
+    pub fn checkpoint_archived(self: &Arc<Self>, wait: Duration) -> Result<()> {
         let _one = self.checkpointing.lock().unwrap();
-        match (self.checkpoint_held(false, true)?, &self.archiving) {
+        match (self.checkpoint_within(false, true, wait)?, &self.archiving) {
             (Some(why), Some(archiving)) => Err(Error::db(ErrorCode::Io, format!("the archive has not taken the log of {} ({why}), and removing database {:?} would remove the only copy of its last commits: make the archive writable, or start the server without it", archiving.history, self.name))),
             _ => Ok(()),
         }
