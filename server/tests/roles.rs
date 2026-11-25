@@ -2,7 +2,7 @@
 //! tables. Each right is proved the same way: a role that lacks only
 //! that right is refused every statement that needs it, by every way a
 //! statement can be sent, and nothing is changed; a role that holds it
-//! is answered. R-A1 to R-A8.
+//! is answered. R-A1 to R-A7.
 
 mod common;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -480,6 +480,22 @@ async fn a_role_is_not_told_which_tables_exist_among_those_it_has_no_right_to() 
         assert_eq!(message(there, Request::Delete(Delete::from(there).key([1]))).await, message(absent, Request::Delete(Delete::from(absent).key([1]))).await);
         assert_eq!(message(there, Request::Ddl(Ddl::DropTable { name: there.into(), if_exists: true })).await, message(absent, Request::Ddl(Ddl::DropTable { name: absent.into(), if_exists: true })).await);
     }
+    // Nor is it told a name by a refusal that is about another table: one
+    // that may change a table's schema, and no more, learns that the
+    // table is pointed at, and not by what.
+    owner.roles().create("keeper", ROLE_PASSWORD).await?;
+    owner.roles().grant("keeper", Rights::SCHEMA, "customers").await?;
+    let drop_customers = || Request::Ddl(Ddl::DropTable { name: "customers".into(), if_exists: false });
+    let kept = send(&server, "keeper", Way::Alone, drop_customers()).await.expect_err("other tables point at it");
+    assert_eq!(kept.code, ErrorCode::ForeignKeyViolation);
+    for hidden in ["orders", "invoices", "lines", "notes"] {
+        assert!(!kept.message.contains(hidden) && kept.constraint.as_ref().is_none_or(|c| !format!("{c:?}").contains(hidden)), "{kept:?}");
+    }
+    // One that holds a right on the table that points is told which.
+    owner.roles().grant("keeper", Rights::READ, "invoices").await?;
+    owner.roles().grant("keeper", Rights::READ, "orders").await?;
+    let named = send(&server, "keeper", Way::Alone, drop_customers()).await.expect_err("other tables point at it");
+    assert!(named.message.contains("invoices") || named.message.contains("orders"), "{}", named.message);
     // It is shown the definitions of the tables it has a right on, and
     // of no other.
     let mut wire = Wire::role(&server, "clerk").await;
@@ -730,6 +746,14 @@ async fn a_revoke_binds_every_statement_that_begins_after_it_is_answered() -> Db
     assert_eq!(reads(&mut reading, "audit").await.err().map(|e| e.code), Some(ErrorCode::TransactionAborted));
     reading.ask(Request::Rollback).await?;
     reads(&mut reading, "audit").await?;
+    // A change of the role's password takes no right: its transactions
+    // carry on.
+    let mut steady = Wire::role(&server, "clerk").await;
+    steady.ask(Request::Begin { kind: TxnKind::Read, lock_wait_ms: 0 }).await?;
+    reads(&mut steady, "audit").await?;
+    roles.set_password("clerk", ROLE_PASSWORD).await?;
+    reads(&mut steady, "audit").await?;
+    steady.ask(Request::Commit).await?;
     // The transaction that wrote what it had read does not commit.
     assert!(writing.ask(Request::Commit).await.is_err(), "a transaction committed a write past the revoke of what it read");
     assert!(owner.get("audit", [500]).await?.is_none());

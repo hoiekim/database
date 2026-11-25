@@ -1274,6 +1274,11 @@ impl Tx {
             return if if_exists { Ok(()) } else { Err(Error::Db(DbError::not_found(format!("no table {name:?}")))) };
         };
         if let Some((child, _)) = self.catalog.children_of(name).into_iter().find(|(child, _)| child.name != name) {
+            // A role is not told the name of a table it holds no right
+            // on, here or anywhere.
+            if self.role.as_ref().is_some_and(|role| role.rights_on(&child.name).is_empty()) {
+                return Err(Error::db(ErrorCode::ForeignKeyViolation, format!("table {name:?} is pointed at by another table: that one is dropped first")));
+            }
             return Err(violation(ErrorCode::ForeignKeyViolation, name, &child.name, format!("table {name:?} is pointed at by table {:?}: drop that one first", child.name)));
         }
         self.destroy_tree(table.root)?;

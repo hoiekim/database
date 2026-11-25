@@ -228,9 +228,9 @@ pub enum Admin {
 
 /// The columns of a `ListRoles` answer: a role's name; a table's name, or
 /// NULL for what the role holds on every table; and the rights it holds
-/// there, as a list of their names. A role is listed once for every
-/// table it has rights on, and once for every table whether or not it
-/// has rights there, so that a role with none is listed too.
+/// there, as a list of their names. A role is listed once with a NULL
+/// table, whatever it holds on every table, so that a role with nothing
+/// is listed too, and once for each table it has rights on.
 pub const ROLES_COLUMNS: [&str; 3] = ["role", "table", "rights"];
 
 #[derive(Clone, Debug, PartialEq, Default)]

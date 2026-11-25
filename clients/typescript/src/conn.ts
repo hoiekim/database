@@ -35,10 +35,10 @@ export interface Config {
   /**
    * The role of the database to connect as, if any: `password` is then
    * the role's, and the client may do what the role was granted and
-   * nothing else. `null` connects with the database's own password, which
-   * may do anything in it.
+   * nothing else. Without it, or with `null`, the client connects with
+   * the database's own password, which may do anything in it.
    */
-  role?: string;
+  role?: string | null;
   password: string;
   /** Connections kept at most. A transaction or a held lock occupies one until it ends. */
   poolSize: number;
@@ -60,7 +60,7 @@ const ROLE_SEPARATOR = "/";
 
 /** What the greeting names: the database, and the role after it if the connection is a role's. */
 function greetingDatabase(config: Config): string {
-  return config.role === undefined ? config.database : `${config.database}${ROLE_SEPARATOR}${config.role}`;
+  return config.role == null ? config.database : `${config.database}${ROLE_SEPARATOR}${config.role}`;
 }
 
 function bad(why: string): DbError {

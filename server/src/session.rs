@@ -1205,8 +1205,10 @@ impl Session {
         }
         let Some(began) = &self.began_as else { return Ok(()) };
         // A role is the same allocation in every version from one change
-        // of it to the next.
-        if db.role_now().is_some_and(|now| Arc::ptr_eq(&now, began)) {
+        // of it to the next. A change of its password alone is a change
+        // too, and takes no right from anyone: then what it holds is
+        // compared.
+        if db.role_now().is_some_and(|now| Arc::ptr_eq(&now, began) || (now.everywhere == began.everywhere && now.tables == began.tables)) {
             return Ok(());
         }
         let e = DbError::new(ErrorCode::AccessDenied, format!("the rights of role {:?} have changed since this transaction began: it was rolled back, and can be begun again", began.name));
