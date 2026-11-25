@@ -576,6 +576,61 @@ more. `BENCH_SERVER_CPUS=16` there keeps the client off the server's
 cores. One writer per database is expected to cost more there on the
 workloads that write.
 
+### One CPU: commits that share syncs
+
+On one CPU the server's pool has one thread. A commit that syncs the log
+on that thread holds up every other connection while it does: none of
+their requests is read and none of their records is written. Synced
+there, 16 connections making durable inserts took one sync per commit
+(16,056 `fdatasync` calls for 16,000 commits, counted with
+`strace -c -f`) and reached about 4,200 a second against Postgres'
+12,500, though the server used a fraction of its CPU. So the commit that
+syncs first hands the thread's other connections to another thread
+before it syncs (see "The server" in `DESIGN.md`). Without that and with
+it, measured on a shared machine with the server on CPU 0 and the client
+on the other three, each figure from `BENCH_DETAILS=1` (syncs) and
+`/proc` (CPU time and context switches of all the server's threads), on
+a fresh database:
+
+| `BENCH_SERVER_CPUS=1` | synced on the thread | handed over |
+|---|---:|---:|
+| durable insert, 16 connections | 3,500-5,900/s | 22,800-30,600/s |
+| syncs of the log, 16,000 inserts on 16 connections | 16,056 (`strace`) | 3,440-3,550, with 2,000 lone inserts, a sync each |
+| server CPU per insert, 16 connections | 57-63 µs | 27-32 µs |
+| context switches per insert, 16 connections | 2.0-2.1 | 0.7-1.0 |
+| durable insert, 1 connection: p50 (four runs of 20,000) | 184-245 µs | 192-235 µs |
+| CPU per insert, 1 connection (the same runs) | 69-87 µs | 69-84 µs |
+| context switches per insert, 1 connection | 3.1 | 4.1 |
+
+A lone commit pays one more context switch, made while the disk works,
+and no measurable time. Against Postgres in the same runs (two runs, on
+a database without the bulk load before it), the one-CPU workloads that
+were behind are ahead: durable inserts on 16 connections 2.0-2.3×,
+durable upserts 1.5-2.1×, the transfer transaction 1.9-2.0×, the
+transfer sent whole 2.4-2.6×, a durable insert on one connection
+1.1-1.3×, a session lookup on one connection 0.95-1.01×. On four cores
+nothing is handed over: context switches per request are the same with
+the change and without, and a lone durable insert takes the same 62,000 instructions
+in the server (callgrind, the difference between runs of 2,000 and
+10,000 inserts).
+
+What remains is the quarter of a minute after the bulk load. The
+engine's thread that merges full-text segments goes on with the segments
+the load left due, and on one CPU it takes a third to a half of it from
+the requests: during the session lookups that follow the load, the
+request threads spent 300-370 ms of each second waiting for the CPU
+while it ran, and under 15 ms once it was done
+(`/proc/<pid>/task/*/schedstat`). The workloads that run in that window
+in the benchmark's order came out, in one run against Postgres, at 0.71×
+(session lookup, one connection), 0.85× (durable insert, one connection)
+and 0.66× (durable insert, 16 connections); the same workloads on a
+fresh database are at par or ahead. Running the merging thread at the
+lowest priority (`nice` 19) cut the requests' wait to 70-85 ms a second,
+but starved the merges during the bulk load itself: 1-2 merges beside
+the writers instead of 67-70, the writers merging for themselves
+instead, and the load slower (6.8-7.0 statements a second against
+7.6-7.7, p99 1.4-2.6 s against 0.8-1.2 s). It was not kept.
+
 ## Running it
 
 ```sh

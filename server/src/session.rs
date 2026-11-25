@@ -870,7 +870,18 @@ async fn durable(db: &Arc<Database>, version: u64) -> DbResult<()> {
         // quiet moment that is the whole of it, and the commit has not
         // changed threads. If more commits came meanwhile, a thread of
         // its own carries on for them.
-        if db.sync_waiters(1) {
+        //
+        // While the sync runs, this thread serves nobody else. That is no
+        // matter where the runtime has other threads: they go on reading
+        // and committing beside the sync, and share the next one. Where it
+        // has only this one (on one CPU), the connections that share it
+        // are first moved to another, or they would wait for every sync
+        // and each commit would take a sync of its own. The move is made
+        // while the sync runs, when the CPU would otherwise be idle.
+        let runtime = tokio::runtime::Handle::current();
+        let alone = runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread && runtime.metrics().num_workers() == 1;
+        let more = if alone { tokio::task::block_in_place(|| db.sync_waiters(1)) } else { db.sync_waiters(1) };
+        if more {
             let db = db.clone();
             tokio::task::spawn_blocking(move || {
                 db.sync_waiters(usize::MAX);
@@ -1715,5 +1726,112 @@ impl Session {
             Ok(Err(e)) => Response::Error(e),
             Err(e) => Response::Error(DbError::new(ErrorCode::Internal, e.to_string())),
         }])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use database_engine::engine::{Engine, EngineOptions};
+    use database_engine::vfs::{File, MemVfs, Vfs};
+    use database_protocol::query::Insert;
+    use database_protocol::schema::{ColumnDef, TableDef};
+    use database_protocol::value::Type;
+    use std::path::Path;
+
+    /// A disk whose syncs take as long as a real one's, or longer.
+    struct SlowSyncs(MemVfs);
+
+    struct SlowFile(Arc<dyn File>);
+
+    const SYNC: Duration = Duration::from_millis(2);
+
+    impl File for SlowFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            self.0.read_at(buf, offset)
+        }
+        fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+            self.0.write_at(buf, offset)
+        }
+        fn sync(&self) -> std::io::Result<()> {
+            std::thread::sleep(SYNC);
+            self.0.sync()
+        }
+        fn len(&self) -> std::io::Result<u64> {
+            self.0.len()
+        }
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            self.0.set_len(len)
+        }
+    }
+
+    impl Vfs for SlowSyncs {
+        fn open(&self, path: &Path, create: bool) -> std::io::Result<Arc<dyn File>> {
+            Ok(Arc::new(SlowFile(self.0.open(path, create)?)))
+        }
+        fn remove(&self, path: &Path) -> std::io::Result<()> {
+            self.0.remove(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.0.exists(path)
+        }
+        fn list(&self, dir: &Path) -> std::io::Result<Vec<String>> {
+            self.0.list(dir)
+        }
+        fn create_dir_all(&self, dir: &Path) -> std::io::Result<()> {
+            self.0.create_dir_all(dir)
+        }
+        fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+            self.0.sync_dir(dir)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.0.rename(from, to)
+        }
+    }
+
+    /// The count `stats` gives for the log's syncs.
+    fn syncs(db: &Database) -> u64 {
+        let stats = db.stats();
+        let before = stats.split(" syncs of the log").next().unwrap();
+        before.rsplit(' ').next().unwrap().parse().unwrap()
+    }
+
+    // R-X10: each commit is answered only once it is on disk, and the
+    // commits of many connections share the syncs that put them there,
+    // even where the server has one thread to serve them all (one CPU).
+    #[test]
+    fn commits_share_syncs_when_the_server_has_one_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let options = EngineOptions { merging_paused: true, ..EngineOptions::default() };
+        let engine = Engine::open_with(Arc::new(SlowSyncs(MemVfs::new())), Path::new("/data"), options, None).unwrap();
+        let db = engine.create_database("test").unwrap();
+        let mut txn = db.begin_write(Duration::from_secs(5), false).unwrap();
+        let table = TableDef::new("entries").column(ColumnDef::new("id", Type::Int)).primary_key(["id"]);
+        txn.ddl(&database_protocol::message::Ddl::CreateTable { def: table, if_not_exists: false }, None).unwrap();
+        txn.commit().unwrap();
+        let before = syncs(&db);
+        const CONNECTIONS: i64 = 16;
+        const COMMITS: i64 = 10;
+        runtime.block_on(async {
+            let mut tasks = Vec::new();
+            for connection in 0..CONNECTIONS {
+                let db = db.clone();
+                tasks.push(tokio::spawn(async move {
+                    for i in 0..COMMITS {
+                        let mut txn = db.begin_write(Duration::from_secs(5), false).unwrap();
+                        txn.insert(&Insert::into("entries").set("id", connection * COMMITS + i), None).unwrap();
+                        let version = txn.commit_start().unwrap().unwrap().version();
+                        durable(&db, version).await.unwrap();
+                        assert!(db.is_published(version), "answered before it was on disk");
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+        let made = syncs(&db) - before;
+        let commits = (CONNECTIONS * COMMITS) as u64;
+        assert!(made * 4 <= commits, "{commits} commits took {made} syncs of the log");
     }
 }

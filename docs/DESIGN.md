@@ -515,7 +515,14 @@ Postgres took 53, and a durable insert 400 µs against 170. So:
   log it syncs it itself, once, and otherwise it is told by whoever is.
   Only when its version is on disk and published does the client hear.
   A commit that put nothing in the log (it changed only tables that
-  need not survive a crash) is published at once.
+  need not survive a crash) is published at once. Where the pool has
+  one thread (one CPU), the commit that syncs first hands the thread's
+  other connections to another thread, and syncs where it is: otherwise
+  none of them could read a request or write a record while the sync
+  runs, and each commit would take a sync of its own. The hand-over
+  happens while the disk works and the CPU would be idle; with more
+  threads than one, the others serve meanwhile and nothing is handed
+  over.
 
 **What a small request costs is mostly not the engine**: the trip
 through the network stack, decoding the request into a tree of
