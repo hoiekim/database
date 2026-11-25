@@ -271,8 +271,12 @@ A client takes it that the connection holds a transaction after a
   those listed above, when a `Prepared` with its statement was refused
   (see "Prepared statements"), or when what is explained is not a
   query. All are `InvalidRequest`. In a dead transaction every statement
-  answers `TransactionAborted`; `Commit` answers the error the
-  `BeginWith` answered and ends it; `Rollback` answers `Ok` and ends it.
+  answers `TransactionAborted`, where the connection has its database:
+  on a connection that named none, or whose database is gone, a
+  statement is answered `InvalidRequest` or `Unavailable` as it is
+  outside any transaction, since the database is looked for first.
+  `Commit` answers the error the `BeginWith` answered and ends the
+  transaction; `Rollback` answers `Ok` and ends it.
   So nothing the client sends next runs outside the transaction it was
   meant for.
 
@@ -1163,8 +1167,9 @@ e8 07                 timeout_ms: 1000
 00                      expect: none
 ```
 
-Statement 7 explained, then its answer: 50 index entries and 50 rows
-read, 50 rows returned, in 240 microseconds:
+Statement 7 explained, then its answer. The statement reads one row by
+its key: no index entry and one row read, one row returned, in 240
+microseconds:
 
 ```text
 e8 07                 timeout_ms: 1000
@@ -1183,6 +1188,6 @@ e8 07                 timeout_ms: 1000
 01                    affected: 1
 00                    total: none
 01                    one row
-03 64 03 64 03 64       int 50, int 50, int 50
+03 00 03 02 03 02       int 0, int 1, int 1
 03 e0 03                int, zigzag 480 = 240
 ```
