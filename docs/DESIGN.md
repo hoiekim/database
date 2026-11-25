@@ -49,7 +49,7 @@ A database named `shop` is three kinds of file in the data directory:
 ```text
 shop.db             pages of 8 KiB
 shop.wal-0000000007 the log of commits since the last checkpoint
-ACCESS              every database's password hash (one file for the server)
+ACCESS              every database's password hash (one file for the server); roles are in each database
 LOCK                held while a server has the directory open
 ```
 
@@ -559,6 +559,79 @@ from the environment and may do anything). The protocol is not
 encrypted: the server is meant for a private network, such as the one
 between an application's containers.
 
+### Roles (`catalog.rs`, `write.rs`, `exec.rs`, `session/role.rs`)
+
+A database's own password may do anything in it. Beside it a database
+may have **roles**: each a name, a password of its own, and rights on
+tables (`PROTOCOL.md`, "Roles", has the list of what each statement
+needs). Three decisions shape the code.
+
+**Roles are part of the catalog.** A version of the database is its
+tables and, with them, who may do what to them. So a change of rights
+is a commit like any other: one writer at a time makes it, the log
+holds it (one record per role changed, the role whole), it is answered
+when it is durable, a reader sees it whole or not at all, a rollback or
+a savepoint undoes it with the rest, a checkpoint stores it with the
+tables, and a dump carries it. Nothing about rights is kept anywhere
+else, so nothing about them can disagree with the tables after a crash:
+`engine/tests/faults.rs` changes roles through its workload and
+compares them, with the rows, after every cut. The rights held on a
+table are removed in the transaction that drops the table, and by
+replaying the same record, so a table made later under the same name
+is one nobody was granted. A catalog without roles is stored as the
+bytes it always was.
+
+**The engine asks, at the table.** A transaction is given the role its
+statements run as, and every place where a statement comes to a table
+asks whether the role may: `exec::table_of`, through which a query
+reads its own table, each table it joins and the table of every
+subquery in any of its expressions; the statements `insert`, `update`,
+`delete` and `ddl` of a writing transaction; the check of a foreign
+key's parent; and, before a delete looks at a row, the tables its rows
+can take with them. There is no walk over a statement beforehand that
+lists the tables it will touch: such a list would have to be kept true
+to every expression that can hold a query, and one that was missed
+would be a hole. Asked where the table is opened, a way to a table
+that is added later is asked too. The price is that a read is refused
+when the statement comes to it: a subquery that no row calls for reads
+nothing and is not refused. A delete is not left to that, because what
+it removes by cascade should not depend on which rows it finds. The
+log's replay and the loading of a dump run as no role, and are asked
+nothing. The question is asked before the table is looked for, so the
+answer is the same for a table that does not exist.
+
+**The session cannot begin a transaction any other way.** Every
+transaction a connection's statements run in is begun through `As`,
+the database as that connection may use it, whose `begin_read`,
+`begin_write` and `begin_fork` stand in front of the database's own and
+give the transaction the connection's role. A statement on its own, a
+batch, a bulk load, a prepared statement, an `explain`, a fork run
+again at its commit: each begins its transaction there, so none has a
+check of its own to forget. A role's rights are those of the version
+its transaction is on. For a statement on its own, a batch and an
+exclusive transaction that is the newest, so a revoke that was answered
+binds them. A reading or an optimistic transaction stays on the version
+it began at, and would go on by the rights of that version; so the
+session compares the role as it was then with the role as it is, before
+each statement, and ends the transaction if they differ. (A role is the
+same allocation in every version from one change of it to the next, so
+the comparison is of two pointers.) An optimistic transaction that
+wrote cannot commit past a change of rights in any case: the change is
+a commit, so the fork is run again on the newest version, as its role
+now is.
+
+A role is named in the greeting's `database`, after a `/` that no
+database's name can hold: every client of every protocol version has
+that field, so every one can connect as a role, and a server from
+before roles answers such a greeting as it answers any database it does
+not have. The password sent with a role's name is compared with the
+role's alone, the administrator's not at all. A role's password is
+stored in the catalog as the database's is stored in `ACCESS`: a salt
+and a SHA-256.
+
+A connection that is not a role's pays for none of this but a branch
+where a table is opened.
+
 Given a path, the server also listens on a **Unix domain socket**
 there. A connection is served the same whichever way it came (the
 session is written over any pair of byte streams), and is asked for the
@@ -597,8 +670,8 @@ budget alone.
 ## Dump and restore (`dump.rs`)
 
 A dump is a stream: a header, then for each database its name and
-password hash, each table's definition and rows in batches, and a
-closing record with counts; every record carries a CRC, and the stream
+password hash, each table's definition and rows in batches, its roles
+if it has any, and a closing record with counts; every record carries a CRC, and the stream
 ends with a count of databases. It is taken from one snapshot per
 database, so it is consistent however long it takes and writers are not
 held up.

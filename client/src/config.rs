@@ -18,6 +18,11 @@ pub struct Config {
     pub socket: Option<PathBuf>,
     /// Empty for a connection that only administers the server.
     pub database: String,
+    /// The role of the database to connect as, if any: `password` is
+    /// then the role's, and the client may do what the role was granted
+    /// and nothing else. `None` connects with the database's own
+    /// password, which may do anything in it.
+    pub role: Option<String>,
     pub password: String,
     /// Connections kept at most. A transaction or a held lock occupies one
     /// until it ends.
@@ -48,6 +53,7 @@ impl Config {
             port,
             socket: None,
             database: database.to_string(),
+            role: None,
             password: password.to_string(),
             pool_size: 8,
             connect_timeout: Duration::from_secs(10),
@@ -55,6 +61,15 @@ impl Config {
             lock_wait: Duration::from_secs(30),
             optimistic_runs: 2,
             name: String::new(),
+        }
+    }
+
+    /// What the greeting names: the database, and the role after it if
+    /// the connection is a role's.
+    pub(crate) fn greeting_database(&self) -> String {
+        match &self.role {
+            Some(role) => format!("{}{}{role}", self.database, database_protocol::message::ROLE_SEPARATOR),
+            None => self.database.clone(),
         }
     }
 
@@ -70,7 +85,9 @@ impl Config {
     /// with optional `?pool=8&connect_timeout=10&statement_timeout=60&lock_wait=30&name=app`
     /// (times in seconds), `&socket=/run/database/database.sock` to
     /// connect through the server's Unix domain socket instead of the
-    /// host and port, and `&optimistic_runs=1` (see the field). The
+    /// host and port, `&optimistic_runs=1` (see the field), and
+    /// `&role=reader` to connect as a role of the database, with the
+    /// role's password in the password's place. The
     /// database may be named before the password or as the path; an
     /// administrator's URL names none. Percent-encoding is decoded in
     /// every part.
@@ -107,6 +124,12 @@ impl Config {
                     config.socket = Some(PathBuf::from(value));
                 }
                 "name" => config.name = value,
+                "role" => {
+                    if value.is_empty() || config.database.is_empty() {
+                        return Err(bad("role must be the name of a role, of a database the URL names"));
+                    }
+                    config.role = Some(value);
+                }
                 _ => return Err(bad("an unknown setting")),
             }
         }
@@ -151,6 +174,11 @@ mod tests {
         let local = Config::from_url("database://shop:pw@localhost?socket=%2Frun%2Fdatabase%2Fdatabase.sock&optimistic_runs=1").unwrap();
         assert_eq!(local.socket.as_deref(), Some(std::path::Path::new("/run/database/database.sock")));
         assert_eq!((local.optimistic_runs, local.address().as_str()), (1, "/run/database/database.sock"));
+
+        let role = Config::from_url("database://shop:rolepw@db?role=reader").unwrap();
+        assert_eq!((role.database.as_str(), role.role.as_deref(), role.password.as_str(), role.greeting_database().as_str()), ("shop", Some("reader"), "rolepw", "shop/reader"));
+        assert_eq!(c.greeting_database(), "blog");
+        assert!(Config::from_url("database://shop:pw@db?role=").is_err() && Config::from_url("database://adminpw@db?role=reader").is_err());
 
         for bad in ["database://a:b@h/d?statement_timeout=-1", "database://a:b@h/d?lock_wait=NaN", "database://a:b@h/d?connect_timeout=1e400", "postgres://a:b@h/d", "database://nohost", "database://a:b@:1/d", "database://a:b@h:x/d", "database://a:b@h/d?pool=0", "database://a:b@h/d?what=1", "database://a:%zz@h/d", "database://a:b@h/d?socket=", "database://a:b@h/d?optimistic_runs=two"] {
             assert!(Config::from_url(bad).is_err(), "{bad}");

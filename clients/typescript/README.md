@@ -147,6 +147,29 @@ try {
 dump of the connection's own database need the administrator's password
 (`Client.connect("database://<admin password>@host")`).
 
+## Roles
+
+A role of a database has a password of its own and rights on tables:
+read, insert, update, delete, schema. A client connects as one by naming
+it, with the role's password where the database's would be:
+
+```ts
+const db = await Client.connect("database://shop:<role password>@database:5454?role=reader");
+// or, with a Config: { ...config("database", 5454, "shop", "<role password>"), role: "reader" }
+```
+
+A wrong password, the database's own password with a role named, and a
+role that is not there are all refused at `connect` with `AccessDenied`.
+A statement that needs a right the role lacks rejects with a `DbError`
+of the same code, whose message names the role and the table: `role
+"reader" may not read table "orders"`. A revoke binds the next statement
+of a client that is already connected.
+
+This client cannot make a role or grant it anything: those requests are
+of a later protocol version than it greets with. Roles are made and
+granted with the Rust client or on the server's command line (`database
+role create|grant|revoke|drop ...`).
+
 ## Tests
 
 ```sh
@@ -163,4 +186,5 @@ npm test
 - `test/builders.test.ts`: the builders say what the Rust builders say.
 - `test/values.test.ts`: JavaScript values, URLs and rows, without a server.
 - `test/integration.test.ts`: every kind of request against a real
-  server. Skipped if no server binary is found; `DATABASE_BIN` names one.
+  server, and connecting as a role (the roles themselves are made with
+  the server binary's `database role` commands). Skipped if no server binary is found; `DATABASE_BIN` names one.

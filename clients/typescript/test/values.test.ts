@@ -179,6 +179,11 @@ test("reads a URL", () => {
   assert.deepEqual([admin.database, admin.password], ["", "adminpw"]);
   c = configFromUrl("database://d:a%3Ab%40c@h?connect_timeout=2&lock_wait=0.25");
   assert.deepEqual([c.password, c.connectTimeout, c.lockWait], ["a:b@c", 2, 0.25]);
+  assert.equal(c.role, undefined);
+  // A role is a setting, and the password before the host is then the role's.
+  const role = configFromUrl("database://shop:rolepw@db?role=reader");
+  assert.deepEqual([role.database, role.role, role.password], ["shop", "reader", "rolepw"]);
+  assert.equal(configFromUrl("database://rolepw@db/shop?role=night%20reader").role, "night reader");
   for (const bad of [
     "database://a:b@h/d?statement_timeout=-1",
     "database://a:b@h/d?lock_wait=NaN",
@@ -191,6 +196,10 @@ test("reads a URL", () => {
     "database://a:b@h/d?what=1",
     "database://a:%zz@h/d",
     "database://a:b@h/d?name",
+    "database://a:b@h/d?role=",
+    "database://a:b@h/d?role",
+    // A role is a role of a database, and this URL names none.
+    "database://adminpw@h?role=reader",
   ]) {
     assert.throws(
       () => configFromUrl(bad),

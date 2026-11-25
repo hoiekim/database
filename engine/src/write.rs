@@ -16,14 +16,15 @@ use std::time::Instant;
 use database_protocol::codec::{self, Reader, Writer as Encoder};
 use database_protocol::error::{DbError, ErrorCode};
 use database_protocol::expr::{Expr, Func};
-use database_protocol::message::RowSet;
+use database_protocol::message::{Ddl, RowSet};
 use database_protocol::query::*;
+use database_protocol::rights::Rights;
 use database_protocol::schema::*;
 use database_protocol::value::Value;
 
 use crate::blob;
 use crate::btree::{self, Cursor};
-use crate::catalog::{plain_columns, Catalog, Table, TableMeta};
+use crate::catalog::{self, plain_columns, Catalog, Role, Table, TableMeta};
 use crate::error::{Error, Result};
 use crate::eval::{eval, frame_value, holds, Cost, Ctx, Frame, Scope, Tape};
 use crate::exec::{self, encode_prefix, entry_pk, fetch, for_each_match, index_parts, pk_parts};
@@ -42,6 +43,8 @@ const OP_ADD_COLUMN: u8 = 6;
 const OP_DROP_COLUMN: u8 = 7;
 const OP_CREATE_INDEX: u8 = 8;
 const OP_DROP_INDEX: u8 = 9;
+/// A role as it now is, whole, or that it is no more.
+const OP_ROLE: u8 = 10;
 
 /// A writing transaction's working state.
 pub struct Tx {
@@ -63,6 +66,10 @@ pub struct Tx {
     pub cost: Cost,
     /// The tables it has made, which nobody else can see until it commits.
     created: Vec<u32>,
+    /// The role its statements run as, which holds each of them to its
+    /// rights. `None` for the database's own password, for replaying the
+    /// log and for loading a dump: nothing is refused then.
+    role: Option<Arc<Role>>,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -200,15 +207,64 @@ fn unique_holder(ctx: &Ctx, table: &Table, i: usize, entry: &Entry, own_pk: &[u8
 
 impl Tx {
     pub fn new(writer: Writer, catalog: Catalog, now: i64) -> Tx {
-        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), params: Vec::new(), cost: Cost::default(), created: Vec::new() }
+        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), params: Vec::new(), cost: Cost::default(), created: Vec::new(), role: None }
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape), params: &self.params, cost: &self.cost }
+        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape), params: &self.params, cost: &self.cost, role: self.role.as_deref() }
     }
 
     fn table(&self, name: &str) -> Result<Arc<Table>> {
         Ok(self.catalog.table(name)?.clone())
+    }
+
+    /// Has the statements from here on run as a role of the database, or
+    /// with `None` as its owner. The role is the one this transaction's
+    /// catalog holds: its rights as of the version the transaction is on.
+    /// A role the catalog does not hold is one that was dropped, and
+    /// runs with no rights at all.
+    pub fn set_role(&mut self, name: Option<&str>) {
+        self.role = name.map(|name| catalog::role_in(&self.catalog, name));
+    }
+
+    /// The role the statements run as.
+    pub fn role(&self) -> Option<&Arc<Role>> {
+        self.role.as_ref()
+    }
+
+    /// Fails unless whoever the statement runs as may do this to the
+    /// table.
+    fn need(&self, table: &str, rights: Rights) -> Result<()> {
+        match &self.role {
+            Some(role) => role.need(table, rights),
+            None => Ok(()),
+        }
+    }
+
+    /// Fails unless the role may do what deleting rows of `table` can
+    /// come to: delete the rows of tables that go with them, clear the
+    /// pointers of those that stay, or be told that rows of a table
+    /// forbid it. Asked of the tables as they are defined, before a row
+    /// is looked at: whether a delete is allowed does not depend on
+    /// which rows it finds.
+    fn need_to_delete(&self, table: &str, seen: &mut Vec<String>) -> Result<()> {
+        if self.role.is_none() || seen.iter().any(|t| t == table) {
+            return Ok(());
+        }
+        self.need(table, Rights::DELETE)?;
+        seen.push(table.to_string());
+        for (child, fks) in self.catalog.children_of(table) {
+            for fk in &fks {
+                match fk.on_delete {
+                    OnDelete::Cascade => self.need_to_delete(&child.name, seen)?,
+                    OnDelete::SetNull => self.need(&child.name, Rights::UPDATE)?,
+                    // A refusal says the child holds rows that point here.
+                    OnDelete::Restrict if child.name != table => self.need(&child.name, Rights::READ)?,
+                    OnDelete::Restrict => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The table's entry in this transaction's catalog, to change.
@@ -515,6 +571,11 @@ impl Tx {
             if key.iter().any(Value::is_null) {
                 continue;
             }
+            // Whether the parent holds the key is something the statement
+            // is told: its own table apart, that takes the right to read.
+            if fk.ref_table != table.name {
+                self.need(&fk.ref_table, Rights::READ)?;
+            }
             let parent = self.table(&fk.ref_table)?;
             let found = match parent.unique_key(&fk.ref_columns) {
                 Some(None) => fetch(&ctx, &parent, &encode_prefix(key.clone(), pk_parts(&parent))?)?.is_some(),
@@ -560,6 +621,10 @@ impl Tx {
                 let (was, now) = (values(old)?, values(new)?);
                 if was.iter().any(Value::is_null) || was.iter().zip(&now).all(|(a, b)| a.same(b)) {
                     continue;
+                }
+                // A refusal says the child holds rows that point here.
+                if child.name != table.name {
+                    self.need(&child.name, Rights::READ)?;
                 }
                 if !self.children_pointing_at(&child, fk, &[was])?.is_empty() {
                     return Err(violation(
@@ -771,6 +836,17 @@ impl Tx {
     /// the transaction began: see `fts::cut_ahead`. `ahead` must have
     /// been made from this very insert.
     pub fn insert_ahead(&mut self, ins: &Insert, ahead: Option<&fts::Ahead>) -> Result<RowSet> {
+        // An insert that turns into an update changes a row there is, by
+        // what that row holds; one that returns the row shows what the
+        // table gave it. Each takes the right for what it does.
+        let mut needed = Rights::INSERT;
+        if matches!(ins.on_conflict, OnConflict::DoUpdate { .. }) {
+            needed = needed | Rights::UPDATE | Rights::READ;
+        }
+        if !ins.returning.is_empty() {
+            needed = needed | Rights::READ;
+        }
+        self.need(&ins.table, needed)?;
         let table = self.table(&ins.table)?;
         let mut targets = Vec::with_capacity(ins.columns.len());
         for name in &ins.columns {
@@ -956,6 +1032,9 @@ impl Tx {
 
     pub fn update(&mut self, upd: &Update) -> Result<RowSet> {
         let name = upd.rows.table.clone();
+        // The rows are found by a query, and how many it found is the
+        // statement's answer: an update reads what it changes.
+        self.need(&name, Rights::UPDATE | Rights::READ)?;
         let table = self.table(&name)?;
         let cols: Vec<usize> = upd.set.iter().map(|a| table.col(&a.column)).collect::<Result<_>>()?;
         let returning = returned(&table, &upd.returning);
@@ -1001,6 +1080,8 @@ impl Tx {
 
     pub fn delete(&mut self, del: &Delete) -> Result<RowSet> {
         let name = del.rows.table.clone();
+        self.need(&name, Rights::READ)?;
+        self.need_to_delete(&name, &mut Vec::new())?;
         let returning = returned(&*self.table(&name)?, &del.returning);
         let columns: Vec<String> = returning.iter().map(|s| s.name.clone()).collect();
         let targets = self.targets(&del.rows, &mut |ctx, scope, _| returning.iter().map(|s| eval(ctx, scope, &s.expr)).collect::<Result<Vec<_>>>())?;
@@ -1016,6 +1097,146 @@ impl Tx {
             self.log.u8(op);
             write(&mut self.log);
         }
+    }
+
+    /// Runs a schema change as a statement: one the role it runs as must
+    /// hold the right to.
+    pub fn ddl(&mut self, ddl: &Ddl) -> Result<()> {
+        if let Some(role) = &self.role {
+            match ddl {
+                // A table that is not there yet is no table to hold a
+                // right on. And a foreign key is a way to ask a parent
+                // which keys it holds.
+                Ddl::CreateTable { def, .. } => {
+                    role.need_everywhere(Rights::SCHEMA, "create a table")?;
+                    for fk in def.foreign_keys.iter().filter(|fk| fk.ref_table != def.name) {
+                        role.need(&fk.ref_table, Rights::READ)?;
+                    }
+                }
+                Ddl::DropTable { name: table, .. } | Ddl::AddColumn { table, .. } | Ddl::DropColumn { table, .. } | Ddl::CreateIndex { table, .. } | Ddl::DropIndex { table, .. } => role.need(table, Rights::SCHEMA)?,
+            }
+        }
+        match ddl {
+            Ddl::CreateTable { def, if_not_exists } => self.create_table(def, *if_not_exists),
+            Ddl::DropTable { name, if_exists } => self.drop_table(name, *if_exists),
+            Ddl::AddColumn { table, column, if_not_exists } => self.add_column(table, column, *if_not_exists),
+            Ddl::DropColumn { table, column, if_exists } => self.drop_column(table, column, *if_exists),
+            Ddl::CreateIndex { table, index, if_not_exists } => self.create_index(table, index, *if_not_exists),
+            Ddl::DropIndex { table, index, if_exists } => self.drop_index(table, index, *if_exists),
+        }
+    }
+
+    // ------------------------------------------------------------ roles
+
+    /// Puts a role in the catalog as it now is, or takes it out, and
+    /// logs that. The log holds the role whole, so replaying it needs
+    /// nothing but the record.
+    fn set_role_entry(&mut self, name: &str, role: Option<Role>) {
+        let roles = Arc::make_mut(&mut self.catalog.roles);
+        match &role {
+            Some(role) => roles.insert(name.to_string(), Arc::new(role.clone())),
+            None => roles.remove(name),
+        };
+        self.log_op(OP_ROLE, |w| {
+            w.str(name);
+            match &role {
+                Some(role) => {
+                    w.u8(1);
+                    catalog::put_role(w, role);
+                }
+                None => w.u8(0),
+            }
+        });
+    }
+
+    fn role_named(&self, name: &str) -> Result<Role> {
+        self.catalog.roles.get(name).map(|role| (**role).clone()).ok_or_else(|| Error::Db(DbError::not_found(format!("no role {name:?}"))))
+    }
+
+    /// Makes a role that may do nothing yet. `secret` is what the caller
+    /// will know its password by.
+    pub fn create_role(&mut self, name: &str, secret: &[u8], if_not_exists: bool) -> Result<()> {
+        if self.catalog.roles.contains_key(name) {
+            return if if_not_exists { Ok(()) } else { Err(Error::db(ErrorCode::AlreadyExists, format!("role {name:?} already exists"))) };
+        }
+        catalog::check_role_name(name)?;
+        self.set_role_entry(name, Some(Role { name: name.to_string(), secret: secret.to_vec(), everywhere: Rights::NONE, tables: Default::default() }));
+        Ok(())
+    }
+
+    pub fn drop_role(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        if !self.catalog.roles.contains_key(name) {
+            return if if_exists { Ok(()) } else { Err(Error::Db(DbError::not_found(format!("no role {name:?}")))) };
+        }
+        self.set_role_entry(name, None);
+        Ok(())
+    }
+
+    pub fn set_role_secret(&mut self, name: &str, secret: &[u8]) -> Result<()> {
+        let mut role = self.role_named(name)?;
+        role.secret = secret.to_vec();
+        self.set_role_entry(name, Some(role));
+        Ok(())
+    }
+
+    /// Gives a role rights on a table, or with no table on every table.
+    pub fn grant(&mut self, name: &str, table: Option<&str>, rights: Rights) -> Result<()> {
+        let mut role = self.role_named(name)?;
+        match table {
+            Some(table) => {
+                self.table(table)?;
+                let held = role.tables.get(table).copied().unwrap_or_default() | rights;
+                if !held.is_empty() {
+                    role.tables.insert(table.to_string(), held);
+                }
+            }
+            None => role.everywhere = role.everywhere | rights,
+        }
+        self.set_role_entry(name, Some(role));
+        Ok(())
+    }
+
+    /// Takes rights from a role. Once this has succeeded the role does
+    /// not hold them where it says: on the table, or with no table on
+    /// any table. Rights the role holds on every table cannot be taken
+    /// from one table alone, and that is an error, not something done in
+    /// part.
+    pub fn revoke(&mut self, name: &str, table: Option<&str>, rights: Rights) -> Result<()> {
+        let mut role = self.role_named(name)?;
+        match table {
+            Some(table) => {
+                self.table(table)?;
+                let everywhere = role.everywhere;
+                if everywhere.intersects(rights) {
+                    let held: Vec<&str> = rights.names().into_iter().filter(|n| everywhere.names().contains(n)).collect();
+                    return Err(invalid(format!(
+                        "role {name:?} holds the right to {} on every table, so it cannot be taken from {table:?} alone: revoke it from every table and grant it on the tables the role is to keep",
+                        held.join(" and ")
+                    )));
+                }
+                let left = role.tables.get(table).copied().unwrap_or_default().without(rights);
+                if left.is_empty() {
+                    role.tables.remove(table);
+                } else {
+                    role.tables.insert(table.to_string(), left);
+                }
+            }
+            None => {
+                role.everywhere = role.everywhere.without(rights);
+                role.tables.retain(|_, held| {
+                    *held = held.without(rights);
+                    !held.is_empty()
+                });
+            }
+        }
+        self.set_role_entry(name, Some(role));
+        Ok(())
+    }
+
+    /// Puts a role in place as a dump holds it.
+    pub fn restore_role(&mut self, role: Role) {
+        let name = role.name.clone();
+        self.set_role_entry(&name, Some(role));
     }
 
     pub fn create_table(&mut self, def: &TableDef, if_not_exists: bool) -> Result<()> {
@@ -1053,12 +1274,27 @@ impl Tx {
             return if if_exists { Ok(()) } else { Err(Error::Db(DbError::not_found(format!("no table {name:?}")))) };
         };
         if let Some((child, _)) = self.catalog.children_of(name).into_iter().find(|(child, _)| child.name != name) {
+            // A role is not told the name of a table it holds no right
+            // on, here or anywhere.
+            if self.role.as_ref().is_some_and(|role| role.rights_on(&child.name).is_empty()) {
+                return Err(Error::db(ErrorCode::ForeignKeyViolation, format!("table {name:?} is pointed at by another table: that one is dropped first")));
+            }
             return Err(violation(ErrorCode::ForeignKeyViolation, name, &child.name, format!("table {name:?} is pointed at by table {:?}: drop that one first", child.name)));
         }
         self.destroy_tree(table.root)?;
         self.destroy_tree(table.blobs)?;
         self.destroy_indexes(&table)?;
         self.catalog.tables.remove(name);
+        // The rights held on the table go with it: a table made later
+        // under the same name is another table, which nobody was granted.
+        // Replaying the log does the same from the same record.
+        if self.catalog.roles.values().any(|role| role.tables.contains_key(name)) {
+            for role in Arc::make_mut(&mut self.catalog.roles).values_mut() {
+                if role.tables.contains_key(name) {
+                    Arc::make_mut(role).tables.remove(name);
+                }
+            }
+        }
         self.log_op(OP_DROP_TABLE, |w| w.str(name));
         Ok(())
     }
@@ -1309,6 +1545,13 @@ impl Tx {
                 OP_DROP_INDEX => {
                     let name = r.str().map_err(bad)?;
                     self.drop_index(&name, &r.str().map_err(bad)?, false)?;
+                }
+                OP_ROLE => {
+                    let name = r.str().map_err(bad)?;
+                    let role = if r.bool().map_err(bad)? { Some(catalog::get_role(&mut r).map_err(bad)?) } else { None };
+                    let logging = std::mem::replace(&mut self.logging, false);
+                    self.set_role_entry(&name, role);
+                    self.logging = logging;
                 }
                 other => return Err(Error::corrupt(format!("a log record holds an unknown operation {other}"))),
             }

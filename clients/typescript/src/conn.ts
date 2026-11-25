@@ -32,6 +32,13 @@ export interface Config {
   port: number;
   /** Empty for a connection that only administers the server. */
   database: string;
+  /**
+   * The role of the database to connect as, if any: `password` is then
+   * the role's, and the client may do what the role was granted and
+   * nothing else. Without it, or with `null`, the client connects with
+   * the database's own password, which may do anything in it.
+   */
+  role?: string | null;
   password: string;
   /** Connections kept at most. A transaction or a held lock occupies one until it ends. */
   poolSize: number;
@@ -46,6 +53,14 @@ export interface Config {
 
 export function config(host: string, port = DEFAULT_PORT, database = "", password = ""): Config {
   return { host, port, database, password, poolSize: 8, connectTimeout: 10, statementTimeout: 60, lockWait: 30, name: "" };
+}
+
+/** What stands between a database's name and a role's in the greeting: `shop/reader`. */
+const ROLE_SEPARATOR = "/";
+
+/** What the greeting names: the database, and the role after it if the connection is a role's. */
+function greetingDatabase(config: Config): string {
+  return config.role == null ? config.database : `${config.database}${ROLE_SEPARATOR}${config.role}`;
 }
 
 function bad(why: string): DbError {
@@ -64,9 +79,11 @@ function decode(text: string): string {
 /**
  * Reads `database://<database>:<password>@<host>[:<port>][/<database>]`
  * with optional `?pool=8&connect_timeout=10&statement_timeout=60&lock_wait=30&name=app`
- * (times in seconds). The database may be named before the password or
- * as the path; an administrator's URL names none
- * (`database://<password>@<host>`). Percent-encoding is decoded in the
+ * (times in seconds), and `&role=reader` to connect as a role of the
+ * database, with the role's password in the password's place. The
+ * database may be named before the password or as the path; an
+ * administrator's URL names none (`database://<password>@<host>`), and
+ * so can name no role. Percent-encoding is decoded in the
  * database, the password and the settings.
  */
 export function configFromUrl(url: string): Config {
@@ -124,6 +141,10 @@ export function configFromUrl(url: string): Config {
         break;
       case "name":
         out.name = value;
+        break;
+      case "role":
+        if (value === "" || out.database === "") throw bad("role must be the name of a role, of a database the URL names");
+        out.role = value;
         break;
       default:
         throw bad("an unknown setting");
@@ -191,7 +212,7 @@ export class Conn {
     socket.setNoDelay(true);
     const conn = new Conn(socket, config);
     try {
-      const hello: ast.Request = { kind: "hello", version: PROTOCOL_VERSION, database: config.database, password: config.password, client: config.name };
+      const hello: ast.Request = { kind: "hello", version: PROTOCOL_VERSION, database: greetingDatabase(config), password: config.password, client: config.name };
       const answer = await conn.exchange(hello, Date.now() + config.connectTimeout * 1000);
       if (answer.kind !== "hello") throw lost("unexpected answer to the greeting");
       return conn;

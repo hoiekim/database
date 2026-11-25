@@ -728,6 +728,82 @@ class Administration(Case):
         self.assertEqual(restored.query(Query.table("users")).column("name"), ["ann", "bob"])
 
 
+class Roles(Case):
+    """A database with users and orders, and a role ``reader`` that may
+    read users."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.create_table(users())
+        self.db.create_table(orders())
+        self.db.insert(Insert.into("users").set("name", "ann"))
+        self.server.role("create", self.name, "reader", password="reader-password")
+        self.server.role("grant", self.name, "reader", "read", "users")
+
+    def config(self, role: Optional[str], password: str) -> Config:
+        return dataclasses.replace(self.server.config(self.name, password), role=role, pool_size=1)
+
+    def as_role(self, role: str, password: str) -> Client:
+        client = Client.connect(self.config(role, password))
+        self.addCleanup(client.close)
+        return client
+
+    def test_a_role_does_what_it_was_granted_and_nothing_else(self) -> None:
+        # R-A1: the role is named in the greeting's database, which this
+        # client's protocol version has like every other.
+        reader = self.as_role("reader", "reader-password")
+        self.assertEqual(reader.query(Query.table("users").columns(["name"])).column(), ["ann"])
+        by_url = Client.connect(f"database://{self.name}:reader-password@127.0.0.1:{self.server.port}?role=reader")
+        self.addCleanup(by_url.close)
+        self.assertEqual(len(by_url.query(Query.table("users"))), 1)
+
+        # R-A2: no statement reads or changes a table without the right,
+        # and the refusal names the role.
+        read = self.code(ErrorCode.ACCESS_DENIED, reader.query, Query.table("orders"))
+        self.assertIn('role "reader"', read.message)
+        self.assertIn('"orders"', read.message)
+        for write, statement in [
+            (reader.insert, Insert.into("users").set("name", "bob")),
+            (reader.update, Update.table("users").filter(col("name").eq("ann")).set("age", 1)),
+            (reader.delete, Delete.from_("users").filter(col("name").eq("ann"))),
+            (reader.drop_table, "users"),
+        ]:
+            refused = self.code(ErrorCode.ACCESS_DENIED, write, statement)
+            self.assertIn('role "reader"', refused.message)
+        # The role is still served after a refusal, and nothing was changed.
+        self.assertEqual([row.as_dict() for row in reader.query(Query.table("users").columns(["name", "age"]))], [{"name": "ann", "age": 0}])
+
+        # The database's own password does beside the role what it always did.
+        self.db.insert(Insert.into("users").set("name", "bob"))
+        self.assertEqual(len(self.db.query(Query.table("orders"))), 0)
+        self.assertEqual(reader.query(Query.table("users").columns(["name"]).order_by(col("name"))).column(), ["ann", "bob"])
+
+    def test_a_role_connects_with_its_own_password_and_no_other(self) -> None:
+        # R-A1: the password that opens a role's connection is the role's.
+        self.as_role("reader", "reader-password").close()
+        self.code(ErrorCode.ACCESS_DENIED, Client.connect, self.config("reader", "not-the-password"))
+        self.code(ErrorCode.ACCESS_DENIED, Client.connect, self.config("reader", PASSWORD))
+        self.code(ErrorCode.ACCESS_DENIED, Client.connect, self.config("nobody", "reader-password"))
+        self.code(ErrorCode.ACCESS_DENIED, Client.connect, f"database://{self.name}:{PASSWORD}@127.0.0.1:{self.server.port}?role=reader")
+        # The role's password is not the database's.
+        self.code(ErrorCode.ACCESS_DENIED, Client.connect, self.config(None, "reader-password"))
+        # A role that was dropped connects no more.
+        self.server.role("drop", self.name, "reader")
+        self.code(ErrorCode.ACCESS_DENIED, Client.connect, self.config("reader", "reader-password"))
+
+    def test_a_revoke_binds_the_next_statement_of_a_role_already_connected(self) -> None:
+        reader = self.as_role("reader", "reader-password")
+        self.assertEqual(len(reader.query(Query.table("users"))), 1)
+        # R-A4: the revoke is answered when the command returns, and the
+        # read that begins after it goes over the connection made before it.
+        self.server.role("revoke", self.name, "reader", "read", "users")
+        refused = self.code(ErrorCode.ACCESS_DENIED, reader.query, Query.table("users"))
+        self.assertIn('role "reader"', refused.message)
+        self.server.role("grant", self.name, "reader", "read")
+        self.assertEqual(len(reader.query(Query.table("users"))), 1)
+        self.assertEqual(len(reader.query(Query.table("orders"))), 0)
+
+
 class Restarts(unittest.TestCase):
     def test_a_pooled_connection_from_before_a_restart_is_replaced(self) -> None:
         own = Server()

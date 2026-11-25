@@ -8,6 +8,7 @@ pub mod error;
 pub mod expr;
 pub mod message;
 pub mod query;
+pub mod rights;
 pub mod schema;
 pub mod time;
 pub mod value;

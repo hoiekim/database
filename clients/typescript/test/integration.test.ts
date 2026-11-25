@@ -798,6 +798,85 @@ describe("against a server", { skip }, () => {
     assert.deepEqual(overflows, []);
   });
 
+  /** A database with users and orders, and a role `reader` that may read users. */
+  async function withReader(): Promise<[string, Client]> {
+    const [name, db] = await fresh();
+    await db.createTable(users());
+    await db.createTable(orders());
+    await db.insert(Insert.into("users").set("name", "ann"));
+    await server.role(["create", name, "reader"], "reader-password");
+    await server.role(["grant", name, "reader", "read", "users"]);
+    return [name, db];
+  }
+
+  async function asRole(name: string, role: string, password: string): Promise<Client> {
+    const db = await Client.connect({ ...server.config(name, password), role, poolSize: 1 });
+    opened.push(db);
+    return db;
+  }
+
+  test("a role does what it was granted and nothing else", async () => {
+    const [name, db] = await withReader();
+    // R-A1: the role is named in the greeting's database, which this
+    // client's protocol version has like every other.
+    const reader = await asRole(name, "reader", "reader-password");
+    assert.deepEqual((await reader.query(Query.table("users").columns(["name"]))).column(), ["ann"]);
+    const byUrl = await Client.connect(`database://${name}:reader-password@127.0.0.1:${server.port}?role=reader`);
+    opened.push(byUrl);
+    assert.equal((await byUrl.query(Query.table("users"))).rows.length, 1);
+
+    // R-A2: no statement reads or changes a table without the right, and
+    // the refusal names the role.
+    const read = await code(ErrorCode.AccessDenied, reader.query(Query.table("orders")));
+    assert.match(read.message, /role "reader"/);
+    assert.match(read.message, /"orders"/);
+    for (const write of [
+      reader.insert(Insert.into("users").set("name", "bob")),
+      reader.update(Update.table("users").filter(col("name").eq("ann")).set("age", 1)),
+      reader.delete(Delete.from("users").filter(col("name").eq("ann"))),
+      reader.dropTable("users"),
+    ]) {
+      const refused = await code(ErrorCode.AccessDenied, write);
+      assert.match(refused.message, /role "reader"/);
+    }
+    // The role is still served after a refusal, and nothing was changed.
+    assert.deepEqual((await reader.query(Query.table("users").columns(["name", "age"]))).rows.map((row) => row.toObject()), [{ name: "ann", age: 0 }]);
+
+    // The database's own password does beside the role what it always did.
+    await db.insert(Insert.into("users").set("name", "bob"));
+    assert.deepEqual((await db.query(Query.table("orders"))).rows.length, 0);
+    assert.deepEqual((await reader.query(Query.table("users").columns(["name"]).orderBy(col("name")))).column(), ["ann", "bob"]);
+  });
+
+  test("a role connects with its own password and no other", async () => {
+    const [name] = await withReader();
+    // R-A1: the password that opens a role's connection is the role's.
+    (await asRole(name, "reader", "reader-password")).close();
+    await code(ErrorCode.AccessDenied, Client.connect({ ...server.config(name, "not-the-password"), role: "reader" }));
+    await code(ErrorCode.AccessDenied, Client.connect({ ...server.config(name, PASSWORD), role: "reader" }));
+    await code(ErrorCode.AccessDenied, Client.connect({ ...server.config(name, "reader-password"), role: "nobody" }));
+    await code(ErrorCode.AccessDenied, Client.connect(`database://${name}:${PASSWORD}@127.0.0.1:${server.port}?role=reader`));
+    // The role's password is not the database's.
+    await code(ErrorCode.AccessDenied, Client.connect(server.config(name, "reader-password")));
+    // A role that was dropped connects no more.
+    await server.role(["drop", name, "reader"]);
+    await code(ErrorCode.AccessDenied, Client.connect({ ...server.config(name, "reader-password"), role: "reader" }));
+  });
+
+  test("a revoke binds the next statement of a role already connected", async () => {
+    const [name] = await withReader();
+    const reader = await asRole(name, "reader", "reader-password");
+    assert.equal((await reader.query(Query.table("users"))).rows.length, 1);
+    // R-A4: the revoke is answered when the command returns, and the read
+    // that begins after it goes over the connection made before it.
+    await server.role(["revoke", name, "reader", "read", "users"]);
+    const refused = await code(ErrorCode.AccessDenied, reader.query(Query.table("users")));
+    assert.match(refused.message, /role "reader"/);
+    await server.role(["grant", name, "reader", "read"]);
+    assert.equal((await reader.query(Query.table("users"))).rows.length, 1);
+    assert.equal((await reader.query(Query.table("orders"))).rows.length, 0);
+  });
+
   test("check, checkpoint, stats, dump and restore", async () => {
     const [name, db] = await fresh();
     await db.createTable(users());

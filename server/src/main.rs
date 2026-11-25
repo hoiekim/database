@@ -7,6 +7,12 @@
 //! database drop <name>
 //! database password <name>             change a database's password
 //! database list
+//! database role create <database> <role>               make a role; its password from DATABASE_PASSWORD
+//! database role password <database> <role>             change a role's password
+//! database role drop <database> <role>
+//! database role grant <database> <role> <rights> [table]    rights: read,insert,update,delete,schema; write; all
+//! database role revoke <database> <role> <rights> [table]   with no table: on every table
+//! database role list <database>
 //! database dump [name...] > file       every database, or the named ones, to stdout
 //! database restore [--replace] < file  load a dump from stdin
 //! database check                       verify every database's files
@@ -34,7 +40,7 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use database_client::{Client, Config, DbError, DEFAULT_PORT};
+use database_client::{Client, Config, DbError, Rights, DEFAULT_PORT};
 use database_server::{Server, ServerConfig};
 
 fn env(name: &str) -> Option<String> {
@@ -51,8 +57,14 @@ fn admin_password() -> Result<String, String> {
 }
 
 async fn admin() -> Result<Client, String> {
+    admin_on("").await
+}
+
+/// A connection with the administrator's password to one database, or
+/// with an empty name to none.
+async fn admin_on(database: &str) -> Result<Client, String> {
     let host = env("DATABASE_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
-    let mut config = Config::new(&host, listen_address()?.port(), "", &admin_password()?);
+    let mut config = Config::new(&host, listen_address()?.port(), database, &admin_password()?);
     config.socket = env("DATABASE_SOCKET").map(Into::into);
     config.name = "database-cli".to_string();
     config.pool_size = 1;
@@ -154,6 +166,49 @@ async fn run(command: &str, mut args: Vec<String>) -> Result<(), String> {
             }
             Ok(())
         }
+        "role" => {
+            let usage = "usage: database role create|password|drop <database> <role> | grant|revoke <database> <role> <rights> [table] | list <database>";
+            let what = if args.is_empty() { String::new() } else { args.remove(0) };
+            // The password is read before anything is asked of the server.
+            let password = if matches!(what.as_str(), "create" | "password") { Some(new_password(&mut args)?) } else { None };
+            let if_not_exists = what == "create" && take_flag(&mut args, "--if-not-exists");
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match (what.as_str(), args.as_slice(), password) {
+                ("create", [database, role], Some(password)) => {
+                    let client = admin_on(database).await?;
+                    if if_not_exists {
+                        client.roles().create_if_not_exists(role, &password).await.map_err(text)
+                    } else {
+                        client.roles().create(role, &password).await.map_err(text)
+                    }
+                }
+                ("password", [database, role], Some(password)) => admin_on(database).await?.roles().set_password(role, &password).await.map_err(text),
+                ("drop", [database, role], _) => admin_on(database).await?.roles().drop(role).await.map_err(text),
+                ("grant" | "revoke", [database, role, rights, table @ ..], _) if table.len() <= 1 => {
+                    let rights = Rights::parse(rights).map_err(text)?;
+                    let client = admin_on(database).await?;
+                    let roles = client.roles();
+                    match (what.as_str(), table.first()) {
+                        ("grant", Some(table)) => roles.grant(role, rights, table).await,
+                        ("grant", None) => roles.grant_everywhere(role, rights).await,
+                        (_, Some(table)) => roles.revoke(role, rights, table).await,
+                        (_, None) => roles.revoke_everywhere(role, rights).await,
+                    }
+                    .map_err(text)
+                }
+                ("list", [database], _) => {
+                    for held in admin_on(database).await?.roles().list().await.map_err(text)? {
+                        let rights = if held.rights.is_empty() { "nothing".to_string() } else { held.rights.to_string() };
+                        match held.table {
+                            Some(table) => println!("{}: on {table}: {rights}", held.role),
+                            None => println!("{}: on every table: {rights}", held.role),
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(usage.to_string()),
+            }
+        }
         "dump" => {
             if std::io::stdout().is_terminal() {
                 return Err("stdout is a terminal; redirect the dump to a file or a pipe".to_string());
@@ -185,7 +240,7 @@ async fn run(command: &str, mut args: Vec<String>) -> Result<(), String> {
             print!("{}", admin().await?.admin().stats().await.map_err(text)?);
             Ok(())
         }
-        _ => Err("usage: database serve | ping | create <name> | drop <name> | password <name> | list | dump [name...] | restore [--replace] | check | checkpoint | stats".to_string()),
+        _ => Err("usage: database serve | ping | create <name> | drop <name> | password <name> | list | role ... | dump [name...] | restore [--replace] | check | checkpoint | stats".to_string()),
     }
 }
 

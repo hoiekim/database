@@ -422,6 +422,13 @@ fn search(ctx: &Ctx, table: &Table, outer: &Scope, index: &str, prefix: &[Expr],
 fn table_of(ctx: &Ctx, name: &str) -> Result<Arc<Table>> {
     static NONE: OnceLock<Arc<Table>> = OnceLock::new();
     if !name.is_empty() {
+        // Every read of a table by a statement begins here: the table a
+        // query names, each it joins, and those of the queries inside its
+        // expressions. Asked before the table is looked for, so that the
+        // answer does not say whether there is one.
+        if let Some(role) = ctx.role {
+            role.need(name, database_protocol::rights::Rights::READ)?;
+        }
         return Ok(ctx.catalog.table(name)?.clone());
     }
     Ok(NONE
@@ -473,7 +480,7 @@ fn join_level(ctx: &Ctx, q: &Query, level: usize, scope: &Scope, base: &Hit, sto
         })?;
     }
     if matches == 0 && join.kind == JoinKind::Left && !stopped.get() {
-        let table = ctx.catalog.table(&inner.table)?.clone();
+        let table = table_of(ctx, &inner.table)?;
         let frame = [Frame { alias: inner.alias.as_deref().unwrap_or(&table.name), table: &table, row: None }];
         let padded = Scope { frames: &frame, outer: Some(scope), ..Scope::default() };
         join_level(ctx, q, level + 1, &padded, base, stopped, f)?;

@@ -405,6 +405,9 @@ fn admin(a: &Admin) -> Json {
         Admin::RestoreBegin { replace } => json!({"kind": "restore_begin", "replace": replace}),
         Admin::RestoreChunk(bytes) => json!({"kind": "restore_chunk", "hex": hex(bytes)}),
         Admin::RestoreEnd => json!({"kind": "restore_end"}),
+        // A request about roles, of a later version: no vector here
+        // holds one.
+        other => unreachable!("{other:?} is not of the vectors' version"),
     }
 }
 

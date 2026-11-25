@@ -148,7 +148,7 @@ impl Conn {
         };
         let hello = Request::Hello {
             version: PROTOCOL_VERSION,
-            database: config.database.clone(),
+            database: config.greeting_database(),
             password: config.password.clone(),
             client: config.name.clone(),
         };

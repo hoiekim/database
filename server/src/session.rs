@@ -45,6 +45,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::access::{same, sha256};
+use self::role::As;
 use crate::gate::{Gate, Turn};
 use crate::State;
 
@@ -194,6 +195,12 @@ struct Session {
     /// Its queue of writers, once the connection has written.
     gate: Option<Arc<Gate>>,
     admin: bool,
+    /// The role of the database the connection greeted as, if it did:
+    /// it then has that role's rights and no other.
+    role: Option<Arc<str>>,
+    /// For a role's reading or optimistic transaction: the role as it
+    /// was when the transaction began.
+    began_as: Option<Arc<database_engine::catalog::Role>>,
     txn: Option<Txn>,
     /// The size of the request being answered.
     request_bytes: usize,
@@ -220,6 +227,10 @@ fn already_open() -> DbError {
 
 fn denied() -> DbError {
     DbError::new(ErrorCode::AccessDenied, "no such database, or the wrong password")
+}
+
+fn not_for_a_role() -> DbError {
+    DbError::new(ErrorCode::AccessDenied, "a role cannot ask this: it takes the database's own password, or the administrator's")
 }
 
 fn admin_only() -> DbError {
@@ -330,6 +341,8 @@ where
         database: None,
         gate: None,
         admin: false,
+        role: None,
+        began_as: None,
         txn: None,
         request_bytes: 0,
         kept: HashMap::new(),
@@ -430,6 +443,7 @@ where
 
 mod budget;
 mod load;
+mod role;
 
 fn rows(set: RowSet) -> Vec<Response> {
     rows_responses(set)
@@ -582,7 +596,7 @@ fn is_lock_timeout(e: &database_engine::error::Error) -> bool {
 /// but for the moments a checkpoint or a check holds it: tried at once,
 /// and waited for, with this thread's other tasks moved elsewhere, only
 /// then.
-fn begin_write(db: &Arc<Database>, wait: Duration, interactive: bool) -> DbResult<WriteTxn> {
+fn begin_write(db: &As, wait: Duration, interactive: bool) -> DbResult<WriteTxn> {
     match db.begin_write(Duration::ZERO, interactive) {
         Err(e) if is_lock_timeout(&e) => {
             tokio::task::block_in_place(|| db.begin_write(wait, interactive)).map_err(|e| e.into_db())
@@ -632,7 +646,7 @@ fn replay(txn: &mut WriteTxn, steps: &mut [Step], deadline: Option<Instant>) -> 
 /// Whatever it answers (rows, no rows, an error such as a key already
 /// taken) may rest on a commit still on its way to the disk.
 fn lone_write(
-    db: &Arc<Database>,
+    db: &As,
     statement: &mut Stmt,
     deadline: Option<Instant>,
     wait: Duration,
@@ -689,7 +703,7 @@ fn part_answer(n: usize, part: &Part, answer: DbResult<Vec<Response>>) -> DbResu
 
 /// Runs a batch as a transaction of its own, with the turn held: every
 /// statement, then the commit, or nothing. Returns as `lone_write` does.
-fn batch_write(db: &Arc<Database>, parts: &mut [Part], deadline: Option<Instant>, wait: Duration) -> (DbResult<Vec<Response>>, u64, Read) {
+fn batch_write(db: &As, parts: &mut [Part], deadline: Option<Instant>, wait: Duration) -> (DbResult<Vec<Response>>, u64, Read) {
     let mut txn = match begin_write(db, wait, false) {
         Ok(txn) => txn,
         Err(e) => return (Err(e), 0, Read::default()),
@@ -715,7 +729,7 @@ fn batch_write(db: &Arc<Database>, parts: &mut [Part], deadline: Option<Instant>
 }
 
 /// Runs a batch that only reads: every query sees the same moment.
-fn batch_read(db: &Arc<Database>, parts: &[Part], deadline: Option<Instant>) -> (DbResult<Vec<Response>>, Read) {
+fn batch_read(db: &As, parts: &[Part], deadline: Option<Instant>) -> (DbResult<Vec<Response>>, Read) {
     let txn = db.begin_read();
     let mut responses = Vec::with_capacity(parts.len());
     for (n, part) in parts.iter().enumerate() {
@@ -773,7 +787,7 @@ fn shape(request: &Request) -> String {
 /// the outcome and the version that must be on disk before it is told.
 fn commit_fork(
     state: &State,
-    db: &Arc<Database>,
+    db: &As,
     fork: Fork,
     deadline: Option<Instant>,
 ) -> (DbResult<()>, u64, Read) {
@@ -790,7 +804,7 @@ const RUN_AGAIN: usize = 1;
 const IN_CONFLICT: usize = 2;
 
 fn commit_fork_as(
-    db: &Arc<Database>,
+    db: &As,
     fork: Fork,
     deadline: Option<Instant>,
 ) -> ((DbResult<()>, u64, Read), Option<usize>) {
@@ -804,7 +818,7 @@ fn commit_fork_as(
 }
 
 fn commit_fork_how(
-    db: &Arc<Database>,
+    db: &As,
     fork: Fork,
     deadline: Option<Instant>,
 ) -> ((DbResult<()>, u64, Read), usize) {
@@ -854,7 +868,7 @@ fn commit_fork_how(
 
 /// Waits, without holding a thread, until everything up to `version` is
 /// on disk and visible to readers.
-async fn durable(db: &Arc<Database>, version: u64) -> DbResult<()> {
+async fn durable(db: &As, version: u64) -> DbResult<()> {
     if db.is_published(version) {
         return Ok(());
     }
@@ -915,6 +929,21 @@ impl Session {
         if !(OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
             return Err(DbError::new(ErrorCode::ProtocolMismatch, format!("the client speaks protocol {version}, the server {OLDEST_PROTOCOL_VERSION} to {PROTOCOL_VERSION}: upgrade the older of the two")));
         }
+        // A greeting that names a role is that role's or nobody's: the
+        // password is then compared with the role's alone, so that the
+        // administrator's password, sent with a role's name by mistake,
+        // opens nothing more than the role does.
+        if let Some((database, role)) = database.split_once(ROLE_SEPARATOR) {
+            let db = self.state.engine.database(database).ok();
+            let secret = db.as_ref().and_then(|db| db.begin_read().catalog().roles.get(role).map(|role| role.secret.clone()));
+            if !crate::access::matches(secret.as_deref(), password) {
+                return Err(denied());
+            }
+            self.database = db;
+            self.name = database.to_string();
+            self.role = Some(Arc::from(role));
+            return Ok(());
+        }
         self.admin = same(&sha256(password.as_bytes()), &sha256(self.state.config.admin_password.as_bytes()));
         if database.is_empty() {
             return if self.admin { Ok(()) } else { Err(denied()) };
@@ -929,11 +958,14 @@ impl Session {
         Ok(())
     }
 
-    fn database(&self) -> DbResult<Arc<Database>> {
+    /// The connection's database, as the connection may use it: every
+    /// transaction begun through what this returns runs as the
+    /// connection's role, if it has one.
+    fn database(&self) -> DbResult<As> {
         let db = self.database.clone().ok_or_else(|| DbError::invalid("this connection is on no database"))?;
         // The name may have been given to another database since.
         match self.state.engine.database(&self.name) {
-            Ok(current) if Arc::ptr_eq(&current, &db) => Ok(db),
+            Ok(current) if Arc::ptr_eq(&current, &db) => Ok(As::new(db, self.role.clone())),
             _ => Err(DbError::new(ErrorCode::Unavailable, format!("database {:?} was dropped or replaced; reconnect", self.name))),
         }
     }
@@ -1036,7 +1068,18 @@ impl Session {
                 Ok(vec![Response::Ok])
             }
             Request::Now if self.txn.is_none() => Ok(vec![Response::Time(now_micros())]),
-            Request::Lock { name, wait_ms } => self.lock(name, Duration::from_millis(wait_ms)).await,
+            Request::Lock { name, wait_ms } => {
+                // A named lock is how writers keep out of each other's
+                // way (one migration at a time). A role that can change
+                // nothing has no part in that, and could only hold a
+                // lock to keep those who can from their work.
+                if let Some(role) = self.role.as_ref().and(self.database()?.role_now()) {
+                    if !role.changes_something() {
+                        return Err(DbError::new(ErrorCode::AccessDenied, format!("role {:?} can only read, and a named lock is for those who write", role.name)));
+                    }
+                }
+                self.lock(name, Duration::from_millis(wait_ms)).await
+            }
             Request::Unlock { name } => {
                 self.unlock(&name);
                 Ok(vec![Response::Ok])
@@ -1118,7 +1161,8 @@ impl Session {
     /// Starts a transaction on the connection, which has none.
     async fn begin(&mut self, kind: TxnKind, wait: Duration) -> DbResult<()> {
         let db = self.database()?;
-        self.txn = Some(match kind {
+        self.began_as = None;
+        let txn = match kind {
             TxnKind::Read => Txn::Read(db.begin_read()),
             TxnKind::Exclusive => {
                 let turn = self.turn(wait).await?;
@@ -1135,8 +1179,41 @@ impl Session {
                 spent: Duration::ZERO,
                 wait,
             })),
-        });
+        };
+        // A transaction that stays on the version it began at stays on
+        // the rights of that version: what they were is kept, to be
+        // compared with what they are when its next statement comes.
+        self.began_as = match &txn {
+            Txn::Read(txn) => txn.role().cloned(),
+            Txn::Fork(fork) => fork.txn.role().cloned(),
+            _ => None,
+        };
+        self.txn = Some(txn);
         Ok(())
+    }
+
+    /// Ends a role's reading or optimistic transaction if the role has
+    /// been changed, or dropped, since the transaction began. Such a
+    /// transaction reads the version it began at, and with it the rights
+    /// of that version; without this, a statement sent after a revoke
+    /// was answered would still be run by the rights from before it. An
+    /// exclusive transaction needs none of it: while it holds the turn
+    /// no change of rights can commit.
+    fn role_still_stands(&mut self, db: &As) -> DbResult<()> {
+        if !matches!(self.txn, Some(Txn::Read(_) | Txn::Fork(_))) {
+            return Ok(());
+        }
+        let Some(began) = &self.began_as else { return Ok(()) };
+        // A role is the same allocation in every version from one change
+        // of it to the next. A change of its password alone is a change
+        // too, and takes no right from anyone: then what it holds is
+        // compared.
+        if db.role_now().is_some_and(|now| Arc::ptr_eq(&now, began) || (now.everywhere == began.everywhere && now.tables == began.tables)) {
+            return Ok(());
+        }
+        let e = DbError::new(ErrorCode::AccessDenied, format!("the rights of role {:?} have changed since this transaction began: it was rolled back, and can be begun again", began.name));
+        self.txn = Some(Txn::Dead(e.clone()));
+        Err(e)
     }
 
     /// What a request asks to be run: itself, or the kept statement it
@@ -1239,6 +1316,7 @@ impl Session {
 
     async fn statement(&mut self, mut statement: Stmt, deadline: Option<Instant>) -> DbResult<Vec<Response>> {
         let db = self.database()?;
+        self.role_still_stands(&db)?;
         match &self.txn {
             Some(Txn::Dead(e)) => {
                 return Err(DbError::new(
@@ -1582,18 +1660,49 @@ impl Session {
     /// all of them on a connection that is on none.
     fn targets(&self) -> DbResult<Vec<Arc<Database>>> {
         match &self.database {
-            Some(_) => Ok(vec![self.database()?]),
+            Some(_) => Ok(vec![self.database()?.database().clone()]),
             None => self.state.engine.names().iter().map(|n| self.state.engine.database(n).map_err(|e| e.into_db())).collect(),
         }
     }
 
     async fn admin(&mut self, request: Admin) -> DbResult<Vec<Response>> {
         let state = self.state.clone();
-        // A database's own password is enough to look after it.
-        if !self.admin && !matches!(request, Admin::Checkpoint | Admin::Check | Admin::Stats) {
+        // A role has its rights on tables and nothing else: what follows
+        // is about the database or the server whole.
+        if self.role.is_some() {
+            return Err(not_for_a_role());
+        }
+        let about_roles = matches!(request, Admin::CreateRole { .. } | Admin::DropRole { .. } | Admin::SetRolePassword { .. } | Admin::Grant { .. } | Admin::Revoke { .. } | Admin::ListRoles);
+        // A database's own password is enough to look after it, and to
+        // say who else may use it.
+        if !self.admin && !about_roles && !matches!(request, Admin::Checkpoint | Admin::Check | Admin::Stats) {
             return Err(admin_only());
         }
         match request {
+            Admin::CreateRole { name, password, if_not_exists } => {
+                let secret = crate::access::secret(&password);
+                self.change_roles(move |tx| tx.create_role(&name, &secret, if_not_exists)).await
+            }
+            Admin::DropRole { name, if_exists } => self.change_roles(move |tx| tx.drop_role(&name, if_exists)).await,
+            Admin::SetRolePassword { name, password } => {
+                let secret = crate::access::secret(&password);
+                self.change_roles(move |tx| tx.set_role_secret(&name, &secret)).await
+            }
+            Admin::Grant { role, table, rights } => self.change_roles(move |tx| tx.grant(&role, table.as_deref(), rights)).await,
+            Admin::Revoke { role, table, rights } => self.change_roles(move |tx| tx.revoke(&role, table.as_deref(), rights)).await,
+            Admin::ListRoles => {
+                let roles = self.database()?.database().begin_read().catalog().roles.clone();
+                let rights = |rights: database_protocol::rights::Rights| Value::List(rights.names().into_iter().map(|name| Value::Text(name.to_string())).collect());
+                let mut listed = Vec::new();
+                for role in roles.values() {
+                    listed.push(vec![Value::Text(role.name.clone()), Value::Null, rights(role.everywhere)]);
+                    for (table, held) in &role.tables {
+                        listed.push(vec![Value::Text(role.name.clone()), Value::Text(table.clone()), rights(*held)]);
+                    }
+                }
+                let affected = listed.len() as u64;
+                Ok(rows(RowSet { columns: ROLES_COLUMNS.iter().map(|c| c.to_string()).collect(), rows: listed, affected, total: None }))
+            }
             Admin::CreateDatabase { name, password, if_not_exists } => {
                 if state.engine.database(&name).is_ok() {
                     return if if_not_exists { Ok(vec![Response::Ok]) } else { Err(DbError::new(ErrorCode::AlreadyExists, format!("database {name:?} already exists"))) };
@@ -1681,8 +1790,36 @@ impl Session {
         }
     }
 
+    /// Changes the roles of the connection's database, as a transaction
+    /// of its own: it waits its turn as any write does, and is answered
+    /// when it is on disk and every statement that begins from then on
+    /// runs by it.
+    async fn change_roles(&mut self, change: impl FnOnce(&mut database_engine::write::Tx) -> database_engine::error::Result<()> + Send + 'static) -> DbResult<Vec<Response>> {
+        if self.txn.is_some() {
+            return Err(DbError::invalid("a change of roles is a transaction of its own: it cannot be sent inside another"));
+        }
+        let db = self.database()?;
+        let wait = self.state.config.lock_wait;
+        let turn = self.turn(wait).await?;
+        let writing = db.clone();
+        let version = blocking(move || {
+            let mut txn = begin_write(&writing, wait, false)?;
+            let base = txn.base();
+            txn.change_roles(change).map_err(|e| e.into_db())?;
+            Ok::<_, DbError>(txn.commit_start().map_err(|e| e.into_db())?.map_or(base, |committed| committed.version()))
+        })
+        .await?;
+        drop(turn);
+        durable(&db, version?).await?;
+        Ok(vec![Response::Ok])
+    }
+
     /// Streams a dump: chunks, then `Ok` or the error that stopped it.
     async fn dump<W: AsyncWrite + Unpin>(&mut self, databases: Vec<String>, writer: &mut W) -> Result<Vec<Response>, ()> {
+        // A dump holds every table, and the roles' passwords as stored.
+        if self.role.is_some() {
+            return Ok(vec![Response::Error(not_for_a_role())]);
+        }
         // A database's own connection may dump that database.
         let own = self.database.is_some() && (databases.is_empty() || databases == [self.name.clone()]);
         if !self.admin && !own {
