@@ -179,6 +179,11 @@ test("reads a URL", () => {
   assert.deepEqual([admin.database, admin.password], ["", "adminpw"]);
   c = configFromUrl("database://d:a%3Ab%40c@h?connect_timeout=2&lock_wait=0.25");
   assert.deepEqual([c.password, c.connectTimeout, c.lockWait], ["a:b@c", 2, 0.25]);
+  assert.equal(c.tls, undefined);
+  assert.equal(configFromUrl("database://shop:pw@db?tls=off").tls, undefined);
+  assert.deepEqual(configFromUrl("database://shop:pw@db?tls=on").tls, {});
+  assert.deepEqual(configFromUrl("database://shop:pw@10.0.0.5?tls_ca=%2Fetc%2Fdatabase%2Fca.pem&tls_name=db.example.com").tls, { ca: "/etc/database/ca.pem", name: "db.example.com" });
+  assert.deepEqual(configFromUrl("database://shop:pw@db?tls_name=db.example.com&tls=on").tls, { name: "db.example.com" });
   for (const bad of [
     "database://a:b@h/d?statement_timeout=-1",
     "database://a:b@h/d?lock_wait=NaN",
@@ -191,6 +196,13 @@ test("reads a URL", () => {
     "database://a:b@h/d?what=1",
     "database://a:%zz@h/d",
     "database://a:b@h/d?name",
+    "database://a:b@h/d?tls=yes",
+    "database://a:b@h/d?tls=",
+    "database://a:b@h/d?tls=off&tls_ca=ca.pem",
+    "database://a:b@h/d?tls_name=db&tls=off",
+    "database://a:b@h/d?tls_ca=",
+    "database://a:b@h/d?tls_name=",
+    "database://a:b@h/d?tls_cert=server.pem",
   ]) {
     assert.throws(
       () => configFromUrl(bad),

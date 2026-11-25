@@ -28,8 +28,15 @@
 //! Both clients prepare each statement once per connection and send its
 //! values after that. `BENCH_SOCKET=1` has both servers listen on a Unix
 //! domain socket and both clients connect through it, as an application
-//! on the server's own host could.
+//! on the server's own host could. `BENCH_TLS=1` has this server serve
+//! TLS and its client connect under it, with the certificate of
+//! `BENCH_TLS_CERT` and `BENCH_TLS_KEY` (default: the tests' own, in
+//! `protocol/fixtures/tls`, found from the repository's root). Postgres
+//! is not given TLS: the setting is for comparing this server with
+//! itself. `--connections` measures what a connection costs instead of
+//! running the workloads (`connections.rs`).
 
+mod connections;
 mod family;
 mod http;
 mod limits;
@@ -191,6 +198,14 @@ fn through_socket() -> bool {
     std::env::var_os("BENCH_SOCKET").is_some()
 }
 
+/// `BENCH_TLS=1`: the certificate and key this server serves TLS with,
+/// and its client takes the server by.
+fn tls_files() -> Option<(PathBuf, PathBuf)> {
+    std::env::var_os("BENCH_TLS")?;
+    let file = |name: &str, default: &str| std::env::var_os(name).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(default));
+    Some((file("BENCH_TLS_CERT", "protocol/fixtures/tls/server.pem"), file("BENCH_TLS_KEY", "protocol/fixtures/tls/server.key")))
+}
+
 fn bench_dir(name: &str) -> PathBuf {
     let base = std::env::var("BENCH_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     if keep() && name == "ours" {
@@ -205,6 +220,14 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
         let _ = std::fs::remove_dir_all(&dir);
     }
     let socket = through_socket().then(|| dir.with_extension("sock"));
+    let tls = tls_files();
+    let secured = |mut config: Config| {
+        config.socket = socket.clone();
+        if config.socket.is_none() {
+            config.tls = tls.as_ref().map(|(certificate, _)| Tls::certificate(certificate));
+        }
+        config
+    };
     let port = free_port();
     let cage = limits().cage("ours");
     let child = limits()
@@ -215,6 +238,7 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
         .env("DATABASE_ADMIN_PASSWORD", "bench-admin")
         .env("DATABASE_CACHE_MB", cache_mb.to_string())
         .envs(socket.iter().map(|socket| ("DATABASE_SOCKET", socket)))
+        .envs(tls.iter().flat_map(|(certificate, key)| [("DATABASE_TLS_CERT", certificate), ("DATABASE_TLS_KEY", key)]))
         // BENCH_SERVER_LOG=file keeps what the server says.
         .stderr(match std::env::var_os("BENCH_SERVER_LOG") {
             Some(path) => Stdio::from(std::fs::File::create(path).expect("the server's log file")),
@@ -224,12 +248,10 @@ async fn start_ours(binary: &Path, cache_mb: u32) -> (Server, Client) {
         .unwrap_or_else(|e| panic!("cannot run {}: {e}. Build it first: cargo build --release", binary.display()));
     let server = Server { child: Some(child), dir, as_postgres: false, cage, name: "database" };
     for _ in 0..200 {
-        let mut admin = Config::new("127.0.0.1", port, "", "bench-admin");
-        admin.socket = socket.clone();
+        let admin = secured(Config::new("127.0.0.1", port, "", "bench-admin"));
         if let Ok(admin) = Client::connect(admin).await {
             admin.admin().create_database_if_not_exists("bench", "bench").await.unwrap();
-            let mut config = Config::new("127.0.0.1", port, "bench", "bench");
-            config.socket = socket.clone();
+            let mut config = secured(Config::new("127.0.0.1", port, "bench", "bench"));
             config.pool_size = CONNECTIONS;
             return (server, Client::connect(config).await.unwrap());
         }
@@ -1271,6 +1293,9 @@ async fn bench() {
         None => matches!(name, "ours" | "postgres"),
     };
     let binary = args.iter().position(|a| a == "--binary").and_then(|i| args.get(i + 1)).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("target/release/database"));
+    if args.iter().any(|a| a == "--connections") {
+        return connections::connections(&binary).await;
+    }
     let mut reports = Vec::new();
     if wanted("ours") {
         let (server, client) = start_ours(&binary, 32).await;

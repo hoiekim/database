@@ -29,10 +29,12 @@ mod client;
 mod config;
 mod conn;
 mod row;
+mod tls;
 
 pub use client::{Admin, Batch, Client, Db, Explained, LockGuard, Prepared, Statement, Transaction};
 pub use config::{Config, DEFAULT_PORT};
 pub use row::{FromRow, Row, Rows};
+pub use tls::{Tls, Trust};
 
 pub use database_protocol::decimal::Decimal;
 pub use database_protocol::error::{DbError, DbResult, ErrorCode};

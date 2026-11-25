@@ -1,5 +1,5 @@
-//! The database server: listens on a TCP port, and on a Unix domain
-//! socket if it is given one, and serves the requests of
+//! The database server: listens on a TCP port, under TLS if it is given a
+//! certificate, and on a Unix domain socket if it is given one, and serves the requests of
 //! `database-protocol` from the databases in its data directory.
 //!
 //! One task per connection reads a request, runs it on a blocking thread
@@ -11,6 +11,7 @@ mod access;
 mod gate;
 pub mod memory;
 mod session;
+mod tls;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,6 +28,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Notify};
 
 pub use access::sha256;
+pub use tls::TlsConfig;
 
 /// How a server is started.
 #[derive(Clone, Debug)]
@@ -40,6 +42,11 @@ pub struct ServerConfig {
     /// may connect is decided by the file's permissions, and then by the
     /// password, as on TCP. Not on systems without such sockets.
     pub socket: Option<PathBuf>,
+    /// The certificate to serve TLS with on the TCP listener, and whether
+    /// connections in the clear are still taken there. `None` serves TCP
+    /// in the clear alone. The Unix domain socket is never encrypted:
+    /// what goes through it does not leave the host.
+    pub tls: Option<TlsConfig>,
     /// The password for administering: creating and dropping databases,
     /// dumping, restoring.
     pub admin_password: String,
@@ -67,6 +74,7 @@ impl ServerConfig {
             data_dir: data_dir.into(),
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             socket: None,
+            tls: None,
             admin_password: admin_password.to_string(),
             cache_bytes: 32 * 1024 * 1024,
             sync: true,
@@ -81,6 +89,8 @@ pub(crate) struct State {
     pub engine: Engine,
     pub access: Mutex<access::Access>,
     pub config: ServerConfig,
+    /// The certificate for TLS, if the server was given one.
+    pub tls: Option<Arc<tls::Tls>>,
     /// Named locks: the database and name, and the connection holding it.
     pub locks: Mutex<HashMap<(String, String), u64>>,
     pub lock_freed: Notify,
@@ -147,7 +157,47 @@ where
         // may then take it that nothing of the connections is left, the
         // hold on the data directory included.
         let _serving = serving;
-        session::serve(reader, writer, state, id, stopping).await;
+        session::serve(reader, writer, state, id, stopping, None).await;
+    });
+}
+
+/// How long a connection has to say what it is and, if it is TLS, to
+/// finish the handshake: as long as it has for its greeting.
+const HANDSHAKE_PATIENCE: Duration = Duration::from_secs(10);
+
+fn tls_required() -> database_protocol::error::DbError {
+    database_protocol::error::DbError::new(
+        database_protocol::error::ErrorCode::AccessDenied,
+        "this server takes connections over TCP only under TLS, and this one came in the clear: turn TLS on in the client",
+    )
+}
+
+/// Serves one connection accepted over TCP by a server that has a
+/// certificate: under TLS if that is how the connection begins, and
+/// otherwise in the clear, or not at all where TLS is required.
+fn connect_tls(state: &Arc<State>, stopping: &watch::Receiver<bool>, tls: &Arc<tls::Tls>, stream: tokio::net::TcpStream) {
+    let id = state.connections.fetch_add(1, Ordering::Relaxed) + 1;
+    let (state, stopping, tls) = (state.clone(), stopping.clone(), tls.clone());
+    state.open.count.fetch_add(1, Ordering::Relaxed);
+    let serving = Serving(state.open.clone());
+    // The handshake waits on the client, so it is the connection's own
+    // task that makes it: the listener goes on accepting.
+    tokio::spawn(async move {
+        let _serving = serving;
+        let Ok(Some(first)) = tokio::time::timeout(HANDSHAKE_PATIENCE, tls::first_bytes(&stream)).await else { return };
+        if tls::is_handshake(first) {
+            let Ok(Ok(stream)) = tokio::time::timeout(HANDSHAKE_PATIENCE, tls.acceptor().accept(stream)).await else { return };
+            let (reader, writer) = tokio::io::split(stream);
+            session::serve(reader, writer, state, id, stopping, None).await;
+        } else {
+            // In the clear. Where that is not served, the greeting is
+            // still read, so that the refusal is the answer to it: a
+            // frame the client reads, where a closed connection would
+            // tell it nothing.
+            let refusal = (!tls.plain_allowed()).then(tls_required);
+            let (reader, writer) = stream.into_split();
+            session::serve(reader, writer, state, id, stopping, refusal).await;
+        }
     });
 }
 
@@ -182,6 +232,10 @@ impl Server {
         // Recovery reads and writes files: keep it off the async threads.
         let engine = tokio::task::spawn_blocking(move || Engine::open(&dir, options)).await.map_err(std::io::Error::other)?.map_err(|e| std::io::Error::other(e.to_string()))?;
         let access = access::Access::load(&config.data_dir)?;
+        let tls = match &config.tls {
+            Some(tls) => Some(Arc::new(tls::Tls::open(tls.clone())?)),
+            None => None,
+        };
         let listener = TcpListener::bind(config.listen).await?;
         let addr = listener.local_addr()?;
         #[cfg(unix)]
@@ -198,6 +252,7 @@ impl Server {
             engine,
             access: Mutex::new(access),
             config,
+            tls,
             locks: Mutex::new(HashMap::new()),
             lock_freed: Notify::new(),
             open: Arc::default(),
@@ -243,8 +298,13 @@ impl Server {
                 // Requests are small and each waits for its answer:
                 // never hold one back to send it with the next.
                 let _ = stream.set_nodelay(true);
-                let (reader, writer) = stream.into_split();
-                connect(&accept_state, &accept_stopping, reader, writer);
+                match &accept_state.tls {
+                    Some(tls) => connect_tls(&accept_state, &accept_stopping, tls, stream),
+                    None => {
+                        let (reader, writer) = stream.into_split();
+                        connect(&accept_state, &accept_stopping, reader, writer);
+                    }
+                }
             }
         }));
         #[cfg(unix)]

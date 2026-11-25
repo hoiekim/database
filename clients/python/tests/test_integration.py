@@ -5,18 +5,21 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import io
+import socket
+import ssl
 import threading
 import time
 import unittest
 import uuid
 from decimal import Decimal
 from typing import Any, List, Optional
+from urllib.parse import quote
 
 from database_client import *
 from database_client import codec
 from database_client.conn import Conn
 
-from .server import PASSWORD, Server
+from .server import PASSWORD, Server, fixture
 
 server: Optional[Server] = None
 
@@ -749,6 +752,140 @@ class Restarts(unittest.TestCase):
         for conn in db._pool._idle:
             conn.last_used -= 60
         self.assertEqual(db.query(Query.table("t")).column(), [1])
+
+
+class OverTls(unittest.TestCase):
+    """Against a server that serves nothing in the clear, one that serves
+    both, and the shared one, which serves no TLS."""
+
+    required: Server
+    optional: Server
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.required = Server("required")
+        cls.addClassCleanup(cls.required.stop)
+        cls.optional = Server("optional")
+        cls.addClassCleanup(cls.optional.stop)
+        for own in (cls.required, cls.optional):
+            own.client("test").close()
+
+    def connect(self, target: Any) -> Client:
+        db = Client.connect(target)
+        self.addCleanup(db.close)
+        return db
+
+    def code(self, expected: ErrorCode, target: Any) -> DbError:
+        with self.assertRaises(DbError) as caught:
+            Client.connect(target).close()
+        self.assertEqual(caught.exception.code, expected, caught.exception)
+        return caught.exception
+
+    @staticmethod
+    def url(to: Server, host: str, settings: str) -> str:
+        return f"database://test:{PASSWORD}@{host}:{to.port}?{settings}"
+
+    ca = "tls_ca=" + quote(fixture("ca.pem"), safe="")
+
+    # R-O8: everything a connection does, it does under TLS.
+    def test_a_client_that_verifies_the_server_runs_its_statements_under_tls(self) -> None:
+        db = self.connect(self.url(self.required, "localhost", self.ca))
+        db.create_table(TableDef("notes").column(ColumnDef("id", Type.INT)).column(ColumnDef("body", Type.TEXT)).primary_key(["id"]))
+        # A result of several frames, each far larger than a TLS record,
+        # and requests as large.
+        body = "y" * 500_000
+        for n in range(12):
+            db.insert(Insert.into("notes").set("id", n).set("body", f"{n}:{body}"))
+        rows = db.query(Query.table("notes"))
+        self.assertEqual(len(rows), 12)
+        self.assertTrue(all(row["body"] == f"{row['id']}:{body}" for row in rows))
+
+        def shorten(tx: Transaction) -> None:
+            kept = tx.query_one(Query.table("notes").key([3]))["body"]
+            tx.update(Update.table("notes").key([3]).set("body", kept[:4] + "!"))
+
+        db.transaction(shorten)
+        self.assertEqual(db.query_one(Query.table("notes").key([3]))["body"], "3:yy!")
+
+        conn = Conn(self.required.config("test"))
+        self.addCleanup(conn.close)
+        self.assertIsInstance(conn.sock, ssl.SSLSocket)
+        conn.send(codec.request(codec.QUERY, Query.table("notes").spec))
+        frames: List[Any] = []
+        while not frames or frames[-1].more:
+            frames.append(conn.receive())
+        conn.settle()
+        self.assertGreater(len(frames), 1)
+
+        # The certificate carries the loopback address too, and a name
+        # the host is not reached by can be given.
+        by_address = self.connect(self.url(self.required, "127.0.0.1", self.ca))
+        self.assertEqual(len(by_address.query(Query.table("notes").key([3]))), 1)
+        by_name = self.connect(self.url(self.required, "127.0.0.1", self.ca + "&tls_name=database.test"))
+        self.assertEqual(len(by_name.query(Query.table("notes").key([3]))), 1)
+        by_named_address = dataclasses.replace(self.required.config("test"), host="localhost", tls=Tls(ca=fixture("ca.pem"), name="::1"))
+        self.assertEqual(len(self.connect(by_named_address).query(Query.table("notes").key([3]))), 1)
+
+    # R-O9: with TLS required, a greeting in the clear is refused whatever
+    # password it carries, and the answer says why.
+    def test_a_server_that_requires_tls_refuses_a_client_in_the_clear(self) -> None:
+        for password in (PASSWORD, "not-the-password"):
+            refused = self.code(ErrorCode.ACCESS_DENIED, self.required.config("test", password, clear=True))
+            self.assertIn("only under TLS", refused.message)
+
+    # R-O9: where TLS is optional, one port serves both, and both see the
+    # same data.
+    def test_a_server_where_tls_is_optional_serves_both(self) -> None:
+        secured = self.connect(self.optional.config("test"))
+        clear = self.connect(self.optional.config("test", clear=True))
+        secured.create_table(TableDef("notes").column(ColumnDef("id", Type.INT)).primary_key(["id"]))
+        secured.insert(Insert.into("notes").set("id", 1))
+        clear.insert(Insert.into("notes").set("id", 2))
+        self.assertEqual(secured.query(Query.table("notes")).column(), [1, 2])
+        self.assertEqual(clear.query(Query.table("notes")).column(), [1, 2])
+
+    # R-O8: a server the client cannot verify is not sent a greeting, also
+    # where the server would have served the client in the clear.
+    def test_a_client_refuses_a_server_it_cannot_verify(self) -> None:
+        for to in (self.required, self.optional):
+            for settings in [
+                # Signed by an authority the client was not given.
+                "tls_ca=" + quote(fixture("stranger-ca.pem"), safe=""),
+                # The system's authorities have not signed it either.
+                "tls=on",
+                # The right authority, for a name the certificate does not carry.
+                self.ca + "&tls_name=elsewhere.test",
+            ]:
+                with self.subTest(tls=to.tls, settings=settings):
+                    refused = self.code(ErrorCode.CONNECTION, self.url(to, "localhost", settings))
+                    self.assertRegex(refused.message, f"the TLS handshake with the database at localhost:{to.port} failed: .")
+        unread = self.code(ErrorCode.CONNECTION, self.url(self.required, "localhost", "tls_ca=%2Fnowhere%2Fca.pem"))
+        self.assertRegex(unread.message, "TLS cannot be set up: /nowhere/ca.pem: .")
+        empty = self.code(ErrorCode.CONNECTION, self.url(self.required, "localhost", "tls_ca=" + quote(fixture("server.key"), safe="")))
+        self.assertRegex(empty.message, r"TLS cannot be set up: .*server\.key: .")
+
+    # R-O8: a client told to use TLS never talks in the clear instead.
+    def test_a_client_asked_for_tls_does_not_talk_to_a_server_that_serves_none(self) -> None:
+        assert server is not None
+        refused = self.code(ErrorCode.CONNECTION, self.url(server, "127.0.0.1", self.ca))
+        self.assertRegex(refused.message, f"the TLS handshake with the database at 127.0.0.1:{server.port} failed: .*does not serve TLS")
+        # The same client without the setting is served: it was the TLS.
+        self.connect(server.config()).ping()
+
+    # R-O8: the server speaks TLS 1.3 and nothing older.
+    def test_a_peer_limited_to_tls_1_2_is_refused(self) -> None:
+        def handshake(newest: ssl.TLSVersion) -> Optional[str]:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.load_verify_locations(cafile=fixture("ca.pem"))
+            context.maximum_version = newest
+            with socket.create_connection(("127.0.0.1", self.required.port), timeout=10) as plain:
+                with context.wrap_socket(plain, server_hostname="localhost") as secured:
+                    return secured.version()
+
+        with self.assertRaises((ssl.SSLError, ConnectionError)):
+            handshake(ssl.TLSVersion.TLSv1_2)
+        # The same peer without the limit is served: it was the version.
+        self.assertEqual(handshake(ssl.TLSVersion.TLSv1_3), "TLSv1.3")
 
 
 if __name__ == "__main__":

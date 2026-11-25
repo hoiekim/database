@@ -576,6 +576,50 @@ more. `BENCH_SERVER_CPUS=16` there keeps the client off the server's
 cores. One writer per database is expected to cost more there on the
 workloads that write.
 
+## What TLS costs
+
+TLS (`OPERATIONS.md`, "TLS") is rustls, built for TLS 1.3 alone with
+`ring` for its ciphers. Measured on 4 cores under Linux, with the
+client on the server's cores, on the
+build before TLS was added and the build with it, three runs of the
+session lookup each and one of `bench --connections`:
+
+| | Before | With TLS built in, in the clear | Under TLS |
+|---|---:|---:|---:|
+| The `database` binary | 3,436,456 bytes | 5,515,352 bytes | |
+| Memory when idle | 3.8 to 3.9 MB | 4.6 to 5.0 MB | 5.8 to 6.0 MB |
+| Memory for each open connection | 22.0 kB | 22.1 kB | 29.9 kB |
+| A new connection, to its first answer, median | 144 µs | 138 µs | 544 µs |
+| the same, 99th percentile | 700 µs | 274 µs | 1,539 µs |
+| Session lookup, 1 connection, per second | 21,501 to 22,068 | 21,254 to 21,802 | 19,476 to 20,081 |
+| the same, median | 41 µs | 41 to 42 µs | 45 to 46 µs |
+| Session lookup, 16 connections, per second | 94,680 to 101,462 | 96,701 to 100,944 | 85,121 to 89,199 |
+| the same, median | 117 to 126 µs | 122 to 123 µs | 137 to 143 µs |
+
+What these say:
+
+- **A server that is given no certificate pays in size alone.** Its
+  requests cost what they did: a connection in the clear never enters
+  the TLS code. The binary is 2.1 MB larger, and about a megabyte of
+  that is in memory when the server is idle. That megabyte is the
+  binary's own pages, read from its file and given back under memory
+  pressure, not memory the server allocates: what it allocates when
+  idle went from 356 kB to 404 kB.
+- **A certificate in use is another megabyte when idle**: the code
+  that serves it, now read in.
+- **A request under TLS costs 4 to 5 µs more**, a tenth of a session
+  lookup on one connection: its request and its answer are each
+  encrypted on one side and decrypted on the other, and both sides ran
+  on this machine. From sixteen connections the server answers 10 to
+  12% fewer.
+- **A handshake costs 0.4 ms**, both sides counted, with a P-256
+  certificate. A pool that keeps its connections pays it once for each.
+- **A connection under TLS holds 8 kB more** on the server: the
+  session's keys and its buffers.
+
+The ranges are across the runs.
+`bench --connections` and `BENCH_TLS=1` (below) make them again.
+
 ## Running it
 
 ```sh
@@ -589,6 +633,8 @@ BENCH_REPEAT="mailbox:30" BENCH_WORKLOADS=mailbox ./target/release/bench --only 
 BENCH_KEEP=1 BENCH_WORKLOADS=mailbox ./target/release/bench --only ours   # keep this server's loaded data for the next run
 BENCH_CONNECTIONS=1 BENCH_WORKLOADS=upsert ./target/release/bench --only ours
 BENCH_SOCKET=1 ./target/release/bench  # both servers through Unix domain sockets, not TCP
+BENCH_TLS=1 BENCH_WORKLOADS=session ./target/release/bench --only ours   # this server under TLS
+./target/release/bench --connections   # what a connection costs: also with BENCH_TLS=1 or BENCH_SOCKET=1
 BENCH_SERVER_LOG=server.log ./target/release/bench --only ours
 BENCH_SERVER_CPUS=1 BENCH_SERVER_MEMORY_MB=256 ./target/release/bench   # each server on one CPU, under 256 MB
 ```

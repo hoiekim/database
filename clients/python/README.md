@@ -109,6 +109,39 @@ length, then by bytes. The server keeps an integer inside JSON exactly
 from -2^63 to 2^64-1 and reads a larger one as a float, so one beyond
 that raises `ValueError`; `float(n)` writes the float.
 
+## TLS
+
+Without a setting a connection is in the clear, the password included,
+which is right only on a network nobody else can listen on; a server
+started with a certificate refuses such a connection unless it was told
+`DATABASE_TLS=optional`. The settings go in the URL, or in the `tls` of
+a `Config`:
+
+```python
+# The server's certificate must be signed by an authority in this file, and by no other.
+Client.connect("database://shop:secret@database:5454?tls_ca=%2Fetc%2Fdatabase%2Fca.pem")
+# Reached by an address, or by a name the certificate does not carry.
+Client.connect(Config("10.0.0.5", 5454, "shop", "secret", tls=Tls(ca="/etc/database/ca.pem", name="database.example.com")))
+# Signed by a public authority.
+Client.connect("database://shop:secret@database.example.com?tls=on")
+```
+
+| URL | `Config.tls` | |
+|---|---|---|
+| `tls=on` | `Tls()` | TLS, the server verified against the system's certificate authorities |
+| `tls_ca=<file>` | `Tls(ca=...)` | verified against the authorities in that PEM file, and no other |
+| `tls_name=<name>` | `Tls(name=...)` | the name or address the certificate must be for, where that is not the host |
+| `tls=off` | `None` | in the clear: the default |
+
+`tls_ca` and `tls_name` turn TLS on by themselves, and `tls=off` beside
+either is an invalid URL. A client that asks for TLS always verifies the
+certificate and the name it is for: there is no setting that encrypts
+without verifying, and no falling back to a connection in the clear. A
+server that cannot be verified, or that serves no TLS, raises a
+`DbError` of code `CONNECTION` before the password is sent. Only
+TLS 1.3 is spoken. The Rust client's `tls_cert`, which takes one exact
+certificate for the server's, is not here.
+
 ## Errors
 
 Everything the server refuses raises `DbError`, with `code` (an
@@ -147,4 +180,6 @@ python -m unittest discover -s tests -t .
 - `tests/test_builders.py`: the builders say what the Rust builders say.
 - `tests/test_values.py`: Python values, URLs and rows, without a server.
 - `tests/test_integration.py`: every kind of request against a real
-  server. Skipped if no server binary is found; `DATABASE_BIN` names one.
+  server, in the clear and under TLS with the certificates of
+  `protocol/fixtures/tls`. Skipped if no server binary is found;
+  `DATABASE_BIN` names one.

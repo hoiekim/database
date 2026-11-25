@@ -19,6 +19,8 @@ database-protocol = { path = "../protocol" }
 database-engine = { path = "../engine" }
 database-client = { path = "../client" }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "time", "macros", "signal"] }
+rustls.workspace = true
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

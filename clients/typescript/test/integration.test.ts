@@ -45,7 +45,7 @@ import {
   type Transaction,
   type ast,
 } from "../src/index.js";
-import { PASSWORD, Server, binary } from "./server.js";
+import { PASSWORD, Server, binary, fixture } from "./server.js";
 
 const path = binary();
 const skip = path === null ? "no server binary: run `cargo build -p database-server`, or set DATABASE_BIN" : false;
@@ -842,5 +842,126 @@ describe("against a server", { skip }, () => {
     } finally {
       await own.stop();
     }
+  });
+});
+
+describe("against a server that serves TLS", { skip }, () => {
+  /** One that serves nothing in the clear, one that serves both, and one that serves no TLS. */
+  let required: Server;
+  let optional: Server;
+  let open: Server;
+  const opened: Client[] = [];
+
+  before(async () => {
+    [required, optional, open] = await Promise.all([Server.start(path!, "required"), Server.start(path!, "optional"), Server.start(path!)]);
+    for (const server of [required, optional, open]) (await server.client("test")).close();
+  });
+
+  after(async () => {
+    for (const client of opened) client.close();
+    await Promise.all([required, optional, open].map((server) => server?.stop()));
+  });
+
+  async function connect(target: string | Config): Promise<Client> {
+    const db = await Client.connect(target);
+    opened.push(db);
+    return db;
+  }
+
+  const url = (server: Server, host: string, settings: string): string => `database://test:${PASSWORD}@${host}:${server.port}?${settings}`;
+  const ca = `tls_ca=${encodeURIComponent(fixture("ca.pem"))}`;
+
+  // R-O8: everything a connection does, it does under TLS.
+  test("a client that verifies the server runs its statements under TLS", async () => {
+    const db = await connect(url(required, "localhost", ca));
+    await db.createTable(new TableDef("notes").column(new ColumnDef("id", Type.Int)).column(new ColumnDef("body", Type.Text)).primaryKey(["id"]));
+    // A result of several frames, each far larger than a TLS record, and
+    // requests as large.
+    const body = "y".repeat(500_000);
+    for (let id = 0; id < 12; id++) await db.insert(Insert.into("notes").set("id", id).set("body", `${id}:${body}`));
+    const rows = await db.query(Query.table("notes"));
+    assert.equal(rows.length, 12);
+    assert.ok(rows.rows.every((row) => row.get("body") === `${row.int("id")}:${body}`));
+    await db.transaction(async (tx) => {
+      const row = await tx.queryOne(Query.table("notes").key([3]));
+      await tx.update(Update.table("notes").key([3]).set("body", `${String(row.get("body")).slice(0, 4)}!`));
+    });
+    assert.equal((await db.queryOne(Query.table("notes").key([3]))).get("body"), "3:yy!");
+
+    const conn = await Conn.open(required.config("test"));
+    try {
+      await conn.send({ kind: "query", query: Query.table("notes").spec });
+      let frames = 0;
+      for (let more = true; more; frames++) {
+        const frame = await conn.receive();
+        assert.equal(frame.kind, "rows");
+        more = frame.kind === "rows" && frame.more;
+      }
+      conn.settle();
+      assert.ok(frames > 1);
+    } finally {
+      conn.close();
+    }
+
+    // The certificate carries the loopback address too, and a name the
+    // host is not reached by can be given.
+    const byAddress = await connect(url(required, "127.0.0.1", ca));
+    assert.equal((await byAddress.query(Query.table("notes").key([3]))).length, 1);
+    const byName = await connect(url(required, "127.0.0.1", `${ca}&tls_name=database.test`));
+    assert.equal((await byName.query(Query.table("notes").key([3]))).length, 1);
+    const byNamedAddress = await connect({ ...required.config("test"), host: "localhost", tls: { ca: fixture("ca.pem"), name: "::1" } });
+    assert.equal((await byNamedAddress.query(Query.table("notes").key([3]))).length, 1);
+  });
+
+  // R-O9: with TLS required, a greeting in the clear is refused whatever
+  // password it carries, and the answer says why.
+  test("a server that requires TLS refuses a client in the clear", async () => {
+    for (const password of [PASSWORD, "not-the-password"]) {
+      const refused = await code(ErrorCode.AccessDenied, Client.connect(required.config("test", password, null)));
+      assert.match(refused.message, /only under TLS/);
+    }
+  });
+
+  // R-O9: where TLS is optional, one port serves both, and both see the
+  // same data.
+  test("a server where TLS is optional serves both", async () => {
+    const secured = await connect(optional.config("test"));
+    const clear = await connect(optional.config("test", PASSWORD, null));
+    await secured.createTable(new TableDef("notes").column(new ColumnDef("id", Type.Int)).primaryKey(["id"]));
+    await secured.insert(Insert.into("notes").set("id", 1));
+    await clear.insert(Insert.into("notes").set("id", 2));
+    assert.deepEqual((await secured.query(Query.table("notes"))).column(), [1, 2]);
+    assert.deepEqual((await clear.query(Query.table("notes"))).column(), [1, 2]);
+  });
+
+  // R-O8: a server the client cannot verify is not sent a greeting, also
+  // where the server would have served the client in the clear.
+  test("a client refuses a server it cannot verify", async () => {
+    for (const server of [required, optional]) {
+      for (const settings of [
+        // Signed by an authority the client was not given.
+        `tls_ca=${encodeURIComponent(fixture("stranger-ca.pem"))}`,
+        // The system's authorities have not signed it either.
+        "tls=on",
+        // The right authority, for a name the certificate does not carry.
+        `${ca}&tls_name=elsewhere.test`,
+      ]) {
+        const refused = await code(ErrorCode.Connection, Client.connect(url(server, "localhost", settings)));
+        assert.match(refused.message, new RegExp(`the TLS handshake with the database at localhost:${server.port} failed: .`), settings);
+      }
+    }
+    const unread = await code(ErrorCode.Connection, Client.connect(url(required, "localhost", "tls_ca=%2Fnowhere%2Fca.pem")));
+    assert.match(unread.message, /TLS cannot be set up: .*\/nowhere\/ca\.pem/);
+    const empty = await code(ErrorCode.Connection, Client.connect(url(required, "localhost", `tls_ca=${encodeURIComponent(fixture("server.key"))}`)));
+    assert.match(empty.message, /TLS cannot be set up: .*server\.key holds no certificate/);
+  });
+
+  // R-O8: a client told to use TLS never talks in the clear instead.
+  test("a client asked for TLS does not talk to a server that serves none", async () => {
+    const refused = await code(ErrorCode.Connection, Client.connect(url(open, "127.0.0.1", ca)));
+    assert.match(refused.message, /the TLS handshake with the database at 127\.0\.0\.1:\d+ failed: .*does not serve TLS/);
+    // The same client without the setting is served: it was the TLS.
+    const clear = await connect(open.config("test"));
+    await clear.ping();
   });
 });

@@ -31,6 +31,43 @@ its trip through the network stack (a little on Linux, a good deal on
 macOS): add `?socket=/run/database/database.sock` (the server's
 `DATABASE_SOCKET`) to the URL. The host and port are then not used.
 
+An application on another host connects under TLS, to a server that
+was given a certificate (`OPERATIONS.md`, "TLS"). The settings say how
+the client knows the server, and each turns TLS on:
+
+```text
+database://shop:<password>@db.example.com?tls=on                  the system's certificate authorities
+database://shop:<password>@db.example.com?tls_ca=/etc/shop/ca.pem  the authorities in this file, and no other
+database://shop:<password>@10.0.0.5?tls_ca=..&tls_name=db.example.com   the name the certificate is for, where the host is not it
+database://shop:<password>@db?tls_cert=/etc/shop/server.pem        exactly this certificate, whatever its name and dates
+```
+
+In code it is `Config::tls`: `Tls::system()`, `Tls::authority(path)`,
+`Tls::certificate(path)`, each with `.name(..)`. Three things hold for
+every one of them:
+
+- **The server is verified before the greeting is sent**, so the
+  password goes to nobody else. There is no setting that encrypts
+  without verifying.
+- **A client asked for TLS never talks in the clear instead.** If the
+  handshake fails, or the server serves no TLS, connecting fails with
+  `ErrorCode::Connection`.
+- **Without any of these settings a client talks in the clear**, as it
+  always has, and a server that requires TLS refuses it with
+  `AccessDenied` and says why. The password has crossed the network by
+  then: turn TLS on in every client before the network is one that
+  others can listen on.
+
+The system's authorities are the file named by `SSL_CERT_FILE`, or the
+first that exists of the places Debian, Fedora, openSUSE, Alpine, macOS
+and FreeBSD keep theirs. The authorities are read when the client opens
+its first connection; a client made later reads them again. TLS and
+`socket=` together are refused: a Unix domain socket never leaves the
+host and is not encrypted. `tls_cert` is the Rust client's alone; the
+other two take the first three settings, and with `tls=on` each trusts
+what its language does: Node its own list of authorities and
+`NODE_EXTRA_CA_CERTS`, Python the system's.
+
 ## Tables
 
 ```rust
@@ -600,4 +637,4 @@ common matches); collations (text orders by bytes); `UNION`; window
 functions other than `with_total`; adding a foreign key or a check to a
 table that exists (declare them at creation); changing a column's type;
 cancelling another connection's statement (each request has its own
-deadline, `statement_timeout`); TLS.
+deadline, `statement_timeout`).

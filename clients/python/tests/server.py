@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 from typing import Optional
 
-from database_client import Client, Config, DbError
+from database_client import Client, Config, DbError, Tls
 
 ADMIN_PASSWORD = "admin-password"
 PASSWORD = "test-password"
@@ -40,8 +40,19 @@ def binary() -> Optional[Path]:
     return built if built.is_file() else None
 
 
+def fixture(name: str) -> str:
+    """A file of ``protocol/fixtures/tls``: the test authority ``ca.pem``,
+    the server's ``server.pem`` and ``server.key`` signed by it, and a
+    stranger's."""
+    return str(REPOSITORY / "protocol" / "fixtures" / "tls" / name)
+
+
 class Server:
-    def __init__(self) -> None:
+    def __init__(self, tls: Optional[str] = None) -> None:
+        """With ``tls``, ``"required"`` or ``"optional"``, the server
+        serves TLS with the fixtures' certificate, and connections in the
+        clear only where TLS is optional."""
+        self.tls = tls
         path = binary()
         if path is None:
             raise unittest.SkipTest("no server binary: run `cargo build -p database-server`, or set DATABASE_BIN")
@@ -55,6 +66,8 @@ class Server:
 
     def _start(self) -> None:
         environment = dict(os.environ, DATABASE_ADMIN_PASSWORD=ADMIN_PASSWORD, DATABASE_DATA=os.path.join(self.dir, "data"), DATABASE_LISTEN=f"127.0.0.1:{self.port}")
+        if self.tls:
+            environment.update(DATABASE_TLS_CERT=fixture("server.pem"), DATABASE_TLS_KEY=fixture("server.key"), DATABASE_TLS=self.tls)
         self.process = subprocess.Popen([str(self.path), "serve"], env=environment, stdout=self.log, stderr=self.log)
         deadline = time.monotonic() + 60
         while True:
@@ -74,8 +87,11 @@ class Server:
         except OSError:
             return ""
 
-    def config(self, database: str = "", password: str = PASSWORD) -> Config:
-        return Config("127.0.0.1", self.port, database, password if database else ADMIN_PASSWORD)
+    def config(self, database: str = "", password: str = PASSWORD, clear: bool = False) -> Config:
+        """Over TLS, verified against the fixtures' authority, if the
+        server serves it and ``clear`` does not say otherwise."""
+        tls = Tls(ca=fixture("ca.pem")) if self.tls and not clear else None
+        return Config("127.0.0.1", self.port, database, password if database else ADMIN_PASSWORD, tls=tls)
 
     def admin(self) -> Client:
         """A client with the administrator's password, on no database."""

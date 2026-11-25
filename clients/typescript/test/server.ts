@@ -13,7 +13,7 @@ import * as net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Client, type Config, config } from "../src/index.js";
+import { Client, type Config, type Tls, config } from "../src/index.js";
 import { REPOSITORY } from "./describe.js";
 
 export const ADMIN_PASSWORD = "admin-password";
@@ -40,6 +40,11 @@ function freePort(): Promise<number> {
   });
 }
 
+/** A file of `protocol/fixtures/tls`: the test authority `ca.pem`, the server's `server.pem` and `server.key` signed by it, and a stranger's. */
+export function fixture(name: string): string {
+  return join(REPOSITORY, "protocol", "fixtures", "tls", name);
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class Server {
@@ -49,10 +54,15 @@ export class Server {
     private readonly path: string,
     private readonly dir: string,
     readonly port: number,
+    private readonly tls: "required" | "optional" | null,
   ) {}
 
-  static async start(path: string): Promise<Server> {
-    const server = new Server(path, mkdtempSync(join(tmpdir(), "database-typescript-test-")), await freePort());
+  /**
+   * With `tls`, the server serves TLS with the fixtures' certificate, and
+   * connections in the clear only where TLS is `optional`.
+   */
+  static async start(path: string, tls: "required" | "optional" | null = null): Promise<Server> {
+    const server = new Server(path, mkdtempSync(join(tmpdir(), "database-typescript-test-")), await freePort(), tls);
     await server.run();
     return server;
   }
@@ -60,7 +70,13 @@ export class Server {
   private async run(): Promise<void> {
     const log = openSync(join(this.dir, "server.log"), "a");
     this.child = spawn(this.path, ["serve"], {
-      env: { ...process.env, DATABASE_ADMIN_PASSWORD: ADMIN_PASSWORD, DATABASE_DATA: join(this.dir, "data"), DATABASE_LISTEN: `127.0.0.1:${this.port}` },
+      env: {
+        ...process.env,
+        DATABASE_ADMIN_PASSWORD: ADMIN_PASSWORD,
+        DATABASE_DATA: join(this.dir, "data"),
+        DATABASE_LISTEN: `127.0.0.1:${this.port}`,
+        ...(this.tls ? { DATABASE_TLS_CERT: fixture("server.pem"), DATABASE_TLS_KEY: fixture("server.key"), DATABASE_TLS: this.tls } : {}),
+      },
       stdio: ["ignore", log, log],
     });
     const deadline = Date.now() + 60_000;
@@ -79,8 +95,12 @@ export class Server {
     }
   }
 
-  config(database = "", password = PASSWORD): Config {
-    return config("127.0.0.1", this.port, database, database === "" ? ADMIN_PASSWORD : password);
+  /**
+   * Over TLS, verified against the fixtures' authority, if the server
+   * serves it; `tls` says otherwise, and `null` is in the clear.
+   */
+  config(database = "", password = PASSWORD, tls: Tls | null = this.tls ? { ca: fixture("ca.pem") } : null): Config {
+    return { ...config("127.0.0.1", this.port, database, database === "" ? ADMIN_PASSWORD : password), ...(tls ? { tls } : {}) };
   }
 
   /** A client with the administrator's password, on no database. */

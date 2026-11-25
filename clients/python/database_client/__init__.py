@@ -71,7 +71,7 @@ from .builders import (
 )
 from .client import Admin, Client, Db, LockGuard, Row, Rows, Transaction
 from .codec import MAX_FRAME, PROTOCOL_VERSION
-from .conn import DEFAULT_PORT, Config
+from .conn import DEFAULT_PORT, Config, Tls
 from .errors import DbError, ErrorCode
 from .values import Date, Json, Timestamp
 
@@ -114,6 +114,7 @@ __all__ = [
     "TableDef",
     "TextConfig",
     "Timestamp",
+    "Tls",
     "Transaction",
     "TxnKind",
     "Type",

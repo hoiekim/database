@@ -286,7 +286,14 @@ async fn write_response<W: AsyncWrite + Unpin>(writer: &mut W, buf: &mut Vec<u8>
     let mut frame = encode_response_onto(frame, response);
     let len = (frame.len() - 4) as u32;
     frame[..4].copy_from_slice(&len.to_le_bytes());
-    let sent = match tokio::time::timeout(SEND_PATIENCE, writer.write_all(&frame)).await {
+    // Under TLS a write may leave the end of the frame in the
+    // connection's own buffer: the flush sends it. On a socket it is
+    // nothing.
+    let send = async {
+        writer.write_all(&frame).await?;
+        writer.flush().await
+    };
+    let sent = match tokio::time::timeout(SEND_PATIENCE, send).await {
         Ok(sent) => sent,
         Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
     };
@@ -314,8 +321,10 @@ fn as_spoken_by(response: &mut Response, version: u32) {
 }
 
 /// Serves one connection, over whatever carries it: the two halves of a
-/// TCP stream, or of a Unix domain socket's.
-pub(crate) async fn serve<R, W>(reader: R, mut writer: W, state: Arc<State>, id: u64, mut stopping: watch::Receiver<bool>)
+/// TCP stream, of a TLS session over one, or of a Unix domain socket's.
+/// With a `refusal`, the connection is one the server does not serve as
+/// it came: its greeting is read and answered with that, and it is closed.
+pub(crate) async fn serve<R, W>(reader: R, mut writer: W, state: Arc<State>, id: u64, mut stopping: watch::Receiver<bool>, refusal: Option<DbError>)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -345,6 +354,7 @@ where
     // The greeting, within ten seconds.
     let hello = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut reader, GREETING_FRAME)).await;
     let greeted = match hello {
+        Ok(Ok(Some(_))) if refusal.is_some() => Err(refusal.unwrap()),
         Ok(Ok(Some(frame))) => match decode_request(&frame) {
             Ok((Request::Hello { version, database, password, client }, _)) => {
                 session.client = client;
