@@ -38,6 +38,7 @@
 //! has. A record is never empty, so the zeros end the log for a reader.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::error::{Error, Result};
@@ -120,6 +121,9 @@ pub struct Wal {
     tail: Mutex<Tail>,
     synced: Mutex<Synced>,
     wake: Condvar,
+    /// Syncs of the log made for commits: how many commits each covered
+    /// is the commits over this.
+    pub syncs: AtomicU64,
     /// When false, `sync_to` returns at once: commits are then only as
     /// durable as the operating system makes them.
     pub sync: bool,
@@ -150,6 +154,7 @@ impl Wal {
             tail: Mutex::new(Tail { file, generation, link: previous, offset: HEADER_LEN, allocated: HEADER_LEN, grow: 0, appended: version, last_record: version }),
             synced: Mutex::new(Synced { version, syncing: false, failed: false }),
             wake: Condvar::new(),
+            syncs: AtomicU64::new(0),
             sync,
         })
     }
@@ -261,6 +266,7 @@ impl Wal {
                 (tail.file.clone(), tail.appended)
             };
             let result = if self.sync { file.sync() } else { Ok(()) };
+            self.syncs.fetch_add(1, Ordering::Relaxed);
             synced = self.synced.lock().unwrap();
             synced.syncing = false;
             match result {

@@ -784,7 +784,7 @@ impl Database {
     pub fn stats(&self) -> String {
         let latest = self.latest.lock().unwrap().clone();
         format!(
-            "database {}: version {}, {} tables, {} pages, {} free, {} dirty, log {} bytes, {} commits, {} disk reads, {} disk writes, {} merges of full-text segments beside the writers and {} dropped\n",
+            "database {}: version {}, {} tables, {} pages, {} free, {} dirty, log {} bytes, {} commits, {} syncs of the log, {} disk reads, {} disk writes, {} merges of full-text segments beside the writers and {} dropped\n",
             self.name,
             latest.version,
             latest.catalog.tables.len(),
@@ -793,6 +793,7 @@ impl Database {
             self.store.dirty_pages(),
             self.wal.size(),
             self.commits.load(Ordering::Relaxed),
+            self.wal.syncs.load(Ordering::Relaxed),
             self.store.disk_reads.load(Ordering::Relaxed),
             self.store.disk_writes.load(Ordering::Relaxed),
             self.merges_beside.load(Ordering::Relaxed),
