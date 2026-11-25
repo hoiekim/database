@@ -3,7 +3,9 @@
 //! A query is carried out as written: read the rows its access path names,
 //! in key order; for each, run the joins; repeat it per item of `each`;
 //! test the filter; then group, sort, cut and select. Nothing is
-//! reordered or chosen: there is no planner.
+//! reordered. A query that names no access path is the one thing chosen
+//! for: `plan.rs` gives it a range that answers the same, where there is
+//! one, and the steps after the read are the same either way.
 
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -20,8 +22,9 @@ use database_protocol::value::{Type, Value};
 use crate::btree::{self, Cursor};
 use crate::catalog::{Table, TableMeta};
 use crate::error::{Error, Result};
-use crate::eval::{self, eval, holds, AggValues, Ctx, Frame, Scope};
+use crate::eval::{self, eval, holds, AggValues, Ctx, Frame, Scope, Way};
 use crate::keys;
+use crate::plan::{self, Choice, Tree};
 use crate::row::Row;
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -268,6 +271,111 @@ fn scan(ctx: &Ctx, table: &Table, alias: &str, access: &Access, outer: &Scope, o
             walk_tree(ctx, table, alias, outer, start, parent, *direction, index.as_deref(), prune.as_ref(), stop.as_ref(), *max_depth, on_hit)
         }
         Access::Search { index, prefix, query, match_prefix } => search(ctx, table, outer, index, prefix, query, *match_prefix, on_hit),
+        Access::Whole => scan_rows(ctx, table, None, None, false, on_hit),
+    }
+}
+
+/// Reads the rows of a run of primary keys, in key order or backwards.
+fn scan_rows(ctx: &Ctx, table: &Table, start: Option<&[u8]>, end: Option<&[u8]>, reverse: bool, on_hit: &mut dyn FnMut(&Hit) -> Result<bool>) -> Result<bool> {
+    walk_range(ctx, table.root, start, end, reverse, &mut |key, value| {
+        ctx.cost.row();
+        on_hit(&Hit { pk: key, row: Row::parse(value.to_vec())?, depth: None, rank: None })
+    })
+}
+
+/// Primary keys packed end to end, with where each starts and how long
+/// it is.
+struct Keys {
+    bytes: Vec<u8>,
+    at: Vec<(u32, u32)>,
+}
+
+/// The primary keys of the entries in runs of an index's keys, sorted,
+/// each once; or `None` if there are more than `most`. Only entries are
+/// read.
+fn gather(ctx: &Ctx, table: &Table, index: usize, spans: &[plan::Span], most: u64) -> Result<Option<Keys>> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut keys: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in spans {
+        let done = walk_range(ctx, table.index_roots[index], Some(start), end.as_deref(), false, &mut |key, value| {
+            ctx.cost.entry();
+            let pk = entry_pk(key, value)?;
+            keys.push((bytes.len() as u32, pk.len() as u32));
+            bytes.extend_from_slice(pk);
+            Ok(keys.len() as u64 <= most && bytes.len() < u32::MAX as usize / 2)
+        })?;
+        if !done {
+            return Ok(None);
+        }
+    }
+    let key = |at: &(u32, u32)| &bytes[at.0 as usize..(at.0 + at.1) as usize];
+    keys.sort_unstable_by(|a, b| key(a).cmp(key(b)));
+    keys.dedup_by(|a, b| key(a) == key(b));
+    Ok(Some(Keys { bytes, at: keys }))
+}
+
+/// The most entries an index's range may hold and still be read through
+/// the index: a quarter of the table's rows, where that is more than a
+/// few, and never more than about a million. A larger range is given up
+/// for the whole table, which reads in key order as cheaply and holds
+/// no keys to be sorted.
+fn most_gathered(table: &Table) -> u64 {
+    (table.rows / 4).clamp(1024, 1 << 20)
+}
+
+/// Reads the rows of a way in that was chosen for a query that named
+/// none (`plan::choose`), or the whole table if none was, and notes
+/// which it was. The rows come in primary key order, as the whole table
+/// gives them, except from a tree read in the query's own order.
+fn scan_chosen(ctx: &Ctx, table: &Table, choice: Option<Choice>, on_hit: &mut dyn FnMut(&Hit) -> Result<bool>) -> Result<bool> {
+    let index_name = |tree: Tree| match tree {
+        Tree::Primary => None,
+        Tree::Index(i) => Some(table.indexes[i].def.name.clone()),
+    };
+    match choice {
+        Some(Choice::Range { tree: Tree::Primary, spans }) => {
+            ctx.cost.chose(&table.name, Way::Primary);
+            for (start, end) in &spans {
+                if !scan_rows(ctx, table, Some(start), end.as_deref(), false, on_hit)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Some(Choice::Range { tree: Tree::Index(i), spans }) => {
+            // Entries first, all of them: the rows are then read in
+            // primary key order, the order the whole table has.
+            let Some(keys) = gather(ctx, table, i, &spans, most_gathered(table))? else {
+                ctx.cost.chose(&table.name, Way::Whole);
+                return scan_rows(ctx, table, None, None, false, on_hit);
+            };
+            ctx.cost.chose(&table.name, Way::Index(table.indexes[i].def.name.clone()));
+            for (n, (at, len)) in keys.at.iter().enumerate() {
+                if n % 256 == 255 {
+                    ctx.check_deadline()?;
+                }
+                let pk = &keys.bytes[*at as usize..(*at + *len) as usize];
+                if !on_hit(&Hit { pk, row: fetch_indexed(ctx, table, pk)?, depth: None, rank: None })? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Some(Choice::Ordered { tree, span: (start, end), reverse }) => {
+            ctx.cost.chose(&table.name, Way::InOrder(index_name(tree)));
+            match tree {
+                Tree::Primary => scan_rows(ctx, table, Some(&start), end.as_deref(), reverse, on_hit),
+                Tree::Index(i) => walk_range(ctx, table.index_roots[i], Some(&start), end.as_deref(), reverse, &mut |key, value| {
+                    ctx.cost.entry();
+                    let pk = entry_pk(key, value)?;
+                    on_hit(&Hit { pk, row: fetch_indexed(ctx, table, pk)?, depth: None, rank: None })
+                }),
+            }
+        }
+        None => {
+            ctx.cost.chose(&table.name, Way::Whole);
+            scan_rows(ctx, table, None, None, false, on_hit)
+        }
     }
 }
 
@@ -439,18 +547,36 @@ fn table_of(ctx: &Ctx, name: &str) -> Result<Arc<Table>> {
 pub fn for_each_match(ctx: &Ctx, q: &Query, outer: &Scope, stopped: &Cell<bool>, f: &mut dyn FnMut(&Scope, &Hit) -> Result<bool>) -> Result<()> {
     let table = table_of(ctx, &q.table)?;
     let alias = q.alias.as_deref().unwrap_or(&table.name);
+    let chosen = chooses(ctx, q).then(|| plan::choose(ctx, q, &table, alias, outer, false));
+    matches_through(ctx, q, &table, alias, chosen, outer, stopped, f)
+}
+
+/// Whether a query's way in is the server's to choose: it names none,
+/// it reads a table, and choosing is not turned off.
+fn chooses(ctx: &Ctx, q: &Query) -> bool {
+    ctx.plan && q.access.is_unnamed() && !q.table.is_empty()
+}
+
+/// `for_each_match`, reading the query's table by the access path it
+/// names (`chosen` is `None`) or by what was chosen for it.
+#[allow(clippy::too_many_arguments)]
+fn matches_through(ctx: &Ctx, q: &Query, table: &Table, alias: &str, chosen: Option<Option<Choice>>, outer: &Scope, stopped: &Cell<bool>, f: &mut dyn FnMut(&Scope, &Hit) -> Result<bool>) -> Result<()> {
     if q.table.is_empty() {
         let hit = Hit { pk: &[], row: Row::from_values(&[]), depth: None, rank: None };
-        let frame = [Frame { alias, table: &table, row: Some(&hit.row) }];
+        let frame = [Frame { alias, table, row: Some(&hit.row) }];
         let scope = Scope { frames: &frame, outer: Some(outer), ..Scope::default() };
         return join_level(ctx, q, 0, &scope, &hit, stopped, f);
     }
-    scan(ctx, &table, alias, &q.access, outer, &mut |hit| {
-        let frame = [Frame { alias, table: &table, row: Some(&hit.row) }];
+    let mut on_hit = |hit: &Hit| {
+        let frame = [Frame { alias, table, row: Some(&hit.row) }];
         let scope = Scope { frames: &frame, depth: hit.depth, rank: hit.rank, outer: Some(outer), ..Scope::default() };
         join_level(ctx, q, 0, &scope, hit, stopped, f)?;
         Ok(!stopped.get())
-    })?;
+    };
+    match chosen {
+        None => scan(ctx, table, alias, &q.access, outer, &mut on_hit)?,
+        Some(choice) => scan_chosen(ctx, table, choice, &mut on_hit)?,
+    };
     Ok(())
 }
 
@@ -610,10 +736,17 @@ pub fn query(ctx: &Ctx, q: &Query, outer: &Scope) -> Result<RowSet> {
     let wanted = q.limit.map(|limit| q.offset.saturating_add(limit));
     let mut total = 0u64;
     let mut distinct: Option<HashSet<Vec<u8>>> = q.distinct.then(HashSet::new);
+    let alias = q.alias.as_deref().unwrap_or(&table.name);
+    // A sorted page of a table's own rows may be read from a tree that
+    // is in that order, and then needs no sort: it stops when it is
+    // full (R-Q24).
+    let page = !q.order_by.is_empty() && wanted.is_some() && !q.with_total && !q.distinct && q.joins.is_empty();
+    let chosen = chooses(ctx, q).then(|| plan::choose(ctx, q, &table, alias, outer, page));
+    let in_order = matches!(chosen, Some(Some(Choice::Ordered { .. })));
 
-    if q.order_by.is_empty() {
+    if q.order_by.is_empty() || in_order {
         let mut rows = Vec::new();
-        for_each_match(ctx, q, outer, &stopped, &mut |scope, hit| {
+        matches_through(ctx, q, &table, alias, chosen, outer, &stopped, &mut |scope, hit| {
             let row = project(ctx, q, scope, &table, &all, hit)?;
             if let Some(seen) = &mut distinct {
                 if !seen.insert(row_key(&row)) {
@@ -636,7 +769,7 @@ pub fn query(ctx: &Ctx, q: &Query, outer: &Scope) -> Result<RowSet> {
     // best rows so far are kept.
     let mut rows: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     let sort = |rows: &mut Vec<(Vec<Value>, Vec<Value>)>| rows.sort_by(|a, b| order_cmp(&a.0, &b.0, &q.order_by));
-    for_each_match(ctx, q, outer, &stopped, &mut |scope, hit| {
+    matches_through(ctx, q, &table, alias, chosen, outer, &stopped, &mut |scope, hit| {
         let row = project(ctx, q, scope, &table, &all, hit)?;
         if let Some(seen) = &mut distinct {
             if !seen.insert(row_key(&row)) {

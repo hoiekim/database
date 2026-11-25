@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use database_protocol::error::{DbError, DbResult, ErrorCode};
 use database_protocol::expr::Expr;
-use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Request, Response, TxnKind, EXPLAIN_COLUMNS};
+use database_protocol::message::{Admin as AdminRequest, BatchItem, Ddl, Request, Response, TxnKind, EXPLAIN_COLUMNS, EXPLAIN_WAY};
 use database_protocol::query::{Delete, Insert, Query, Update};
 use database_protocol::schema::{ColumnDef, IndexDef, TableDef};
 use database_protocol::value::{Timestamp, Value};
@@ -37,11 +37,12 @@ fn ok(response: Response) -> DbResult<()> {
 
 /// What a query made the server read: the answer of `Db::explain`.
 ///
-/// There is no planner here, so there is no plan to look at: a query
-/// reads the range it names, in order, and filters what that gives. What
-/// can be wrong with it is that the range takes in far more than the
-/// query returns, and these figures say so.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A query reads the range it names, in order, and filters what that
+/// gives; one that names none reads a range the server chose from its
+/// filter, or the whole table. What can be wrong with either is that
+/// far more is read than the query returns, and these figures say so,
+/// with the way in that was taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Explained {
     /// Entries read from indexes: those of an ordered index's range, the
     /// children a tree walk found, a search's hits.
@@ -53,13 +54,19 @@ pub struct Explained {
     pub rows_returned: u64,
     /// How long the server took over it.
     pub took: std::time::Duration,
+    /// The way into each table: the query's own if it named one, then
+    /// each the server chose, for the query or for a join or subquery
+    /// of it, marked `chosen`. For example `"mails" by index
+    /// "mails_user_date", chosen`, or `"mails" by the whole table,
+    /// chosen` where nothing fit.
+    pub way: String,
 }
 
 fn explained(response: Response) -> DbResult<Explained> {
     let rows = rows(response)?;
     let row = rows.one()?;
     let figure = |n: usize| row.get::<i64>(EXPLAIN_COLUMNS[n]).map(|v| v.max(0) as u64);
-    Ok(Explained { index_entries: figure(0)?, rows_read: figure(1)?, rows_returned: figure(2)?, took: std::time::Duration::from_micros(figure(3)?) })
+    Ok(Explained { index_entries: figure(0)?, rows_read: figure(1)?, rows_returned: figure(2)?, took: std::time::Duration::from_micros(figure(3)?), way: row.get(EXPLAIN_WAY)? })
 }
 
 /// A query, an insert, an update or a delete: what can be prepared, and

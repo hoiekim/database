@@ -288,6 +288,8 @@ fn access(a: &Access) -> Json {
         Access::Search { index, prefix, query, match_prefix } => {
             json!({"kind": "search", "index": index, "prefix": exprs(prefix), "query": expr(query), "match_prefix": match_prefix})
         }
+        // From version 6: no vector of version 2 holds one.
+        Access::Whole => json!({"kind": "whole"}),
     }
 }
 

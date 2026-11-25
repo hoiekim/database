@@ -453,8 +453,8 @@ one of those true:
   types of the columns and the values at hand, by a list of what is
   known not to fail: columns, values, parameters, `now()`; comparisons
   between kinds that compare; `and`, `or`, `not`; `is null`; `in` over a
-  list of values; `like` on text; `lower`, `upper`, `trim`, `length` and
-  `octet_length` of text; `try_cast`. Whatever does not read the query's
+  list of values; `like` on text; `lower`, `upper`, `trim`, `left`,
+  `length` and `octet_length` of text; `try_cast`. Whatever does not read the query's
   own rows (arithmetic on `now()`, a column of an enclosing query) is
   computed once, and if that fails the whole table is read and fails as
   it would have. A query with anything else in its filter (arithmetic

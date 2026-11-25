@@ -73,7 +73,7 @@ fn schema_migrations() -> TableDef {
 /// The workspace's 26 tables, parents before children so every foreign
 /// key finds its table. Indexes behind a constraint carry the names
 /// Postgres gives them, which error handling matches on; the others are
-/// the access paths a planner would pick and a query here states.
+/// the access paths a planner would pick and the queries here state.
 fn tables() -> Vec<TableDef> {
     let users = TableDef::new("users")
         .column(id_col())

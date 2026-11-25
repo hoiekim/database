@@ -59,7 +59,7 @@ impl Session {
         let Some(ahead) = tokio::task::block_in_place(|| fts::cut_ahead(&catalog, insert)) else { return Err(request) };
         drop(catalog);
         // Described only where slow statements are logged at all.
-        let described = self.state.config.slow_statement.map(|_| shape(&request));
+        let described = self.state.config.slow_statement.map(|_| shape(&request, self.state.config.plan));
         let Request::Insert(insert) = request else { unreachable!("seen above to be an insert") };
         self.read = Read::default();
         let answer = self.loaded(db, insert, ahead, deadline).await;

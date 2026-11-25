@@ -679,6 +679,7 @@ fn put_access(w: &mut Writer, a: &Access) {
             put_expr(w, query);
             w.bool(*match_prefix);
         }
+        Access::Whole => w.u8(5),
     }
 }
 
@@ -705,6 +706,7 @@ fn get_access(r: &mut Reader) -> DbResult<Access> {
             Access::Walk { start, parent, direction, index: r.opt_str()?, prune: get_opt_expr(r)?, stop: get_opt_expr(r)?, max_depth: r.u32()? }
         }
         4 => Access::Search { index: r.str()?, prefix: get_exprs(r)?, query: get_expr(r)?, match_prefix: r.bool()? },
+        5 => Access::Whole,
         _ => return Err(malformed("unknown access")),
     })
 }

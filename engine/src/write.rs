@@ -61,6 +61,9 @@ pub struct Tx {
     pub params: Vec<Value>,
     /// What its statements have read since it was last asked.
     pub cost: Cost,
+    /// Whether its queries that name no way in have one chosen for
+    /// them: the database's `Options::plan`.
+    pub plan: bool,
     /// The tables it has made, which nobody else can see until it commits.
     created: Vec<u32>,
 }
@@ -200,11 +203,11 @@ fn unique_holder(ctx: &Ctx, table: &Table, i: usize, entry: &Entry, own_pk: &[u8
 
 impl Tx {
     pub fn new(writer: Writer, catalog: Catalog, now: i64) -> Tx {
-        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), params: Vec::new(), cost: Cost::default(), created: Vec::new() }
+        Tx { writer, catalog, log: Encoder::new(), now, deadline: None, logging: true, tape: Tape::default(), params: Vec::new(), cost: Cost::default(), plan: true, created: Vec::new() }
     }
 
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape), params: &self.params, cost: &self.cost }
+        Ctx { pages: &self.writer, catalog: &self.catalog, now: self.now, deadline: self.deadline, tape: Some(&self.tape), params: &self.params, cost: &self.cost, plan: self.plan }
     }
 
     fn table(&self, name: &str) -> Result<Arc<Table>> {

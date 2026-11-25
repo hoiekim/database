@@ -36,11 +36,14 @@ pub struct Ctx<'a> {
     pub params: &'a [Value],
     /// Where the statement counts what it reads.
     pub cost: &'a Cost,
+    /// Whether a query that names no way in has one chosen for it
+    /// (`plan.rs`). Where not, such a query reads its whole table.
+    pub plan: bool,
 }
 
 /// What statements have read since this was last asked: the figures a
-/// slow one is explained by. There is no planner to explain, so what a
-/// statement costs is what its access path made it read.
+/// slow one is explained by. What a statement costs is what its way in
+/// made it read, and where the server chose that way, which it was.
 ///
 /// One statement counts at a time, on one thread. The counts are atomics
 /// only so that a transaction can be held by reference across a wait;
@@ -50,10 +53,54 @@ pub struct Ctx<'a> {
 pub struct Cost {
     entries: AtomicU64,
     rows: AtomicU64,
+    /// Whether any way in was chosen since this was last asked, so that
+    /// a statement that named its own does not look.
+    chose: AtomicBool,
+    chosen: Mutex<Vec<Chosen>>,
 }
 
+/// A way into a table that the server chose, for a query that named
+/// none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chosen {
+    pub table: String,
+    pub way: Way,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Way {
+    /// Nothing fit, or an index's range was given up: every row was
+    /// read.
+    Whole,
+    /// A range of the primary key.
+    Primary,
+    /// A range of this index, its rows given in primary key order.
+    Index(String),
+    /// This index, or the primary key for `None`, read in its own order
+    /// for a query sorted that way.
+    InOrder(Option<String>),
+}
+
+impl std::fmt::Display for Chosen {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?} by ", self.table)?;
+        match &self.way {
+            Way::Whole => write!(f, "the whole table"),
+            Way::Primary => write!(f, "its primary key"),
+            Way::Index(index) => write!(f, "index {index:?}"),
+            Way::InOrder(None) => write!(f, "its primary key, in its order"),
+            Way::InOrder(Some(index)) => write!(f, "index {index:?}, in its order"),
+        }
+    }
+}
+
+/// How many distinct choices a statement's `Read` lists: a statement
+/// that runs a join's inner side for every row makes the same few over
+/// and over.
+pub const MAX_CHOSEN: usize = 8;
+
 /// What a statement read.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Read {
     /// Entries read from indexes: the entries of an ordered index's
     /// range, the children found by a tree walk, a search's hits.
@@ -61,12 +108,20 @@ pub struct Read {
     /// Rows read from tables: in key order, through an index, by a join
     /// or a subquery, or to be changed.
     pub rows: u64,
+    /// The ways in the server chose, each once, in the order they were
+    /// first taken: at most `MAX_CHOSEN`.
+    pub chosen: Vec<Chosen>,
 }
 
 impl Read {
     pub fn add(&mut self, other: Read) {
         self.entries += other.entries;
         self.rows += other.rows;
+        for chosen in other.chosen {
+            if self.chosen.len() < MAX_CHOSEN && !self.chosen.contains(&chosen) {
+                self.chosen.push(chosen);
+            }
+        }
     }
 }
 
@@ -83,9 +138,20 @@ impl Cost {
         self.rows.store(self.rows.load(Relaxed) + 1, Relaxed);
     }
 
+    /// Notes a way in that was chosen for `table`, unless it is noted
+    /// already.
+    pub fn chose(&self, table: &str, way: Way) {
+        let mut chosen = self.chosen.lock().unwrap();
+        if chosen.len() < MAX_CHOSEN && !chosen.iter().any(|c| c.table == table && c.way == way) {
+            chosen.push(Chosen { table: table.to_string(), way });
+        }
+        self.chose.store(true, Relaxed);
+    }
+
     /// What was read since this was last asked.
     pub fn take(&self) -> Read {
-        Read { entries: self.entries.swap(0, Relaxed), rows: self.rows.swap(0, Relaxed) }
+        let chosen = if self.chose.swap(false, Relaxed) { std::mem::take(&mut *self.chosen.lock().unwrap()) } else { Vec::new() };
+        Read { entries: self.entries.swap(0, Relaxed), rows: self.rows.swap(0, Relaxed), chosen }
     }
 }
 
@@ -319,7 +385,7 @@ pub fn holds(ctx: &Ctx, scope: &Scope, condition: &Expr) -> Result<bool> {
 
 /// Reads a text as the kind of the value it is compared with, the way an
 /// untyped SQL literal is.
-fn harmonize<'v>(a: &'v Value, b: &'v Value) -> Result<(Cow<'v, Value>, Cow<'v, Value>)> {
+pub(crate) fn harmonize<'v>(a: &'v Value, b: &'v Value) -> Result<(Cow<'v, Value>, Cow<'v, Value>)> {
     let parse = |text: &str, like: &Value| -> Result<Value> {
         let bad = |what: &str| mismatch(format!("{text:?} is not {what}"));
         Ok(match like {

@@ -1,11 +1,17 @@
 //! Reads and writes as the client states them.
 //!
-//! There is no planner. A query names the way in (`Access`): the primary
-//! key, one index, a walk of a tree, or a full-text search, and the range
-//! of keys to read. The server reads those rows in key order, then applies
-//! the rest in a fixed sequence: joins, filter, grouping, sort, offset and
-//! limit, select. A filter on a column is only ever as fast as the range
-//! chosen for it.
+//! A query names the way in (`Access`): the primary key, one index, a
+//! walk of a tree, or a full-text search, and the range of keys to read.
+//! The server reads those rows in key order, then applies the rest in a
+//! fixed sequence: joins, filter, grouping, sort, offset and limit,
+//! select. A way in that is named is exactly what runs, and a filter
+//! over it is only ever as fast as the range named for it.
+//!
+//! A query that names no way in (`Query::table` as it stands) leaves the
+//! choice to the server, which reads a range of the primary key or of an
+//! index where the filter gives one and the answer is sure to be the
+//! same, and otherwise the whole table. `Query::whole` asks for the
+//! whole table and is not chosen for.
 
 use crate::expr::Expr;
 use crate::schema::TextConfig;
@@ -105,6 +111,20 @@ pub enum Access {
     /// Rows matching a full-text search, through a full-text index. Rows
     /// come in no particular order: sort by `Expr::Rank`.
     Search { index: String, prefix: Vec<Expr>, query: Expr, match_prefix: bool },
+    /// Every row, in primary key order, read from the table itself: the
+    /// whole table asked for by name, which the server does not replace
+    /// with a range of its choosing.
+    Whole,
+}
+
+impl Access {
+    /// Whether no way in was named: every row by primary key, as
+    /// `Query::table` leaves it. The server may then read a range that
+    /// answers the same.
+    pub fn is_unnamed(&self) -> bool {
+        matches!(self, Access::Primary { ranges, reverse: false }
+            if matches!(&ranges[..], [KeyRange { lower: Bound::Unbounded, upper: Bound::Unbounded, .. }]))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +247,9 @@ impl Query {
         Query::table("")
     }
 
-    /// Every row of a table, in primary key order, until narrowed.
+    /// Every row of a table, in primary key order, until narrowed. A
+    /// query left so names no way in, and the server chooses one from
+    /// its filter where that answers the same (see `Query::whole`).
     pub fn table(name: &str) -> Query {
         Query {
             table: name.to_string(),
@@ -267,6 +289,15 @@ impl Query {
     /// Rows whose primary key is in the range.
     pub fn range(mut self, range: KeyRange) -> Query {
         self.access = Access::Primary { ranges: vec![range], reverse: false };
+        self
+    }
+
+    /// Every row, read from the table itself in primary key order,
+    /// whatever the filter: the server chooses no other way in. For a
+    /// query meant to read the whole table, and for comparing a chosen
+    /// way with it.
+    pub fn whole(mut self) -> Query {
+        self.access = Access::Whole;
         self
     }
 

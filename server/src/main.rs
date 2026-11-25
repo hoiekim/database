@@ -24,6 +24,7 @@
 //! | `DATABASE_SOCKET` | (none) | a Unix domain socket to listen on as well, for clients on the same host |
 //! | `DATABASE_CACHE_MB` | `32` | memory for cached pages |
 //! | `DATABASE_SLOW_MS` | (none) | log statements that take this many milliseconds or more, with what they read |
+//! | `DATABASE_PLAN` | `on` | `off` reads the whole table for every query that names no way in, instead of choosing one |
 //!
 //! The other commands connect to `DATABASE_HOST` (default `127.0.0.1`) on
 //! the port of `DATABASE_LISTEN`, or through `DATABASE_SOCKET` if that is
@@ -71,6 +72,13 @@ async fn serve() -> Result<(), String> {
     config.socket = env("DATABASE_SOCKET").map(Into::into);
     if let Some(mb) = env("DATABASE_CACHE_MB") {
         config.cache_bytes = mb.parse::<usize>().map_err(|_| "DATABASE_CACHE_MB is not a number".to_string())? * 1024 * 1024;
+    }
+    if let Some(plan) = env("DATABASE_PLAN") {
+        config.plan = match plan.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => return Err("DATABASE_PLAN is not on or off".to_string()),
+        };
     }
     if let Some(ms) = env("DATABASE_SLOW_MS") {
         config.slow_statement = Some(std::time::Duration::from_millis(ms.parse().map_err(|_| "DATABASE_SLOW_MS is not a number of milliseconds".to_string())?));
